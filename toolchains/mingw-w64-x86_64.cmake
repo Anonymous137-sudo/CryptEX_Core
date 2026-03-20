@@ -1,0 +1,25 @@
+# Cross-compilation from macOS to Windows x86_64 using Homebrew mingw-w64.
+#
+# Required:
+#   - Homebrew mingw-w64 toolchain under /opt/homebrew/opt/mingw-w64
+#   - OPENSSL_ROOT_DIR pointing at a Windows x86_64 OpenSSL prefix
+
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+set(TOOLCHAIN_PREFIX x86_64-w64-mingw32)
+set(TOOLCHAIN_ROOT /opt/homebrew/opt/mingw-w64)
+
+set(CMAKE_C_COMPILER   ${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-gcc)
+set(CMAKE_CXX_COMPILER ${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-g++)
+set(CMAKE_RC_COMPILER  ${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-windres)
+
+set(CMAKE_FIND_ROOT_PATH
+    ${TOOLCHAIN_ROOT}/${TOOLCHAIN_PREFIX}
+    ${TOOLCHAIN_ROOT}
+)
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)

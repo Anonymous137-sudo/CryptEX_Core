@@ -60,4 +60,3 @@ Mine multiple blocks in sequence:
 
 - Whitepaper: [WHITEPAPER.md](./WHITEPAPER.md)
 - GUI roadmap: [GUI_MODE_PLAN.md](./GUI_MODE_PLAN.md)
-
