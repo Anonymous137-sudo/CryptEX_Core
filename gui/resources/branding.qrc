@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/branding">
+        <file alias="CryptEXlogo.jpeg">../../CryptEXlogo.jpeg</file>
+    </qresource>
+</RCC>
