@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main>
+  <section class="hero-section">
+    <div class="hero-copy">
+      <p class="eyebrow">Operator-grade cryptocurrency infrastructure</p>
+      <h1>CryptEX is a 512-bit SHA3 network with real node tooling, real release artifacts, and a clean separation between GUI and backend.</h1>
+      <p class="lede">
+        We built the website to mirror that same standard: dynamic releases, domain-aware deployment,
+        explicit security controls, and a stack that can actually be operated in production.
+      </p>
+      <div class="action-row">
+        <a class="button primary" href="/downloads">Get the latest builds</a>
+        <a class="button secondary" href="/security">Review the security posture</a>
+        <a class="button tertiary" href="{{ repository_url }}" target="_blank" rel="noreferrer">View source</a>
+      </div>
+      <p class="lede">Public endpoint: <a href="{{ base_url }}" target="_blank" rel="noreferrer">{{ base_url }}</a></p>
+    </div>
+    <aside class="hero-terminal">
+      <div class="terminal-header">
+        <span></span><span></span><span></span>
+      </div>
+      <pre class="terminal-body">$ network: mainnet / testnet / regtest
+$ consensus: SHA3-512 full-width PoW
+$ wallet: BIP32 + BIP39 + AES-encrypted wallet.dat
+$ sync: headers-first with persistent chainstate
+$ node: structured logs, RPC, Tor-ready
+$ website: domain-ready FastAPI delivery</pre>
+    </aside>
+  </section>
+
+  <section class="stat-grid">
+    {% for stat in hero_stats %}
+    <article class="stat-card">
+      <span>{{ stat.label }}</span>
+      <strong>{{ stat.value }}</strong>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="content-grid">
+    {% for pillar in pillars %}
+    <article class="content-card">
+      <h2>{{ pillar.title }}</h2>
+      <p>{{ pillar.body }}</p>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="split-section">
+    <article class="panel panel-dark">
+      <div class="panel-heading">
+        <p class="eyebrow">Release channels</p>
+        <h2>Purpose-built binaries, not one-size-fits-all blobs.</h2>
+      </div>
+      <ul class="bullet-list">
+        <li>macOS app bundle for the GUI and a separate backend binary</li>
+        <li>Linux AppImages and native backend builds for x86_64 and ARM64</li>
+        <li>Windows GUI, backend, and runtime bundle for clean-machine setup</li>
+      </ul>
+    </article>
+    <article class="panel">
+      <div class="panel-heading">
+        <p class="eyebrow">Security posture</p>
+        <h2>Domain-ready delivery with strict defaults.</h2>
+      </div>
+      <ul class="bullet-list">
+        <li>Host allowlists and optional canonical redirect</li>
+        <li>HTTPS enforcement and HSTS when deployed behind TLS</li>
+        <li>Content Security Policy, frame denial, and no-sniff headers</li>
+        <li>Rate limiting and security disclosure metadata</li>
+      </ul>
+    </article>
+  </section>
+
+  <section class="featured-downloads">
+    <div class="section-heading">
+      <p class="eyebrow">Featured downloads</p>
+      <h2>Download the channels most users actually need.</h2>
+    </div>
+    <div class="download-grid">
+      {% for artifact in featured_artifacts %}
+      <article class="download-card">
+        <div class="download-meta">
+          <span>{{ artifact.platform }}</span>
+          <small>{{ artifact.arch }} · {{ artifact.kind }}</small>
+        </div>
+        <h3>{{ artifact.label }}</h3>
+        <p>{{ artifact.size }}</p>
+        <a class="button tertiary" href="{{ artifact.download_url }}">Download</a>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+</main>
+{% endblock %}

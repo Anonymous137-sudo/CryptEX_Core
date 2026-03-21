@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title }}</title>
+  <meta name="description" content="{{ description }}" />
+  <meta name="theme-color" content="#08120d" />
+  <link rel="icon" type="image/jpeg" href="/static/img/CryptEXlogo.jpeg" />
+  <link rel="stylesheet" href="/static/css/site.css" />
+</head>
+<body>
+  <div class="site-shell">
+    <header class="topbar">
+      <div class="brand-wrap">
+        <a class="brand" href="/">
+          <img src="/static/img/CryptEXlogo.jpeg" alt="CryptEX logo" />
+          <div>
+            <strong>{{ site_name }}</strong>
+            <span>{{ tagline }}</span>
+          </div>
+        </a>
+      </div>
+      <button class="nav-toggle" type="button" aria-label="Toggle navigation" data-nav-toggle>Menu</button>
+      <nav class="main-nav" data-nav>
+        <a href="/" {% if page == "home" %}class="is-active"{% endif %}>Home</a>
+        <a href="/technology" {% if page == "technology" %}class="is-active"{% endif %}>Technology</a>
+        <a href="/downloads" {% if page == "downloads" %}class="is-active"{% endif %}>Downloads</a>
+        <a href="/security" {% if page == "security" %}class="is-active"{% endif %}>Security</a>
+        <a href="/roadmap" {% if page == "roadmap" %}class="is-active"{% endif %}>Roadmap</a>
+        <a href="{{ repository_url }}" target="_blank" rel="noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    {% block content %}{% endblock %}
+
+    <footer class="site-footer">
+      <div class="footer-meta">
+        <strong>{{ organization }}</strong>
+        <p>512-bit SHA3 infrastructure for operators, miners, and security-minded users.</p>
+      </div>
+      <div class="footer-links">
+        <a href="/downloads">Current releases</a>
+        <a href="/security">Security posture</a>
+        <a href="/.well-known/security.txt">security.txt</a>
+        <a href="/api/health">API health</a>
+        <a href="{{ repository_url }}" target="_blank" rel="noreferrer">Source repository</a>
+      </div>
+    </footer>
+  </div>
+  <script src="/static/js/site.js" defer></script>
+</body>
+</html>

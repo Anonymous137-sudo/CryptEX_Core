@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Downloads</p>
+    <h1>Current CryptEX release artifacts</h1>
+    <p>The site surfaces only the artifacts that actually exist in the current release directory, so downloads stay aligned with the shipped builds.</p>
+    <p><a class="button tertiary" href="{{ repository_url }}" target="_blank" rel="noreferrer">Open GitHub repository</a></p>
+  </section>
+
+  {% for platform, artifacts in grouped_artifacts.items() %}
+    {% if artifacts %}
+    <section class="platform-section">
+      <div class="section-heading">
+        <p class="eyebrow">{{ platform }}</p>
+        <h2>{{ platform }} release channel</h2>
+      </div>
+      <div class="artifact-list">
+        {% for artifact in artifacts %}
+        <article class="artifact-card">
+          <div class="artifact-header">
+            <div>
+              <h3>{{ artifact.label }}</h3>
+              <p>{{ artifact.kind }} · {{ artifact.arch }}</p>
+            </div>
+            <span class="artifact-size">{{ artifact.size }}</span>
+          </div>
+          <code class="checksum">{{ artifact.sha256 }}</code>
+          <div class="artifact-actions">
+            <a class="button primary" href="{{ artifact.download_url }}">Download</a>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+  {% endfor %}
+</main>
+{% endblock %}
