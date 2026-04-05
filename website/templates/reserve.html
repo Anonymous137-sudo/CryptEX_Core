@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Reserve transparency</p>
+    <h1>Wrapped supply versus locked native CRX.</h1>
+    <p>This page is the public reserve layer for the custodial bridge. Whether the bridge is currently manual or partially automated, it should never show wrapped ERC supply higher than locked native CRX backing.</p>
+  </section>
+
+  {% if snapshot_error %}
+  <section class="panel panel-dark callout-panel warning-panel">
+    <p class="eyebrow">Reserve snapshot unavailable</p>
+    <h2>The reserve file could not be loaded.</h2>
+    <p>{{ snapshot_error }}</p>
+  </section>
+  {% endif %}
+
+  {% if snapshot %}
+  <section class="stat-grid">
+    {% for card in reserve_cards %}
+    <article class="stat-card">
+      <span>{{ card.label }}</span>
+      <strong>{{ card.value }}</strong>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="split-section">
+    <article class="panel panel-dark">
+      <div class="section-heading">
+        <p class="eyebrow">Reserve details</p>
+        <h2>Current bridge posture</h2>
+      </div>
+      <div class="kv-grid">
+        {% for label, value in reserve_details %}
+        <div class="kv-row">
+          <span>{{ label }}</span>
+          <code>{{ value }}</code>
+        </div>
+        {% endfor %}
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="section-heading">
+        <p class="eyebrow">Operator note</p>
+        <h2>What this snapshot means</h2>
+      </div>
+      <p>This is still a custodial bridge. A solvency display here means the reserve snapshot says native locked backing is at least as large as wrapped supply.</p>
+      <p><strong>Surplus / deficit:</strong> {{ snapshot.surplus_display }}</p>
+      <p><strong>Status flag:</strong> {{ 'Solvent' if snapshot.is_solvent else 'Under-collateralized' }}</p>
+      <p><strong>Notes:</strong> {{ snapshot.notes or 'No operator notes supplied.' }}</p>
+      {% if snapshot.explorer_url %}
+      <p><a class="button tertiary" href="{{ snapshot.explorer_url }}" target="_blank" rel="noreferrer">Open wrapped token explorer</a></p>
+      {% endif %}
+    </article>
+  </section>
+  {% endif %}
+</main>
+{% endblock %}

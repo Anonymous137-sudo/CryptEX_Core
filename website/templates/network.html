@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Network status</p>
+    <h1>Live chain, sync, peer, and checkpoint telemetry from the active CryptEX backend.</h1>
+    <p>The website now pulls network state directly from the node RPC surface, so operators can inspect live height, approval state, sync progress, and recent blocks without leaving the public site.</p>
+  </section>
+
+  {% if backend_error %}
+  <section class="panel panel-dark callout-panel warning-panel">
+    <p class="eyebrow">Backend unavailable</p>
+    <h2>Live RPC data is not reachable right now.</h2>
+    <p>{{ backend_error }}</p>
+  </section>
+  {% endif %}
+
+  <section class="stat-grid">
+    {% for card in status_cards %}
+    <article class="stat-card">
+      <span>{{ card.label }}</span>
+      <strong>{{ card.value }}</strong>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="split-section">
+    <article class="panel panel-dark">
+      <div class="section-heading">
+        <p class="eyebrow">Chain details</p>
+        <h2>Consensus and sync posture</h2>
+      </div>
+      <div class="kv-grid">
+        {% for label, value in chain_details %}
+        <div class="kv-row">
+          <span>{{ label }}</span>
+          <code>{{ value }}</code>
+        </div>
+        {% endfor %}
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="section-heading">
+        <p class="eyebrow">Recent blocks</p>
+        <h2>Latest accepted chain tips</h2>
+      </div>
+      {% if recent_blocks %}
+      <div class="data-table-wrap">
+        <table class="data-table compact-table">
+          <thead>
+            <tr>
+              <th>Height</th>
+              <th>Time</th>
+              <th>Transactions</th>
+              <th>Difficulty</th>
+              <th>Hash</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for block in recent_blocks %}
+            <tr>
+              <td>{{ block.height }}</td>
+              <td>{{ block.time }}</td>
+              <td>{{ block.txcount }}</td>
+              <td>{{ "%.6f"|format(block.difficulty) }}</td>
+              <td><code>{{ block.hash }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p>No block data is available yet.</p>
+      {% endif %}
+    </article>
+  </section>
+</main>
+{% endblock %}

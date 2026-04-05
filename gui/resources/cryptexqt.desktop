@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CryptEX Qt
+Comment=CryptEX graphical client
+Exec=cryptexqt_linux
+Icon=CryptEX
+Categories=Network;Finance;
+Terminal=false
+StartupNotify=true

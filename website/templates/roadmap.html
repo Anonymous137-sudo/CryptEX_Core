@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Roadmap</p>
+    <h1>What comes next for CryptEX</h1>
+    <p>The next steps stay focused on operational maturity, richer user workflows, and better public network visibility.</p>
+  </section>
+
+  <section class="roadmap-stack">
+    {% for bucket in roadmap_items %}
+    <article class="roadmap-card">
+      <h2>{{ bucket["phase"] }}</h2>
+      <ul class="bullet-list">
+        {% for item in bucket["items"] %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    </article>
+    {% endfor %}
+  </section>
+</main>
+{% endblock %}

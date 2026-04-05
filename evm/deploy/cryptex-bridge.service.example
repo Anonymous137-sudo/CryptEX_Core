@@ -1,0 +1,16 @@
+[Unit]
+Description=CryptEX automated bridge daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/CryptEX
+Environment=CRYPTEX_BRIDGE_NATIVE_RPC_PASSWORD=REPLACE_ME
+Environment=CRYPTEX_BRIDGE_EVM_PRIVATE_KEY=0xREPLACE_ME
+ExecStart=/usr/bin/python3 /path/to/CryptEX/evm/bridge/bridge_daemon.py --config /path/to/CryptEX/evm/config/bridge_config.example.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

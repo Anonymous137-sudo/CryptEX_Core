@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Technology</p>
+    <h1>CryptEX is designed as a practical operator stack, not just a protocol concept.</h1>
+    <p>Consensus, wallet recovery, sync behavior, RPC, chat, and packaging are all treated as part of the product surface.</p>
+  </section>
+
+  <section class="content-grid two-up">
+    <article class="content-card">
+      <h2>Consensus</h2>
+      <p>CryptEX uses SHA3-512 with full-width proof-of-work math, 512-bit chainwork, a network-specific genesis, and active longest-chain selection based on cumulative work.</p>
+    </article>
+    <article class="content-card">
+      <h2>Sync and storage</h2>
+      <p>Headers-first sync, binary block storage, persisted chainstate snapshots, peer reputation, and block inventory exchange keep nodes catch-up capable without losing operator visibility.</p>
+    </article>
+    <article class="content-card">
+      <h2>Wallet model</h2>
+      <p>BIP32 and BIP39 recovery, encrypted wallet files, multi-address support, balance separation between immature and spendable outputs, and secure chat identities are already in the stack.</p>
+    </article>
+    <article class="content-card">
+      <h2>Operational tooling</h2>
+      <p>JSON-RPC, structured logs, config files, GUI-backed daemon management, miner consoles, and system datadirs are built for actual deployment rather than demos.</p>
+    </article>
+  </section>
+</main>
+{% endblock %}

@@ -1,0 +1,33 @@
+{
+  "native": {
+    "rpc_url": "http://127.0.0.1:9332/",
+    "rpc_user": "admin",
+    "rpc_password_env": "CRYPTEX_BRIDGE_NATIVE_RPC_PASSWORD",
+    "reserve_address": "REPLACE_WITH_NATIVE_RESERVE_ADDRESS",
+    "deposit_confirmations": 6,
+    "release_confirmations": 1,
+    "scan_limit": 500
+  },
+  "evm": {
+    "rpc_url": "https://mainnet.infura.io/v3/REPLACE_ME",
+    "wrapped_contract_address": "0x0000000000000000000000000000000000000000",
+    "minter_private_key_env": "CRYPTEX_BRIDGE_EVM_PRIVATE_KEY",
+    "confirmations": 12,
+    "start_block": 0,
+    "chain_name": "Ethereum Mainnet",
+    "chain_id": 1,
+    "explorer_url": "https://etherscan.io/token/0x0000000000000000000000000000000000000000"
+  },
+  "automation": {
+    "poll_interval_seconds": 15,
+    "auto_mint": true,
+    "auto_release_redemptions": false,
+    "deposit_memo_prefix": "EVM:",
+    "mint_resubmit_after_seconds": 300,
+    "redemption_block_batch_size": 2000,
+    "state_path": "/path/to/CryptEX/evm/data/bridge_state.runtime.json",
+    "reserve_status_path": "/path/to/CryptEX/website/data/reserve_status.json",
+    "operator_mode": "automated-custodial",
+    "notes": "Automated bridge daemon active. Auto-mint enabled; native redemption release remains operator-reviewed until turned on."
+  }
+}

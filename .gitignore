@@ -1,0 +1,40 @@
+.DS_Store
+
+# Build outputs
+/build-*/
+/build-release/
+/build-release.zip
+/dist/
+/Testing/
+/compile_commands.json
+/src/CMakeFiles/
+
+# Local blockchain/runtime data
+/data/
+/archives/*
+!/archives/CryptEX_Whitepaper_Source_April_2026.md
+*.dat
+*.log
+
+# CMake temporary files
+CMakeCache.txt
+cmake_install.cmake
+
+# Editor/temp files
+*.swp
+*.swo
+*.tmp
+*.user
+*.orig
+__pycache__/
+*.pyc
+/src/gui/.qt/
+
+# Foundry / EVM build outputs
+/evm/cache/
+/evm/out/
+/evm/broadcast/
+/evm/data/*.runtime.json
+/evm/data/*.runtime.log
+/evm/data/*.runtime.stdout.log
+/evm/data/*.runtime.stderr.log

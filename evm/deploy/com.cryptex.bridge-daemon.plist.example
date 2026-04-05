@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cryptex.bridge-daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/path/to/CryptEX/evm/bridge/bridge_daemon.py</string>
+    <string>--config</string>
+    <string>/path/to/CryptEX/evm/config/bridge_config.example.json</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CRYPTEX_BRIDGE_NATIVE_RPC_PASSWORD</key>
+    <string>REPLACE_ME</string>
+    <key>CRYPTEX_BRIDGE_EVM_PRIVATE_KEY</key>
+    <string>0xREPLACE_ME</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/path/to/CryptEX</string>
+  <key>StandardOutPath</key>
+  <string>/path/to/CryptEX/evm/data/bridge-daemon.runtime.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/CryptEX/evm/data/bridge-daemon.runtime.stderr.log</string>
+</dict>
+</plist>

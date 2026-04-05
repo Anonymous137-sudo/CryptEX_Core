@@ -1,0 +1,13 @@
+{
+  "wrapped_contract_address": "",
+  "reserve_wallet_address": "",
+  "evm_chain_name": "Ethereum Mainnet",
+  "evm_chain_id": 1,
+  "explorer_url": "",
+  "operator_mode": "manual-custodial",
+  "status": "draft",
+  "native_locked_sats": 0,
+  "wrapped_supply_wei": 0,
+  "last_reconciled_at": "",
+  "notes": "Initial reserve snapshot placeholder. Update this file as soon as bridge reserve tracking begins."
+}

@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Explorer</p>
+    <h1>Search blocks, transactions, and addresses from the live chain.</h1>
+    <p>The explorer is backed by the same node RPC that powers the GUI. Search by block height, block hash, transaction id, or address.</p>
+    <form class="explorer-form" method="get" action="/explorer">
+      <input type="text" name="q" value="{{ query }}" placeholder="Block height, block hash, txid, or address" />
+      <button class="button primary" type="submit">Search</button>
+    </form>
+  </section>
+
+  {% if search_error %}
+  <section class="panel panel-dark callout-panel warning-panel">
+    <p class="eyebrow">Search error</p>
+    <h2>The explorer backend rejected this request.</h2>
+    <p>{{ search_error }}</p>
+  </section>
+  {% endif %}
+
+  <section class="split-section">
+    <article class="panel panel-dark">
+      <div class="section-heading">
+        <p class="eyebrow">Search result</p>
+        <h2>{% if query %}Query: {{ query }}{% else %}Enter a query to inspect chain data{% endif %}</h2>
+      </div>
+
+      {% if not query %}
+      <p>No query submitted yet. Try a recent block height, a txid, or a wallet address.</p>
+      {% elif search_type == "none" or not search_payload %}
+      <p>No matching block, transaction, or address was found for <code>{{ query }}</code>.</p>
+      {% elif search_type == "block" %}
+      <div class="kv-grid">
+        <div class="kv-row"><span>Type</span><code>Block</code></div>
+        <div class="kv-row"><span>Height</span><code>{{ search_payload.height }}</code></div>
+        <div class="kv-row"><span>Hash</span><code>{{ search_payload.hash }}</code></div>
+        <div class="kv-row"><span>Transactions</span><code>{{ search_payload.txcount if search_payload.txcount is defined else search_payload.tx|length }}</code></div>
+        <div class="kv-row"><span>Difficulty</span><code>{{ search_payload.difficulty }}</code></div>
+      </div>
+      {% elif search_type == "transaction" %}
+      <div class="kv-grid">
+        <div class="kv-row"><span>Type</span><code>Transaction</code></div>
+        <div class="kv-row"><span>TXID</span><code>{{ search_payload.txid }}</code></div>
+        <div class="kv-row"><span>Block height</span><code>{{ search_payload.blockheight if search_payload.blockheight is not none else 'mempool' }}</code></div>
+        <div class="kv-row"><span>Inputs</span><code>{{ search_payload.vin|length }}</code></div>
+        <div class="kv-row"><span>Outputs</span><code>{{ search_payload.vout|length }}</code></div>
+      </div>
+      {% elif search_type == "address" %}
+      <div class="kv-grid">
+        <div class="kv-row"><span>Type</span><code>Address</code></div>
+        <div class="kv-row"><span>Address</span><code>{{ search_payload.address }}</code></div>
+        <div class="kv-row"><span>Balance (sats)</span><code>{{ search_payload.balance_sats }}</code></div>
+        <div class="kv-row"><span>Spendable (sats)</span><code>{{ search_payload.spendable_balance_sats }}</code></div>
+        <div class="kv-row"><span>Immature (sats)</span><code>{{ search_payload.immature_balance_sats }}</code></div>
+        <div class="kv-row"><span>Unspent outputs</span><code>{{ search_payload.unspent_count }}</code></div>
+        <div class="kv-row"><span>Transactions</span><code>{{ search_payload.tx_count }}</code></div>
+      </div>
+      {% endif %}
+    </article>
+
+    <article class="panel">
+      <div class="section-heading">
+        <p class="eyebrow">Recent blocks</p>
+        <h2>Quick jump targets</h2>
+      </div>
+      {% if recent_blocks %}
+      <div class="data-table-wrap">
+        <table class="data-table compact-table">
+          <thead>
+            <tr>
+              <th>Height</th>
+              <th>Difficulty</th>
+              <th>Hash</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for block in recent_blocks %}
+            <tr>
+              <td><a href="/explorer?q={{ block.height }}">{{ block.height }}</a></td>
+              <td>{{ "%.6f"|format(block.difficulty) }}</td>
+              <td><code>{{ block.hash }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p>{{ recent_error or 'Recent block data is not available right now.' }}</p>
+      {% endif %}
+    </article>
+  </section>
+</main>
+{% endblock %}

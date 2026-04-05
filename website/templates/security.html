@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-main">
+  <section class="page-hero">
+    <p class="eyebrow">Security</p>
+    <h1>CryptEX web delivery is built to be domain-ready and locked down by default.</h1>
+    <p>This site stack avoids the usual brochure-site shortcuts and treats the public web presence as part of the project's operational surface.</p>
+  </section>
+
+  <section class="content-grid two-up">
+    <article class="content-card">
+      <h2>Application-level controls</h2>
+      <ul class="bullet-list">
+        <li>Trusted host allowlist</li>
+        <li>Optional canonical domain redirect</li>
+        <li>Optional HTTPS enforcement</li>
+        <li>Strict CSP and defensive browser headers</li>
+        <li>Basic request rate limiting</li>
+      </ul>
+    </article>
+    <article class="content-card">
+      <h2>Operational guidance</h2>
+      <ul class="bullet-list">
+        <li>Reverse-proxy deployment through Caddy</li>
+        <li>Domain-specific environment configuration</li>
+        <li>Dedicated security.txt disclosure path</li>
+        <li>Explicit download attachment behavior</li>
+        <li>Canonical sitemap and robots metadata</li>
+      </ul>
+    </article>
+  </section>
+
+  <section class="panel panel-dark">
+    <div class="panel-heading">
+      <p class="eyebrow">Disclosure</p>
+      <h2>Security contact</h2>
+    </div>
+    <p>If you need to report a site or release-delivery issue, use <a href="mailto:{{ security_contact }}">{{ security_contact }}</a>.</p>
+  </section>
+</main>
+{% endblock %}

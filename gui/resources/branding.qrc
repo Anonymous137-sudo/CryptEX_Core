@@ -1,0 +1,25 @@
+<RCC>
+    <qresource prefix="/branding">
+        <file alias="CryptEXlogo.jpeg">../../CryptEXlogo.jpeg</file>
+        <file alias="icons/overview.png">icons/btc_overview.png</file>
+        <file alias="icons/send.png">icons/btc_send.png</file>
+        <file alias="icons/receive.png">icons/btc_receive.png</file>
+        <file alias="icons/transactions.png">icons/btc_transactions.png</file>
+        <file alias="icons/connect0.png">icons/btc_connect0.png</file>
+        <file alias="icons/connect1.png">icons/btc_connect1.png</file>
+        <file alias="icons/connect2.png">icons/btc_connect2.png</file>
+        <file alias="icons/connect3.png">icons/btc_connect3.png</file>
+        <file alias="icons/connect4.png">icons/btc_connect4.png</file>
+        <file alias="icons/network_disabled.png">icons/btc_network_disabled.png</file>
+        <file alias="icons/synced.png">icons/btc_synced.png</file>
+        <file alias="icons/clock1.png">icons/btc_clock1.png</file>
+        <file alias="icons/clock2.png">icons/btc_clock2.png</file>
+        <file alias="icons/clock3.png">icons/btc_clock3.png</file>
+        <file alias="icons/clock4.png">icons/btc_clock4.png</file>
+        <file alias="icons/clock5.png">icons/btc_clock5.png</file>
+        <file alias="icons/node.svg">icons/node.svg</file>
+        <file alias="icons/network.svg">icons/network.svg</file>
+        <file alias="icons/console.svg">icons/console.svg</file>
+        <file alias="icons/settings.svg">icons/settings.svg</file>
+    </qresource>
+</RCC>
