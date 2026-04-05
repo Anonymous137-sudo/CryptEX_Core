@@ -68,7 +68,7 @@ def load_settings() -> Settings:
         force_https=_env_flag("CRYPTEX_FORCE_HTTPS", False),
         canonical_redirect=_env_flag("CRYPTEX_CANONICAL_REDIRECT", False),
         rate_limit_per_minute=max(30, int(os.getenv("CRYPTEX_RATE_LIMIT_PER_MINUTE", "240"))),
-        security_contact=os.getenv("CRYPTEX_SECURITY_CONTACT", "security@cryptexorg.duckdns.org"),
+        security_contact=os.getenv("CRYPTEX_SECURITY_CONTACT", "Anon-Sec-BTCC@proton.me"),
         rpc_url=os.getenv("CRYPTEX_RPC_URL", "").strip(),
         rpc_user=os.getenv("CRYPTEX_RPC_USER", "").strip(),
         rpc_password=os.getenv("CRYPTEX_RPC_PASSWORD", ""),

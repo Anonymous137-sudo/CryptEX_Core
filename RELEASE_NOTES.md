@@ -1,5 +1,7 @@
 # CryptEX v0.5.3 Release Notes
 
+Public contact: `Anon-Sec-BTCC@proton.me`
+
 These notes describe the CryptEX v0.5.3 release as of April 2026. The project now spans the native chain, desktop GUI, wallet and RPC stack, networking and sync infrastructure, website, and the wrapped-asset EVM workspace.
 
 ## Featured Changes

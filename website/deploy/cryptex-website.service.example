@@ -9,7 +9,7 @@ Environment=CRYPTEX_SITE_URL=https://cryptexorg.duckdns.org
 Environment=CRYPTEX_ALLOWED_HOSTS=cryptexorg.duckdns.org,localhost,127.0.0.1
 Environment=CRYPTEX_FORCE_HTTPS=true
 Environment=CRYPTEX_CANONICAL_REDIRECT=true
-Environment=CRYPTEX_SECURITY_CONTACT=security@cryptexorg.duckdns.org
+Environment=CRYPTEX_SECURITY_CONTACT=Anon-Sec-BTCC@proton.me
 Environment=CRYPTEX_REPOSITORY_URL=https://github.com/Anonymous137-sudo/CryptEX_Core
 Environment=CRYPTEX_SITE_HOST=127.0.0.1
 Environment=CRYPTEX_SITE_PORT=8080

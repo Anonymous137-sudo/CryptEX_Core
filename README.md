@@ -2,6 +2,8 @@
 
 Current release: `v0.5.3`
 
+Public contact: `Anon-Sec-BTCC@proton.me`
+
 CryptEX is a C++ SHA3-512 cryptocurrency with full 512-bit proof-of-work math, a separate Qt GUI and backend daemon, encrypted HD wallets, secure chat, JSON-RPC, adaptive difficulty control, and multi-network support across mainnet, testnet, and regtest.
 
 ## Current Highlights
