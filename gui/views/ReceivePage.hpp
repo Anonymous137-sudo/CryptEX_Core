@@ -21,6 +21,7 @@ private:
     QString selectAddressFormat(const QString& title);
     void requestNewAddress();
     void requestUnusedAddress();
+    void requestSetPrimaryAddress();
     void copyPrimaryAddress();
     QString addressFromObject(const QJsonObject& obj, const QString& baseKey) const;
 
@@ -33,6 +34,7 @@ private:
     QTableWidget* addressTable_{nullptr};
     QPushButton* newAddressButton_{nullptr};
     QPushButton* unusedAddressButton_{nullptr};
+    QPushButton* setPrimaryButton_{nullptr};
     QPushButton* copyAddressButton_{nullptr};
     QString preferredAddressFormat_{QStringLiteral("base64")};
     QString currentWalletFormat_{QStringLiteral("base64")};

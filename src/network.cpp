@@ -1,4 +1,5 @@
 #include "network.hpp"
+#include "base64.hpp"
 #include "blockchain.hpp"
 #include "chat_secure.hpp"
 #include "chainparams.hpp"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -22,11 +24,21 @@
 #include <random>
 #include <regex>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <openssl/ssl.h>
 
 namespace cryptex {
 namespace net {
 
 namespace {
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace ssl = boost::asio::ssl;
+using tcp = boost::asio::ip::tcp;
 
 const char* mempool_status_name(Mempool::AcceptStatus status) {
     switch (status) {
@@ -71,6 +83,64 @@ bool is_ipv4_literal(const std::string& host) {
     } catch (...) {
         return false;
     }
+}
+
+uint64_t now_millis() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+std::optional<size_t> wallet_index_for_address(const Wallet& wallet, const std::string& address) {
+    for (size_t i = 0; i < wallet.addresses.size(); ++i) {
+        if (crypto::addresses_equal(wallet.addresses[i], address)) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+size_t resolve_voice_sender_index(const Wallet& wallet, const std::string& address) {
+    if (!address.empty()) {
+        if (auto idx = wallet_index_for_address(wallet, address)) {
+            return *idx;
+        }
+        throw std::runtime_error("voice sender address not found in wallet");
+    }
+    if (wallet.addresses.empty() || wallet.privkeys.empty() || wallet.pubkeys.empty()) {
+        throw std::runtime_error("wallet has no voice-call key material");
+    }
+    return 0;
+}
+
+std::string voice_security_label(const net::NetworkNode::VoiceCallInfo& info) {
+    const auto capabilities = voice::capability_summary(info.capability_flags);
+    return "ECDH session | AES-GCM frames | " + info.codec + " | " + capabilities;
+}
+
+voice::SessionKey session_key_from_bytes(const std::vector<uint8_t>& bytes) {
+    if (bytes.size() != voice::SessionKey{}.size()) {
+        throw std::runtime_error("voice session key size invalid");
+    }
+    voice::SessionKey key{};
+    std::memcpy(key.data(), bytes.data(), key.size());
+    return key;
+}
+
+bool is_public_ipv4_address(const boost::asio::ip::address_v4& address) {
+    const auto bytes = address.to_bytes();
+    if (bytes[0] == 0 || bytes[0] == 10 || bytes[0] == 127) return false;
+    if (bytes[0] == 169 && bytes[1] == 254) return false;
+    if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) return false;
+    if (bytes[0] == 192 && bytes[1] == 168) return false;
+    if (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127) return false;
+    if (bytes[0] == 192 && bytes[1] == 0 && bytes[2] == 2) return false;
+    if (bytes[0] == 198 && bytes[1] == 18) return false;
+    if (bytes[0] == 198 && bytes[1] == 19) return false;
+    if (bytes[0] == 198 && bytes[1] == 51 && bytes[2] == 100) return false;
+    if (bytes[0] == 203 && bytes[1] == 0 && bytes[2] == 113) return false;
+    if (bytes[0] == 224 || bytes[0] >= 240) return false;
+    if (bytes[0] == 255 && bytes[1] == 255 && bytes[2] == 255 && bytes[3] == 255) return false;
+    return true;
 }
 
 std::string shell_escape(const std::string& value) {
@@ -121,13 +191,77 @@ bool command_available(const std::string& name) {
     return result.exit_code == 0;
 }
 
-std::string extract_ipv4_literal(const std::string& body) {
+std::string parse_ipv4_literal_body(std::string body) {
+    body.erase(body.begin(), std::find_if(body.begin(), body.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+    body.erase(std::find_if(body.rbegin(), body.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), body.end());
+    if (body.empty()) {
+        throw std::invalid_argument("empty IP detection response");
+    }
+    auto parsed = boost::asio::ip::make_address_v4(body);
+    if (!is_public_ipv4_address(parsed)) {
+        throw std::invalid_argument("non-public IPv4");
+    }
+    return parsed.to_string();
+}
+
+std::string extract_first_ipv4_literal(const std::string& body) {
     static const std::regex ip_pattern(R"((\d{1,3}(?:\.\d{1,3}){3}))");
     std::smatch match;
     if (!std::regex_search(body, match, ip_pattern) || match.empty()) {
         throw std::invalid_argument("Invalid IPv4");
     }
     return match.str(1);
+}
+
+struct IpDetectService {
+    std::string host;
+    std::string port;
+    std::string path;
+};
+
+std::string https_detect_ip(const IpDetectService& service) {
+    boost::asio::io_context ctx;
+    ssl::context ssl_ctx(ssl::context::tls_client);
+    ssl_ctx.set_default_verify_paths();
+
+    tcp::resolver resolver(ctx);
+    beast::ssl_stream<beast::tcp_stream> stream(ctx, ssl_ctx);
+    if (!SSL_set_tlsext_host_name(stream.native_handle(), service.host.c_str())) {
+        throw std::runtime_error("ip detect tls sni setup failed");
+    }
+    stream.set_verify_mode(ssl::verify_peer);
+    stream.set_verify_callback(ssl::host_name_verification(service.host));
+
+    auto results = resolver.resolve(service.host, service.port);
+    beast::get_lowest_layer(stream).connect(results);
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::empty_body> req{http::verb::get, service.path, 11};
+    req.set(http::field::host, service.host);
+    req.set(http::field::user_agent, "CryptEX-IPDetect");
+
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    beast::error_code ec;
+    stream.shutdown(ec);
+    if (ec == boost::asio::error::eof) {
+        ec = {};
+    }
+    if (ec) {
+        throw beast::system_error{ec};
+    }
+    if (res.result() != http::status::ok) {
+        throw std::runtime_error("IP detect failed HTTP " + std::to_string(static_cast<unsigned>(res.result_int())));
+    }
+    return parse_ipv4_literal_body(res.body());
 }
 
 void read_exact(boost::asio::ip::tcp::socket& socket, void* data, std::size_t size) {
@@ -320,6 +454,12 @@ std::vector<uint8_t> ChatPayload::serialize() const {
     out.push_back(version);
     out.push_back(chat_type);
     out.push_back(flags);
+    if (version >= 3) {
+        out.push_back(kdf_profile);
+    }
+    if (version >= 4) {
+        out.push_back(cipher_profile);
+    }
     serialization::write_int<uint64_t>(out, timestamp);
     serialization::write_int<uint64_t>(out, nonce);
     serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(sender.data()), sender.size());
@@ -327,6 +467,7 @@ std::vector<uint8_t> ChatPayload::serialize() const {
     serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(channel.data()), channel.size());
     serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(recipient.data()), recipient.size());
     serialization::write_bytes(out, recipient_pubkey.data(), recipient_pubkey.size());
+    serialization::write_bytes(out, wrapped_key.data(), wrapped_key.size());
     serialization::write_bytes(out, body.data(), body.size());
     serialization::write_bytes(out, iv.data(), iv.size());
     serialization::write_bytes(out, auth_tag.data(), auth_tag.size());
@@ -353,6 +494,12 @@ ChatPayload ChatPayload::deserialize(const std::vector<uint8_t>& data) {
     c.version = *ptr; ptr++; rem--;
     c.chat_type = serialization::read_int<uint8_t>(ptr, rem);
     c.flags = serialization::read_int<uint8_t>(ptr, rem);
+    if (c.version >= 3) {
+        c.kdf_profile = serialization::read_int<uint8_t>(ptr, rem);
+    }
+    if (c.version >= 4) {
+        c.cipher_profile = serialization::read_int<uint8_t>(ptr, rem);
+    }
     c.timestamp = serialization::read_int<uint64_t>(ptr, rem);
     c.nonce = serialization::read_int<uint64_t>(ptr, rem);
     auto sender = serialization::read_bytes(ptr, rem);
@@ -363,6 +510,7 @@ ChatPayload ChatPayload::deserialize(const std::vector<uint8_t>& data) {
     auto rec = serialization::read_bytes(ptr, rem);
     c.recipient.assign(rec.begin(), rec.end());
     c.recipient_pubkey = serialization::read_bytes(ptr, rem);
+    c.wrapped_key = serialization::read_bytes(ptr, rem);
     c.body = serialization::read_bytes(ptr, rem);
     c.iv = serialization::read_bytes(ptr, rem);
     c.auth_tag = serialization::read_bytes(ptr, rem);
@@ -1051,6 +1199,11 @@ void NetworkNode::record_chat_history(const chat::HistoryEntry& entry) {
     chat::append_history_entry(chat_history_file_, entry);
 }
 
+bool NetworkNode::delete_chat_message(const std::string& message_id) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    return chat::delete_history_entry(chat_history_file_, message_id);
+}
+
 void NetworkNode::punish_label(const std::string& label, int score, const std::string& reason) {
     if (label.empty()) return;
 
@@ -1165,6 +1318,344 @@ void NetworkNode::set_chat_wallet(std::shared_ptr<const Wallet> wallet) {
     chat_wallet_ = std::move(wallet);
 }
 
+NetworkNode::VoiceCallInfo NetworkNode::voice_call_state() const {
+    std::lock_guard<std::mutex> lock(voice_call_mutex_);
+    return voice_call_;
+}
+
+void NetworkNode::clear_voice_call_locked(const std::string& status) {
+    voice_call_ = VoiceCallInfo{};
+    voice_call_.status = status;
+    voice_audio_inbox_.clear();
+}
+
+size_t NetworkNode::dispatch_chat_payload(const ChatPayload& payload, const std::string& preferred_peer) {
+    Message msg;
+    msg.type = MessageType::CHAT;
+    msg.payload = payload.serialize();
+    remember_chat_message(chat::message_id(payload));
+    if (!preferred_peer.empty() && send_to(preferred_peer, msg)) {
+        return 1;
+    }
+    return broadcast_chat(msg);
+}
+
+bool NetworkNode::start_voice_call(const std::string& recipient_address,
+                                   const std::vector<uint8_t>& recipient_pubkey,
+                                   const std::string& recipient_rsa_public_pem,
+                                   const std::string& peer_label,
+                                   const std::string& from_address,
+                                   bool obfuscate_audio,
+                                   chat::EncryptionMode encryption_mode) {
+    if (!chat_wallet_) {
+        return false;
+    }
+    if (recipient_address.empty() || recipient_pubkey.empty()) {
+        return false;
+    }
+    (void)recipient_rsa_public_pem;
+    (void)encryption_mode;
+
+    VoiceCallInfo snapshot;
+    size_t sender_index = 0;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (voice_call_.active) {
+            return false;
+        }
+        try {
+            sender_index = resolve_voice_sender_index(*chat_wallet_, from_address);
+        } catch (...) {
+            return false;
+        }
+        snapshot.active = true;
+        snapshot.outgoing = true;
+        snapshot.ringing = true;
+        snapshot.connected = false;
+        snapshot.session_ready = false;
+        snapshot.obfuscate_audio = obfuscate_audio;
+        snapshot.started_at = static_cast<uint64_t>(std::time(nullptr));
+        snapshot.last_signal_at = snapshot.started_at;
+        snapshot.call_id = generate_lan_discovery_node_id();
+        snapshot.local_address = chat_wallet_->addresses[sender_index];
+        snapshot.remote_address = recipient_address;
+        snapshot.caller_address = snapshot.local_address;
+        snapshot.callee_address = recipient_address;
+        snapshot.remote_pubkey_b64 = crypto::base64_encode(recipient_pubkey);
+        snapshot.peer_label = peer_label;
+        snapshot.encryption_mode = "ECDH / AES-GCM / Opus";
+        snapshot.frame_duration_ms = 20;
+        snapshot.capability_flags = voice::CAPABILITY_AES_GCM |
+                                    voice::CAPABILITY_OPUS |
+                                    voice::CAPABILITY_AUDIO_CLOAK |
+                                    voice::CAPABILITY_LIVE_WAVEFORM;
+        snapshot.codec = voice::codec_name(voice::CODEC_OPUS);
+        snapshot.status = "calling";
+        try {
+            const auto session_key = voice::derive_session_key(chat_wallet_->privkeys[sender_index],
+                                                               recipient_pubkey,
+                                                               snapshot.call_id,
+                                                               snapshot.local_address,
+                                                               snapshot.remote_address);
+            snapshot.session_key.assign(session_key.begin(), session_key.end());
+            snapshot.session_ready = true;
+        } catch (...) {
+            clear_voice_call_locked("key-agreement-failed");
+            return false;
+        }
+        voice_call_ = snapshot;
+    }
+
+    voice::CallSignal offer;
+    offer.type = voice::SignalType::Offer;
+    offer.timestamp = snapshot.started_at;
+    offer.call_id = snapshot.call_id;
+    offer.caller_address = snapshot.caller_address;
+    offer.callee_address = snapshot.callee_address;
+    offer.peer_label = peer_label;
+    offer.caller_pubkey_b64 = crypto::base64_encode(chat_wallet_->pubkeys[sender_index]);
+    offer.caller_rsa_public_pem = chat_wallet_->chat_rsa_public_key_pem;
+    offer.encryption_mode = static_cast<uint8_t>(chat::EncryptionMode::ECDH);
+    offer.obfuscate_audio = obfuscate_audio;
+    offer.sample_rate = snapshot.sample_rate;
+    offer.channels = snapshot.channels;
+    offer.bits_per_sample = snapshot.bits_per_sample;
+    offer.frame_duration_ms = snapshot.frame_duration_ms;
+    offer.capability_flags = snapshot.capability_flags;
+    offer.codec = snapshot.codec;
+
+    auto payload = chat::make_encrypted_private_chat(*chat_wallet_,
+                                                     snapshot.local_address,
+                                                     snapshot.remote_address,
+                                                     recipient_pubkey,
+                                                     voice::make_signal_content(offer),
+                                                     chat::KeyDerivation::Argon2id,
+                                                     chat::EncryptionMode::ECDH,
+                                                     {},
+                                                     chat::CHAT_TYPE_VOICE_CONTROL);
+    const auto peers = dispatch_chat_payload(payload, peer_label);
+    if (peers == 0) {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        clear_voice_call_locked("no-route");
+        return false;
+    }
+    return true;
+}
+
+bool NetworkNode::accept_voice_call() {
+    if (!chat_wallet_) {
+        return false;
+    }
+    VoiceCallInfo snapshot;
+    size_t sender_index = 0;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || !voice_call_.incoming || !voice_call_.ringing) {
+            return false;
+        }
+        if (!voice_call_.session_ready) {
+            voice_call_.status = "key-agreement-failed";
+            return false;
+        }
+        try {
+            sender_index = resolve_voice_sender_index(*chat_wallet_, voice_call_.local_address);
+        } catch (...) {
+            voice_call_.status = "local-address-unavailable";
+            return false;
+        }
+        snapshot = voice_call_;
+        voice_call_.connected = true;
+        voice_call_.ringing = false;
+        voice_call_.status = "connected";
+        voice_call_.connected_at = static_cast<uint64_t>(std::time(nullptr));
+        voice_call_.last_signal_at = voice_call_.connected_at;
+        snapshot = voice_call_;
+    }
+
+    if (snapshot.remote_pubkey_b64.empty()) {
+        return false;
+    }
+    const auto recipient_pubkey = crypto::base64_decode(snapshot.remote_pubkey_b64);
+
+    voice::CallSignal answer;
+    answer.type = voice::SignalType::Answer;
+    answer.timestamp = snapshot.connected_at;
+    answer.call_id = snapshot.call_id;
+    answer.caller_address = snapshot.caller_address;
+    answer.callee_address = snapshot.callee_address;
+    answer.peer_label = snapshot.peer_label;
+    answer.caller_pubkey_b64 = crypto::base64_encode(chat_wallet_->pubkeys[sender_index]);
+    answer.encryption_mode = static_cast<uint8_t>(chat::EncryptionMode::ECDH);
+    answer.obfuscate_audio = snapshot.obfuscate_audio;
+    answer.sample_rate = snapshot.sample_rate;
+    answer.channels = snapshot.channels;
+    answer.bits_per_sample = snapshot.bits_per_sample;
+    answer.frame_duration_ms = snapshot.frame_duration_ms;
+    answer.capability_flags = snapshot.capability_flags;
+    answer.codec = snapshot.codec;
+
+    auto payload = chat::make_encrypted_private_chat(*chat_wallet_,
+                                                     snapshot.local_address,
+                                                     snapshot.remote_address,
+                                                     recipient_pubkey,
+                                                     voice::make_signal_content(answer),
+                                                     chat::KeyDerivation::Argon2id,
+                                                     chat::EncryptionMode::ECDH,
+                                                     {},
+                                                     chat::CHAT_TYPE_VOICE_CONTROL);
+    return dispatch_chat_payload(payload, snapshot.peer_label) > 0;
+}
+
+bool NetworkNode::decline_voice_call(const std::string& note) {
+    if (!chat_wallet_) {
+        return false;
+    }
+    VoiceCallInfo snapshot;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active) {
+            return false;
+        }
+        snapshot = voice_call_;
+        clear_voice_call_locked("declined");
+    }
+
+    if (snapshot.remote_address.empty()) {
+        return false;
+    }
+    if (snapshot.remote_address.empty() || snapshot.remote_pubkey_b64.empty()) {
+        return false;
+    }
+    const auto recipient_pubkey = crypto::base64_decode(snapshot.remote_pubkey_b64);
+    voice::CallSignal signal;
+    signal.type = voice::SignalType::Decline;
+    signal.timestamp = static_cast<uint64_t>(std::time(nullptr));
+    signal.call_id = snapshot.call_id;
+    signal.caller_address = snapshot.caller_address;
+    signal.callee_address = snapshot.callee_address;
+    signal.peer_label = snapshot.peer_label;
+    signal.encryption_mode = static_cast<uint8_t>(chat::EncryptionMode::ECDH);
+    signal.capability_flags = snapshot.capability_flags;
+    signal.codec = snapshot.codec;
+    signal.note = note;
+    auto payload = chat::make_encrypted_private_chat(*chat_wallet_,
+                                                     snapshot.local_address,
+                                                     snapshot.remote_address,
+                                                     recipient_pubkey,
+                                                     voice::make_signal_content(signal),
+                                                     chat::KeyDerivation::Argon2id,
+                                                     chat::EncryptionMode::ECDH,
+                                                     {},
+                                                     chat::CHAT_TYPE_VOICE_CONTROL);
+    dispatch_chat_payload(payload, snapshot.peer_label);
+    return true;
+}
+
+bool NetworkNode::end_voice_call(const std::string& note) {
+    if (!chat_wallet_) {
+        return false;
+    }
+    VoiceCallInfo snapshot;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active) {
+            return false;
+        }
+        snapshot = voice_call_;
+        clear_voice_call_locked("ended");
+    }
+
+    if (snapshot.remote_address.empty()) {
+        return false;
+    }
+    if (snapshot.remote_address.empty() || snapshot.remote_pubkey_b64.empty()) {
+        return false;
+    }
+    const auto recipient_pubkey = crypto::base64_decode(snapshot.remote_pubkey_b64);
+    voice::CallSignal signal;
+    signal.type = voice::SignalType::Hangup;
+    signal.timestamp = static_cast<uint64_t>(std::time(nullptr));
+    signal.call_id = snapshot.call_id;
+    signal.caller_address = snapshot.caller_address;
+    signal.callee_address = snapshot.callee_address;
+    signal.peer_label = snapshot.peer_label;
+    signal.encryption_mode = static_cast<uint8_t>(chat::EncryptionMode::ECDH);
+    signal.capability_flags = snapshot.capability_flags;
+    signal.codec = snapshot.codec;
+    signal.note = note;
+    auto payload = chat::make_encrypted_private_chat(*chat_wallet_,
+                                                     snapshot.local_address,
+                                                     snapshot.remote_address,
+                                                     recipient_pubkey,
+                                                     voice::make_signal_content(signal),
+                                                     chat::KeyDerivation::Argon2id,
+                                                     chat::EncryptionMode::ECDH,
+                                                     {},
+                                                     chat::CHAT_TYPE_VOICE_CONTROL);
+    dispatch_chat_payload(payload, snapshot.peer_label);
+    return true;
+}
+
+size_t NetworkNode::send_voice_audio(const std::vector<uint8_t>& pcm_bytes,
+                                     uint32_t sample_rate,
+                                     uint16_t channels,
+                                     uint16_t bits_per_sample,
+                                     bool obfuscated) {
+    if (!chat_wallet_ || pcm_bytes.empty()) {
+        return 0;
+    }
+
+    VoiceCallInfo snapshot;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || !voice_call_.connected || !voice_call_.session_ready) {
+            return 0;
+        }
+        snapshot = voice_call_;
+    }
+    if (snapshot.remote_pubkey_b64.empty()) {
+        return 0;
+    }
+    const auto recipient_pubkey = crypto::base64_decode(snapshot.remote_pubkey_b64);
+    uint64_t sequence = 0;
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        sequence = voice_call_.next_outgoing_sequence++;
+    }
+    try {
+        auto frame = voice::make_encrypted_audio_frame(pcm_bytes,
+                                                       session_key_from_bytes(snapshot.session_key),
+                                                       snapshot.call_id,
+                                                       now_millis(),
+                                                       sequence,
+                                                       sample_rate,
+                                                       channels,
+                                                       bits_per_sample,
+                                                       snapshot.frame_duration_ms,
+                                                       obfuscated);
+        auto payload = chat::make_signed_transport_chat(*chat_wallet_,
+                                                        snapshot.local_address,
+                                                        snapshot.remote_address,
+                                                        recipient_pubkey,
+                                                        voice::make_audio_frame_content(frame),
+                                                        chat::CHAT_TYPE_VOICE_FRAME);
+        return dispatch_chat_payload(payload, snapshot.peer_label);
+    } catch (const std::exception& ex) {
+        log_warn("voice", "failed to encode/send voice frame: " + std::string(ex.what()));
+        return 0;
+    }
+}
+
+std::vector<voice::AudioFrame> NetworkNode::take_voice_audio_frames(size_t max_frames) {
+    std::vector<voice::AudioFrame> out;
+    std::lock_guard<std::mutex> lock(voice_call_mutex_);
+    while (!voice_audio_inbox_.empty() && out.size() < max_frames) {
+        out.push_back(std::move(voice_audio_inbox_.front()));
+        voice_audio_inbox_.pop_front();
+    }
+    return out;
+}
+
 void NetworkNode::remember_chat_message(const std::string& message_id) {
     if (message_id.empty()) return;
     mark_chat_seen(message_id, static_cast<int64_t>(std::time(nullptr)));
@@ -1182,6 +1673,183 @@ bool NetworkNode::mark_chat_seen(const std::string& message_id, int64_t now) {
         return true;
     }
     return false;
+}
+
+void NetworkNode::handle_voice_signal(const voice::CallSignal& signal,
+                                      const chat::ParsedMessage& parsed,
+                                      const ChatPayload& payload,
+                                      const std::shared_ptr<PeerSession>& peer) {
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    const auto remote_pubkey = !payload.sender_pubkey.empty()
+        ? payload.sender_pubkey
+        : (signal.caller_pubkey_b64.empty() ? std::vector<uint8_t>{}
+                                            : crypto::base64_decode(signal.caller_pubkey_b64));
+    switch (signal.type) {
+    case voice::SignalType::Offer: {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (voice_call_.active && voice_call_.call_id != signal.call_id) {
+            return;
+        }
+        if (!chat_wallet_ || remote_pubkey.empty()) {
+            clear_voice_call_locked("key-agreement-failed");
+            return;
+        }
+        const auto local_address = signal.callee_address.empty() ? parsed.recipient_address : signal.callee_address;
+        const auto local_index = wallet_index_for_address(*chat_wallet_, local_address);
+        if (!local_index) {
+            clear_voice_call_locked("local-address-unavailable");
+            return;
+        }
+        voice::SessionKey session_key{};
+        try {
+            session_key = voice::derive_session_key(chat_wallet_->privkeys[*local_index],
+                                                    remote_pubkey,
+                                                    signal.call_id,
+                                                    local_address,
+                                                    signal.caller_address.empty() ? parsed.sender_address : signal.caller_address);
+        } catch (...) {
+            clear_voice_call_locked("key-agreement-failed");
+            return;
+        }
+        clear_voice_call_locked("incoming");
+        voice_call_.active = true;
+        voice_call_.incoming = true;
+        voice_call_.outgoing = false;
+        voice_call_.ringing = true;
+        voice_call_.connected = false;
+        voice_call_.session_ready = true;
+        voice_call_.status = "incoming";
+        voice_call_.started_at = signal.timestamp;
+        voice_call_.last_signal_at = now;
+        voice_call_.call_id = signal.call_id;
+        voice_call_.local_address = local_address;
+        voice_call_.remote_address = signal.caller_address.empty() ? parsed.sender_address : signal.caller_address;
+        voice_call_.caller_address = signal.caller_address.empty() ? parsed.sender_address : signal.caller_address;
+        voice_call_.callee_address = signal.callee_address.empty() ? local_address : signal.callee_address;
+        voice_call_.remote_pubkey_b64 = crypto::base64_encode(remote_pubkey);
+        voice_call_.remote_rsa_public_pem = signal.caller_rsa_public_pem;
+        voice_call_.peer_label = peer ? peer->remote_label() : signal.peer_label;
+        voice_call_.encryption_mode = "ECDH / AES-GCM / Opus";
+        voice_call_.obfuscate_audio = signal.obfuscate_audio;
+        voice_call_.sample_rate = signal.sample_rate;
+        voice_call_.channels = signal.channels;
+        voice_call_.bits_per_sample = signal.bits_per_sample;
+        voice_call_.frame_duration_ms = signal.frame_duration_ms == 0 ? 20 : signal.frame_duration_ms;
+        voice_call_.capability_flags = signal.capability_flags == 0
+            ? (voice::CAPABILITY_AES_GCM | voice::CAPABILITY_OPUS)
+            : signal.capability_flags;
+        voice_call_.codec = signal.codec.empty() ? voice::codec_name(voice::CODEC_OPUS) : signal.codec;
+        voice_call_.session_key.assign(session_key.begin(), session_key.end());
+        break;
+    }
+    case voice::SignalType::Answer: {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || voice_call_.call_id != signal.call_id) {
+            return;
+        }
+        if (!remote_pubkey.empty()) {
+            voice_call_.remote_pubkey_b64 = crypto::base64_encode(remote_pubkey);
+        }
+        if (!voice_call_.session_ready && chat_wallet_ && !voice_call_.remote_pubkey_b64.empty()) {
+            const auto local_index = wallet_index_for_address(*chat_wallet_, voice_call_.local_address);
+            if (local_index) {
+                try {
+                    const auto session_key = voice::derive_session_key(chat_wallet_->privkeys[*local_index],
+                                                                       crypto::base64_decode(voice_call_.remote_pubkey_b64),
+                                                                       voice_call_.call_id,
+                                                                       voice_call_.local_address,
+                                                                       voice_call_.remote_address);
+                    voice_call_.session_key.assign(session_key.begin(), session_key.end());
+                    voice_call_.session_ready = true;
+                } catch (...) {
+                    clear_voice_call_locked("key-agreement-failed");
+                    return;
+                }
+            }
+        }
+        voice_call_.incoming = false;
+        voice_call_.ringing = false;
+        voice_call_.connected = true;
+        voice_call_.status = "connected";
+        voice_call_.connected_at = now;
+        voice_call_.last_signal_at = now;
+        voice_call_.peer_label = peer ? peer->remote_label() : voice_call_.peer_label;
+        voice_call_.frame_duration_ms = signal.frame_duration_ms == 0 ? voice_call_.frame_duration_ms : signal.frame_duration_ms;
+        if (signal.capability_flags != 0) {
+            voice_call_.capability_flags = signal.capability_flags;
+        }
+        if (!signal.codec.empty()) {
+            voice_call_.codec = signal.codec;
+        }
+        break;
+    }
+    case voice::SignalType::Decline: {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || voice_call_.call_id != signal.call_id) {
+            return;
+        }
+        clear_voice_call_locked("declined");
+        break;
+    }
+    case voice::SignalType::Hangup: {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || voice_call_.call_id != signal.call_id) {
+            return;
+        }
+        clear_voice_call_locked("ended");
+        break;
+    }
+    }
+}
+
+void NetworkNode::handle_voice_frame(const voice::AudioFrame& frame,
+                                     const chat::ParsedMessage&,
+                                     const ChatPayload&,
+                                     const std::shared_ptr<PeerSession>&) {
+    voice::AudioFrame decoded = frame;
+    voice::SessionKey session_key{};
+    {
+        std::lock_guard<std::mutex> lock(voice_call_mutex_);
+        if (!voice_call_.active || voice_call_.call_id != frame.call_id || !voice_call_.session_ready) {
+            return;
+        }
+        try {
+            session_key = session_key_from_bytes(voice_call_.session_key);
+        } catch (...) {
+            return;
+        }
+    }
+    if (!voice::decrypt_audio_frame_inplace(decoded, session_key)) {
+        return;
+    }
+
+    const auto arrival_ms = now_millis();
+    uint64_t sample_latency = 0;
+    if (decoded.timestamp > 0 && arrival_ms >= decoded.timestamp && (arrival_ms - decoded.timestamp) < 15000) {
+        sample_latency = arrival_ms - decoded.timestamp;
+    }
+
+    std::lock_guard<std::mutex> lock(voice_call_mutex_);
+    if (!voice_call_.active || voice_call_.call_id != frame.call_id) {
+        return;
+    }
+    voice_call_.last_audio_at = static_cast<uint64_t>(std::time(nullptr));
+    if (sample_latency > 0) {
+        const auto previous_latency = voice_call_.latency_ms;
+        voice_call_.latency_ms = previous_latency == 0
+            ? sample_latency
+            : ((previous_latency * 7) + sample_latency) / 8;
+        const auto latency_delta = previous_latency > sample_latency
+            ? (previous_latency - sample_latency)
+            : (sample_latency - previous_latency);
+        voice_call_.jitter_ms = voice_call_.jitter_ms == 0
+            ? latency_delta
+            : ((voice_call_.jitter_ms * 7) + latency_delta) / 8;
+    }
+    if (voice_audio_inbox_.size() >= 64) {
+        voice_audio_inbox_.pop_front();
+    }
+    voice_audio_inbox_.push_back(std::move(decoded));
 }
 
 void NetworkNode::append_chat_inbox(const std::string& line) {
@@ -1222,6 +1890,10 @@ ip_address NetworkNode::public_ip() {
 NetworkNode::PortMappingStatus NetworkNode::port_mapping_status() const {
     std::lock_guard<std::mutex> guard(port_mapping_mutex_);
     return port_mapping_status_;
+}
+
+std::optional<NetworkNode::ProxySettings> NetworkNode::proxy_settings() const {
+    return proxy_;
 }
 
 Message NetworkNode::build_getheaders_request() const {
@@ -1610,13 +2282,33 @@ void NetworkNode::register_default_handlers() {
                 return;
             }
 
+            const bool is_voice_control = chat_payload.chat_type == chat::CHAT_TYPE_VOICE_CONTROL;
+            const bool is_voice_frame = chat_payload.chat_type == chat::CHAT_TYPE_VOICE_FRAME;
+            if (is_voice_control || is_voice_frame) {
+                if (is_voice_control) {
+                    if (parsed.decrypted) {
+                        if (auto signal = voice::parse_signal_content(parsed.content)) {
+                            handle_voice_signal(*signal, parsed, chat_payload, peer);
+                        }
+                    }
+                } else if (auto frame = voice::parse_audio_frame_content(parsed.content)) {
+                    handle_voice_frame(*frame, parsed, chat_payload, peer);
+                }
+                auto relayed = broadcast_chat(m, peer);
+                if (relayed > 0) {
+                    log_info("voice", "relayed voice payload id=" + parsed.message_id +
+                                         " peers=" + std::to_string(relayed));
+                }
+                return;
+            }
+
             chat::HistoryEntry entry;
             entry.direction = "in";
             entry.legacy = parsed.legacy;
             entry.authenticated = parsed.authenticated;
             entry.encrypted = parsed.encrypted;
             entry.decrypted = parsed.decrypted;
-            entry.is_private = chat_payload.chat_type == 1;
+            entry.is_private = chat_payload.chat_type != chat::CHAT_TYPE_PUBLIC;
             entry.timestamp = parsed.timestamp;
             entry.nonce = parsed.nonce;
             entry.message_id = parsed.message_id;
@@ -1628,6 +2320,18 @@ void NetworkNode::register_default_handlers() {
             entry.message = parsed.message;
             entry.peer_label = peer->remote_label();
             entry.status = parsed.encrypted && !parsed.decrypted ? "received-opaque" : "received";
+            entry.content_type = chat::content_type_name(parsed.content.type);
+            entry.mime_type = parsed.content.mime_type;
+            entry.attachment_name = parsed.content.attachment_name;
+            entry.attachment_size = static_cast<uint64_t>(parsed.content.attachment_bytes.size());
+            entry.audio_privacy = chat::audio_privacy_name(parsed.content.audio_privacy);
+            entry.transcript = parsed.content.transcript;
+            entry.encryption_mode = chat::encryption_mode_name(parsed.encryption_mode);
+            if (!parsed.content.attachment_bytes.empty()) {
+                entry.attachment_path = chat::persist_attachment(parsed.content,
+                                                                 chat_history_file_.parent_path(),
+                                                                 parsed.message_id).string();
+            }
 
             auto summary = chat::describe_history_entry(entry);
             log_info("chat", summary);
@@ -2188,7 +2892,7 @@ void NetworkNode::refresh_port_mapping() {
         next.protocol = protocol;
         next.refreshed_at = static_cast<int64_t>(std::time(nullptr));
         try {
-            auto ip = extract_ipv4_literal(result.output);
+            auto ip = extract_first_ipv4_literal(result.output);
             next.external_endpoint = ip + ":" + port;
         } catch (...) {
             if (advertised_self_) {
@@ -2273,39 +2977,39 @@ ip_address detect_public_ip(boost::asio::io_context& ctx,
                             const std::string& host,
                             const std::string& port,
                             const std::string& path) {
-    boost::asio::ip::tcp::resolver resolver(ctx);
-    boost::asio::ip::tcp::socket socket(ctx);
-    auto endpoints = resolver.resolve(host, port);
-    boost::asio::connect(socket, endpoints);
+    (void)ctx;
+    const std::string effective_port = (port == "80") ? "443" : port;
+    const bool using_default_service =
+        host == constants::IP_DETECT_HOST &&
+        (port == constants::IP_DETECT_PORT || effective_port == constants::IP_DETECT_PORT) &&
+        path == constants::IP_DETECT_PATH;
 
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " +
-                      host + "\r\nConnection: close\r\n\r\n";
-    boost::asio::write(socket, boost::asio::buffer(req));
-
-    boost::asio::streambuf response;
-    boost::asio::read_until(socket, response, "\r\n\r\n");
-    std::istream resp_stream(&response);
-    std::string http_version;
-    unsigned int status_code;
-    std::string status_message;
-    resp_stream >> http_version >> status_code;
-    std::getline(resp_stream, status_message);
-    if (!resp_stream || http_version.substr(0,5) != "HTTP/" || status_code != 200)
-        throw std::runtime_error("IP detect failed");
-
-    std::string body;
-    if (response.size() > 0) {
-        std::ostringstream ss;
-        ss << resp_stream.rdbuf();
-        body = ss.str();
-    } else {
-        boost::asio::read(socket, response, boost::asio::transfer_all());
-        std::ostringstream ss;
-        ss << &response;
-        body = ss.str();
+    std::vector<IpDetectService> services;
+    services.push_back({host, effective_port, path});
+    if (using_default_service) {
+        services.push_back({"api.ipify.org", "443", "/"});
+        services.push_back({"ipv4.icanhazip.com", "443", "/"});
     }
-    auto ip = ip_address::from_string(extract_ipv4_literal(body));
-    return ip;
+
+    std::unordered_map<std::string, size_t> counts;
+    std::optional<std::string> last_success;
+    for (const auto& service : services) {
+        try {
+            auto ip = https_detect_ip(service);
+            last_success = ip;
+            const auto next = ++counts[ip];
+            if (next >= 2 || services.size() == 1) {
+                return ip_address::from_string(ip);
+            }
+        } catch (const std::exception& ex) {
+            log_warn("network", std::string("public IP detect failed for ") + service.host + ": " + ex.what());
+        }
+    }
+
+    if (last_success) {
+        return ip_address::from_string(*last_success);
+    }
+    throw std::runtime_error("secure IP detect failed");
 }
 
 } // namespace net

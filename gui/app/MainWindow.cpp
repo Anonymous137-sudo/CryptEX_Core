@@ -5,16 +5,18 @@
 #include "views/TransactionsPage.hpp"
 #include "views/NetworkGraphPage.hpp"
 #include "views/WalletPage.hpp"
-#include "views/ChatPage.hpp"
 #include "views/MiningPage.hpp"
 #include "views/RpcConsolePage.hpp"
 #include "views/TerminalPage.hpp"
+#include "app/ChatWindow.hpp"
 #include "app/NodeWindow.hpp"
+#include "app/WalletManagerWindow.hpp"
 
 #include <QApplication>
 #include <QAction>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QCheckBox>
 #include <QDateTime>
 #include <QFrame>
 #include <QCloseEvent>
@@ -344,6 +346,7 @@ void MainWindow::buildUi() {
 
     auto* openNodeAction = windowMenu->addAction(QStringLiteral("Node Window"));
     auto* openWalletManagerAction = windowMenu->addAction(QStringLiteral("Wallet Manager"));
+    auto* openChatAction = windowMenu->addAction(QStringLiteral("P2P Messenger"));
     auto* refreshAction = fileMenu->addAction(QStringLiteral("Refresh"));
     auto* syncAction = settingsMenu->addAction(QStringLiteral("Sync Details"));
     fileMenu->addSeparator();
@@ -371,7 +374,6 @@ void MainWindow::buildUi() {
     transactionsPage_ = new TransactionsPage(tabs_);
     networkGraphPage_ = new NetworkGraphPage(this);
     walletPage_ = new WalletPage(this);
-    chatPage_ = new ChatPage(this);
     miningPage_ = new MiningPage(this);
     rpcConsolePage_ = new RpcConsolePage(this);
     terminalPage_ = new TerminalPage(this);
@@ -381,6 +383,8 @@ void MainWindow::buildUi() {
     consoleHubPage_ = new QWidget(this);
     minerOutputPage_ = new QWidget(this);
     nodeWindow_ = new NodeWindow(this);
+    chatWindow_ = new ChatWindow(this);
+    walletManagerWindow_ = new WalletManagerWindow(this);
 
     dashboardPage_->setRpcClient(&rpc_);
     sendPage_->setRpcClient(&rpc_);
@@ -388,9 +392,9 @@ void MainWindow::buildUi() {
     transactionsPage_->setRpcClient(&rpc_);
     networkGraphPage_->setRpcClient(&rpc_);
     walletPage_->setRpcClient(&rpc_);
-    chatPage_->setRpcClient(&rpc_);
     miningPage_->setRpcClient(&rpc_);
     rpcConsolePage_->setRpcClient(&rpc_);
+    chatWindow_->setRpcClient(&rpc_);
     miningPage_->setMinerController(&miner_);
     connect(walletPage_, &WalletPage::walletTypeChanged, this, [this]() {
         refreshWalletSessionState();
@@ -403,6 +407,12 @@ void MainWindow::buildUi() {
     rpcUserEdit_ = new QLineEdit(QStringLiteral("admin"), settingsPage_);
     rpcPasswordEdit_ = new QLineEdit(settingsPage_);
     rpcPasswordEdit_->setEchoMode(QLineEdit::Password);
+    rpcTlsCheck_ = new QCheckBox(QStringLiteral("Enable TLS"), settingsPage_);
+    rpcTlsAllowSelfSignedCheck_ = new QCheckBox(QStringLiteral("Trust self-signed on loopback"), settingsPage_);
+    rpcTlsAllowSelfSignedCheck_->setChecked(true);
+    rpcTlsCertPathEdit_ = new QLineEdit(settingsPage_);
+    rpcTlsKeyPathEdit_ = new QLineEdit(settingsPage_);
+    rpcTlsCaPathEdit_ = new QLineEdit(settingsPage_);
     daemonPathEdit_ = new QLineEdit(guessedDaemonPath(), settingsPage_);
     dataDirEdit_ = new QLineEdit(settingsPage_);
     walletNameEdit_ = new QLineEdit(walletManagerPage_);
@@ -410,16 +420,23 @@ void MainWindow::buildUi() {
     walletPassEdit_ = new QLineEdit(walletManagerPage_);
     walletPassEdit_->setEchoMode(QLineEdit::Password);
     walletFormatCombo_ = new QComboBox(walletManagerPage_);
+    walletKdfCombo_ = new QComboBox(walletManagerPage_);
     walletFormatCombo_->addItem(QStringLiteral("Base64 (CryptEX native)"), QStringLiteral("base64"));
     walletFormatCombo_->addItem(QStringLiteral("Base58 (P2PKH style)"), QStringLiteral("base58"));
     walletFormatCombo_->addItem(QStringLiteral("0x Hex (EVM style)"), QStringLiteral("hex"));
     walletFormatCombo_->addItem(QStringLiteral("Bech32"), QStringLiteral("bech32"));
+    walletKdfCombo_->addItem(QStringLiteral("Argon2id"), QStringLiteral("argon2id"));
+    walletKdfCombo_->addItem(QStringLiteral("Scrypt"), QStringLiteral("scrypt"));
+    walletKdfCombo_->addItem(QStringLiteral("PBKDF2"), QStringLiteral("pbkdf2"));
     walletListTable_ = new QTableWidget(walletManagerPage_);
     walletRootValue_ = new QLabel(QStringLiteral("-"), walletManagerPage_);
     directPeersEdit_ = new QLineEdit(settingsPage_);
     seedPeersEdit_ = new QLineEdit(settingsPage_);
     directPeersEdit_->setPlaceholderText(QStringLiteral("Optional direct peers, comma-separated"));
     seedPeersEdit_->setPlaceholderText(QStringLiteral("Leave blank to use automatic global discovery"));
+    rpcTlsCertPathEdit_->setPlaceholderText(QStringLiteral("Server certificate PEM (for cryptexd)"));
+    rpcTlsKeyPathEdit_->setPlaceholderText(QStringLiteral("Server private key PEM (for cryptexd)"));
+    rpcTlsCaPathEdit_->setPlaceholderText(QStringLiteral("Optional CA / cert PEM trusted by the GUI"));
     networkCombo_ = new QComboBox(settingsPage_);
     networkCombo_->addItems({QStringLiteral("mainnet"), QStringLiteral("testnet"), QStringLiteral("regtest")});
 
@@ -449,21 +466,59 @@ void MainWindow::buildUi() {
     backendSettingsLayout->addWidget(rpcUserEdit_, 1, 1);
     backendSettingsLayout->addWidget(new QLabel(QStringLiteral("RPC Password")), 1, 2);
     backendSettingsLayout->addWidget(rpcPasswordEdit_, 1, 3);
-    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Daemon Binary")), 2, 0);
-    backendSettingsLayout->addWidget(daemonPathEdit_, 2, 1);
-    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Data Dir")), 2, 2);
-    backendSettingsLayout->addWidget(dataDirEdit_, 2, 3);
-    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Direct Peer(s)")), 3, 0);
-    backendSettingsLayout->addWidget(directPeersEdit_, 3, 1);
-    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Seed DNS / Peers")), 3, 2);
-    backendSettingsLayout->addWidget(seedPeersEdit_, 3, 3);
-    backendSettingsLayout->addWidget(connectButton, 4, 0);
-    backendSettingsLayout->addWidget(saveButton, 4, 1);
-    backendSettingsLayout->addWidget(startButton, 4, 2);
-    backendSettingsLayout->addWidget(stopButton, 4, 3);
+    backendSettingsLayout->addWidget(rpcTlsCheck_, 2, 0);
+    backendSettingsLayout->addWidget(rpcTlsAllowSelfSignedCheck_, 2, 1);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("RPC CA Cert")), 2, 2);
+    backendSettingsLayout->addWidget(rpcTlsCaPathEdit_, 2, 3);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("RPC TLS Cert")), 3, 0);
+    backendSettingsLayout->addWidget(rpcTlsCertPathEdit_, 3, 1);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("RPC TLS Key")), 3, 2);
+    backendSettingsLayout->addWidget(rpcTlsKeyPathEdit_, 3, 3);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Daemon Binary")), 4, 0);
+    backendSettingsLayout->addWidget(daemonPathEdit_, 4, 1);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Data Dir")), 4, 2);
+    backendSettingsLayout->addWidget(dataDirEdit_, 4, 3);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Direct Peer(s)")), 5, 0);
+    backendSettingsLayout->addWidget(directPeersEdit_, 5, 1);
+    backendSettingsLayout->addWidget(new QLabel(QStringLiteral("Seed DNS / Peers")), 5, 2);
+    backendSettingsLayout->addWidget(seedPeersEdit_, 5, 3);
+    backendSettingsLayout->addWidget(connectButton, 6, 0);
+    backendSettingsLayout->addWidget(saveButton, 6, 1);
+    backendSettingsLayout->addWidget(startButton, 6, 2);
+    backendSettingsLayout->addWidget(stopButton, 6, 3);
     backendSettingsLayout->setColumnStretch(1, 1);
     backendSettingsLayout->setColumnStretch(3, 1);
     settingsRoot->addWidget(connectionBox);
+
+    const auto syncRpcTlsUi = [this]() {
+        const bool tlsEnabled = rpcTlsCheck_ && rpcTlsCheck_->isChecked();
+        if (rpcTlsAllowSelfSignedCheck_) rpcTlsAllowSelfSignedCheck_->setEnabled(tlsEnabled);
+        if (rpcTlsCertPathEdit_) rpcTlsCertPathEdit_->setEnabled(tlsEnabled);
+        if (rpcTlsKeyPathEdit_) rpcTlsKeyPathEdit_->setEnabled(tlsEnabled);
+        if (rpcTlsCaPathEdit_) rpcTlsCaPathEdit_->setEnabled(tlsEnabled);
+
+        QUrl url(rpcUrlEdit_->text().trimmed());
+        if (!url.isValid() || url.host().isEmpty()) {
+            return;
+        }
+        const QString desiredScheme = tlsEnabled ? QStringLiteral("https") : QStringLiteral("http");
+        if (url.scheme().compare(desiredScheme, Qt::CaseInsensitive) != 0) {
+            url.setScheme(desiredScheme);
+            rpcUrlEdit_->setText(url.toString());
+        }
+
+        const auto dataDir = dataDirEdit_ ? dataDirEdit_->text().trimmed() : QString();
+        if (tlsEnabled && !dataDir.isEmpty()) {
+            if (rpcTlsCertPathEdit_ && rpcTlsCertPathEdit_->text().trimmed().isEmpty()) {
+                rpcTlsCertPathEdit_->setText(QDir(dataDir).filePath(QStringLiteral("rpc_tls_cert.pem")));
+            }
+            if (rpcTlsKeyPathEdit_ && rpcTlsKeyPathEdit_->text().trimmed().isEmpty()) {
+                rpcTlsKeyPathEdit_->setText(QDir(dataDir).filePath(QStringLiteral("rpc_tls_key.pem")));
+            }
+        }
+    };
+    connect(rpcTlsCheck_, &QCheckBox::toggled, this, [syncRpcTlsUi](bool) { syncRpcTlsUi(); });
+    connect(dataDirEdit_, &QLineEdit::editingFinished, this, [syncRpcTlsUi]() { syncRpcTlsUi(); });
 
     auto* walletManagerRoot = new QVBoxLayout(walletManagerPage_);
     walletManagerRoot->setContentsMargins(12, 12, 12, 12);
@@ -493,7 +548,9 @@ void MainWindow::buildUi() {
     walletCreateLayout->addWidget(new QLabel(QStringLiteral("Wallet type")), 0, 2);
     walletCreateLayout->addWidget(walletFormatCombo_, 0, 3);
     walletCreateLayout->addWidget(new QLabel(QStringLiteral("Passcode")), 1, 0);
-    walletCreateLayout->addWidget(walletPassEdit_, 1, 1, 1, 3);
+    walletCreateLayout->addWidget(walletPassEdit_, 1, 1);
+    walletCreateLayout->addWidget(new QLabel(QStringLiteral("Encryption KDF")), 1, 2);
+    walletCreateLayout->addWidget(walletKdfCombo_, 1, 3);
     walletCreateLayout->addWidget(createWalletButton_, 2, 0);
     walletCreateLayout->addWidget(openWalletButton_, 2, 1);
     walletCreateLayout->addWidget(closeWalletButton_, 2, 2);
@@ -505,15 +562,17 @@ void MainWindow::buildUi() {
 
     auto* walletListBox = new QGroupBox(QStringLiteral("Available Wallets"), walletManagerPage_);
     auto* walletListLayout = new QVBoxLayout(walletListBox);
-    walletListTable_->setColumnCount(4);
+    walletListTable_->setColumnCount(5);
     walletListTable_->setHorizontalHeaderLabels({QStringLiteral("Name"),
                                                  QStringLiteral("Type"),
+                                                 QStringLiteral("KDF"),
                                                  QStringLiteral("Wallet File"),
                                                  QStringLiteral("Active")});
     walletListTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     walletListTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    walletListTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    walletListTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    walletListTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    walletListTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    walletListTable_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     walletListTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     walletListTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     walletListTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -629,9 +688,8 @@ void MainWindow::buildUi() {
     setCentralWidget(central);
 
     nodeWindow_->setSection(QStringLiteral("information"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/node.svg"), iconTint, QSize(20, 20)), QStringLiteral("Information"), makeScrollableTab(nodeInfoPage_, nodeWindow_));
-    nodeWindow_->setSection(QStringLiteral("wallets"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/node.svg"), iconTint, QSize(20, 20)), QStringLiteral("Wallet Manager"), makeScrollableTab(walletManagerPage_, nodeWindow_));
+    walletManagerWindow_->setPage(makeScrollableTab(walletManagerPage_, walletManagerWindow_));
     nodeWindow_->setSection(QStringLiteral("wallet"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/node.svg"), iconTint, QSize(20, 20)), QStringLiteral("Wallet Tools"), makeScrollableTab(walletPage_, nodeWindow_));
-    nodeWindow_->setSection(QStringLiteral("chat"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/node.svg"), iconTint, QSize(20, 20)), QStringLiteral("Chat"), makeScrollableTab(chatPage_, nodeWindow_));
     nodeWindow_->setSection(QStringLiteral("mining"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/node.svg"), iconTint, QSize(20, 20)), QStringLiteral("Mining"), makeScrollableTab(miningPage_, nodeWindow_));
     nodeWindow_->setSection(QStringLiteral("console"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/console.svg"), iconTint, QSize(20, 20)), QStringLiteral("Console"), consoleHubPage_);
     nodeWindow_->setSection(QStringLiteral("system-log"), makeAdaptiveIcon(QStringLiteral(":/branding/icons/console.svg"), iconTint, QSize(20, 20)), QStringLiteral("System Log"), makeScrollableTab(systemLogPage, nodeWindow_));
@@ -649,6 +707,11 @@ void MainWindow::buildUi() {
     nodeWindowButton_->setAutoRaise(true);
     nodeWindowButton_->setToolTip(QStringLiteral("Open Node Window"));
     cornerLayout->addWidget(nodeWindowButton_);
+    chatWindowButton_ = new QToolButton(cornerWidget);
+    chatWindowButton_->setIcon(makeAdaptiveIcon(QStringLiteral(":/branding/icons/network.svg"), iconTint, QSize(18, 18)));
+    chatWindowButton_->setAutoRaise(true);
+    chatWindowButton_->setToolTip(QStringLiteral("Open P2P Messenger"));
+    cornerLayout->addWidget(chatWindowButton_);
     tabs_->setCornerWidget(cornerWidget, Qt::TopRightCorner);
 
     daemonStatusLabel_ = new QLabel(QStringLiteral("Node: stopped"), this);
@@ -804,7 +867,8 @@ void MainWindow::buildUi() {
     updateSyncStatusBar(QStringLiteral("Synchronizing with network..."), true);
 
     connect(openNodeAction, &QAction::triggered, this, [this]() { openNodeWindow(); });
-    connect(openWalletManagerAction, &QAction::triggered, this, [this]() { openNodeWindow(QStringLiteral("wallets")); });
+    connect(openWalletManagerAction, &QAction::triggered, this, [this]() { openWalletManagerWindow(); });
+    connect(openChatAction, &QAction::triggered, this, [this]() { openChatWindow(); });
     connect(refreshAction, &QAction::triggered, this, [this]() { refreshAll(); });
     connect(syncAction, &QAction::triggered, this, [this]() { toggleSyncOverlay(); });
     connect(quitAction, &QAction::triggered, this, [this]() { close(); });
@@ -814,8 +878,10 @@ void MainWindow::buildUi() {
                                  QStringLiteral("CryptEX Core keeps the main wallet view focused while advanced node, mining, console, and network tools live in the separate Node window."));
     });
     connect(nodeWindowButton_, &QToolButton::clicked, this, [this]() { openNodeWindow(); });
+    connect(chatWindowButton_, &QToolButton::clicked, this, [this]() { openChatWindow(); });
     connect(tabs_, &QTabWidget::currentChanged, this, [this](int) { refreshCurrentMainTab(); });
     connect(nodeWindow_, &NodeWindow::sectionChanged, this, [this](const QString&) { refreshVisibleNodeSection(); });
+    connect(chatWindow_, &ChatWindow::sectionChanged, this, [this](const QString&) { refreshVisibleChatSection(); });
     connect(connectButton, &QPushButton::clicked, this, [this]() {
         systemLogView_->appendPlainText(QStringLiteral("[gui] Connect requested for %1").arg(rpcUrlEdit_->text().trimmed()));
         applyAutomaticBackendDefaults();
@@ -843,7 +909,8 @@ void MainWindow::buildUi() {
         const auto row = items.first()->row();
         const auto* nameItem = walletListTable_->item(row, 0);
         const auto* typeItem = walletListTable_->item(row, 1);
-        const auto* fileItem = walletListTable_->item(row, 2);
+        const auto* kdfItem = walletListTable_->item(row, 2);
+        const auto* fileItem = walletListTable_->item(row, 3);
         if (nameItem) {
             walletNameEdit_->setText(nameItem->text());
         }
@@ -851,6 +918,12 @@ void MainWindow::buildUi() {
             const auto index = walletFormatCombo_->findData(typeItem->text().toLower());
             if (index >= 0) {
                 walletFormatCombo_->setCurrentIndex(index);
+            }
+        }
+        if (kdfItem) {
+            const auto index = walletKdfCombo_->findData(kdfItem->text().toLower());
+            if (index >= 0) {
+                walletKdfCombo_->setCurrentIndex(index);
             }
         }
         if (fileItem) {
@@ -1499,7 +1572,9 @@ void MainWindow::applyAutomaticBackendDefaults() {
     }
     autoDataDir_ = nextDataDir;
 
-    const auto nextRpcUrl = defaultRpcUrlForNetwork(network).toString();
+    auto defaultUrl = defaultRpcUrlForNetwork(network);
+    defaultUrl.setScheme(rpcTlsCheck_ && rpcTlsCheck_->isChecked() ? QStringLiteral("https") : QStringLiteral("http"));
+    const auto nextRpcUrl = defaultUrl.toString();
     const auto currentRpcUrl = rpcUrlEdit_->text().trimmed();
     if (currentRpcUrl.isEmpty() || (!autoRpcUrl_.isEmpty() && currentRpcUrl == autoRpcUrl_)) {
         rpcUrlEdit_->setText(nextRpcUrl);
@@ -1534,6 +1609,8 @@ void MainWindow::applyConfigBackedDefaults() {
     if (!rpcUrl.isValid() || rpcUrl.isEmpty()) {
         rpcUrl = defaultRpcUrlForNetwork(networkCombo_->currentText());
     }
+    const bool configRpcTls = entries.value(QStringLiteral("rpctls")).trimmed() == QStringLiteral("1");
+    rpcUrl.setScheme(configRpcTls ? QStringLiteral("https") : QStringLiteral("http"));
     if (entries.contains(QStringLiteral("rpcbind"))) {
         rpcUrl.setHost(loopbackRpcHostForBind(entries.value(QStringLiteral("rpcbind"))));
     }
@@ -1550,6 +1627,15 @@ void MainWindow::applyConfigBackedDefaults() {
         rpcUrlEdit_->setText(nextRpcUrl);
     }
     autoRpcUrl_ = nextRpcUrl;
+    if (rpcTlsCheck_) {
+        rpcTlsCheck_->setChecked(configRpcTls);
+    }
+    if (rpcTlsCertPathEdit_ && entries.contains(QStringLiteral("rpctlscert"))) {
+        rpcTlsCertPathEdit_->setText(entries.value(QStringLiteral("rpctlscert")).trimmed());
+    }
+    if (rpcTlsKeyPathEdit_ && entries.contains(QStringLiteral("rpctlskey"))) {
+        rpcTlsKeyPathEdit_->setText(entries.value(QStringLiteral("rpctlskey")).trimmed());
+    }
 
     const auto configConnect = normalizePeerEntry(entries.value(QStringLiteral("connect")));
     if (!configConnect.isEmpty()) {
@@ -1607,6 +1693,19 @@ void MainWindow::persistLocalRpcConfig() {
     entries.insert(QStringLiteral("rpcpassword"), rpcPassword);
     entries.insert(QStringLiteral("rpcbind"), QStringLiteral("127.0.0.1"));
     entries.insert(QStringLiteral("rpcport"), QString::number(rpcUrl.port(9332)));
+    if (rpcTlsCheck_ && rpcTlsCheck_->isChecked()) {
+        entries.insert(QStringLiteral("rpctls"), QStringLiteral("1"));
+        if (rpcTlsCertPathEdit_ && !rpcTlsCertPathEdit_->text().trimmed().isEmpty()) {
+            entries.insert(QStringLiteral("rpctlscert"), rpcTlsCertPathEdit_->text().trimmed());
+        }
+        if (rpcTlsKeyPathEdit_ && !rpcTlsKeyPathEdit_->text().trimmed().isEmpty()) {
+            entries.insert(QStringLiteral("rpctlskey"), rpcTlsKeyPathEdit_->text().trimmed());
+        }
+    } else {
+        entries.remove(QStringLiteral("rpctls"));
+        entries.remove(QStringLiteral("rpctlscert"));
+        entries.remove(QStringLiteral("rpctlskey"));
+    }
     writeSimpleConfig(configPath, entries);
 }
 
@@ -1646,6 +1745,7 @@ void MainWindow::refreshWalletSessionState() {
             }
             const auto walletFile = obj.value(QStringLiteral("walletfile")).toString();
             const auto format = obj.value(QStringLiteral("address_format")).toString();
+            const auto kdf = obj.value(QStringLiteral("kdf")).toString();
             const auto address = obj.value(QStringLiteral("primaryaddress")).toString();
             const auto walletRoot = obj.value(QStringLiteral("walletroot")).toString();
             if (!walletRoot.isEmpty() && walletRootValue_) {
@@ -1655,7 +1755,11 @@ void MainWindow::refreshWalletSessionState() {
             if (formatIndex >= 0) {
                 walletFormatCombo_->setCurrentIndex(formatIndex);
             }
-            walletSessionStatusLabel_->setText(QStringLiteral("%1 | %2 | %3").arg(format, address, walletFile));
+            const auto kdfIndex = walletKdfCombo_ ? walletKdfCombo_->findData(kdf) : -1;
+            if (kdfIndex >= 0) {
+                walletKdfCombo_->setCurrentIndex(kdfIndex);
+            }
+            walletSessionStatusLabel_->setText(QStringLiteral("%1 | %2 | %3 | %4").arg(format, kdf, address, walletFile));
             walletSessionStatusLabel_->setStyleSheet(QStringLiteral("color:#8ed0a2;"));
             closeWalletButton_->setEnabled(true);
             if (walletPathEdit_) {
@@ -1691,14 +1795,16 @@ void MainWindow::refreshWalletRegistry() {
                 const auto obj = rows.at(i).toObject();
                 auto* nameItem = new QTableWidgetItem(obj.value(QStringLiteral("name")).toString());
                 auto* typeItem = new QTableWidgetItem(obj.value(QStringLiteral("address_format")).toString(QStringLiteral("unknown")));
+                auto* kdfItem = new QTableWidgetItem(obj.value(QStringLiteral("kdf")).toString(QStringLiteral("unknown")));
                 auto* fileItem = new QTableWidgetItem(QFileInfo(obj.value(QStringLiteral("path")).toString()).fileName());
                 auto* activeItem = new QTableWidgetItem(obj.value(QStringLiteral("active")).toBool() ? QStringLiteral("Yes") : QStringLiteral("No"));
                 fileItem->setToolTip(obj.value(QStringLiteral("path")).toString());
                 fileItem->setData(Qt::UserRole, obj.value(QStringLiteral("path")).toString());
                 walletListTable_->setItem(i, 0, nameItem);
                 walletListTable_->setItem(i, 1, typeItem);
-                walletListTable_->setItem(i, 2, fileItem);
-                walletListTable_->setItem(i, 3, activeItem);
+                walletListTable_->setItem(i, 2, kdfItem);
+                walletListTable_->setItem(i, 3, fileItem);
+                walletListTable_->setItem(i, 4, activeItem);
             }
         },
         [this](const QString&) {
@@ -1710,6 +1816,7 @@ void MainWindow::createWalletSession() {
     const auto walletName = walletNameEdit_->text().trimmed();
     const auto walletPass = walletPassEdit_->text();
     const auto walletFormat = walletFormatCombo_->currentData().toString();
+    const auto walletKdf = walletKdfCombo_->currentData().toString();
     if (walletName.isEmpty() || walletPass.isEmpty()) {
         setConnectionStatus(QStringLiteral("Wallet name and passcode are required to create a wallet."), true);
         return;
@@ -1722,7 +1829,7 @@ void MainWindow::createWalletSession() {
     persistLocalRpcConfig();
 
     rpc_.call(QStringLiteral("createwallet"),
-              QJsonArray{walletPath, walletPass, walletFormat},
+              QJsonArray{walletPath, walletPass, walletFormat, QJsonValue(), QJsonValue(), QJsonValue(), walletKdf},
               this,
               [this, walletPath](const QJsonValue& result) {
                   const auto obj = result.toObject();
@@ -1848,6 +1955,16 @@ void MainWindow::loadSettings() {
     if (walletFormatIndex >= 0) {
         walletFormatCombo_->setCurrentIndex(walletFormatIndex);
     }
+    const auto walletKdf = settings.value(QStringLiteral("wallet/kdf"), QStringLiteral("argon2id")).toString();
+    const auto walletKdfIndex = walletKdfCombo_->findData(walletKdf);
+    if (walletKdfIndex >= 0) {
+        walletKdfCombo_->setCurrentIndex(walletKdfIndex);
+    }
+    rpcTlsCheck_->setChecked(settings.value(QStringLiteral("rpc/tls_enabled"), false).toBool());
+    rpcTlsAllowSelfSignedCheck_->setChecked(settings.value(QStringLiteral("rpc/tls_allow_self_signed"), true).toBool());
+    rpcTlsCertPathEdit_->setText(settings.value(QStringLiteral("rpc/tls_cert")).toString());
+    rpcTlsKeyPathEdit_->setText(settings.value(QStringLiteral("rpc/tls_key")).toString());
+    rpcTlsCaPathEdit_->setText(settings.value(QStringLiteral("rpc/tls_ca")).toString());
     walletNameEdit_->setText(settings.value(QStringLiteral("wallet/name")).toString());
     directPeersEdit_->setText(settings.value(QStringLiteral("network/direct_peers")).toString());
     seedPeersEdit_->setText(settings.value(QStringLiteral("network/seed_peers")).toString());
@@ -1862,9 +1979,15 @@ void MainWindow::saveSettings() {
     settings.setValue(QStringLiteral("rpc/url"), rpcUrlEdit_->text().trimmed());
     settings.setValue(QStringLiteral("rpc/user"), rpcUserEdit_->text().trimmed());
     settings.setValue(QStringLiteral("rpc/password"), rpcPasswordEdit_->text());
+    settings.setValue(QStringLiteral("rpc/tls_enabled"), rpcTlsCheck_->isChecked());
+    settings.setValue(QStringLiteral("rpc/tls_allow_self_signed"), rpcTlsAllowSelfSignedCheck_->isChecked());
+    settings.setValue(QStringLiteral("rpc/tls_cert"), rpcTlsCertPathEdit_->text().trimmed());
+    settings.setValue(QStringLiteral("rpc/tls_key"), rpcTlsKeyPathEdit_->text().trimmed());
+    settings.setValue(QStringLiteral("rpc/tls_ca"), rpcTlsCaPathEdit_->text().trimmed());
     settings.setValue(QStringLiteral("backend/executable"), daemonPathEdit_->text().trimmed());
     settings.setValue(QStringLiteral("backend/datadir"), dataDirEdit_->text().trimmed());
     settings.setValue(QStringLiteral("wallet/format"), walletFormatCombo_->currentData().toString());
+    settings.setValue(QStringLiteral("wallet/kdf"), walletKdfCombo_->currentData().toString());
     settings.setValue(QStringLiteral("wallet/name"), walletNameEdit_->text().trimmed());
     settings.setValue(QStringLiteral("backend/network"), networkCombo_->currentText());
     settings.setValue(QStringLiteral("network/direct_peers"), directPeersEdit_->text().trimmed());
@@ -1877,6 +2000,8 @@ void MainWindow::applyRpcSettings() {
     settings.url = QUrl(rpcUrlEdit_->text().trimmed());
     settings.username = rpcUserEdit_->text().trimmed();
     settings.password = rpcPasswordEdit_->text();
+    settings.allowSelfSigned = rpcTlsAllowSelfSignedCheck_ && rpcTlsAllowSelfSignedCheck_->isChecked();
+    settings.caCertificatePath = rpcTlsCaPathEdit_ ? rpcTlsCaPathEdit_->text().trimmed() : QString();
     rpc_.setSettings(settings);
     setConnectionStatus(QStringLiteral("RPC settings applied."));
     if (systemLogView_) {
@@ -1960,6 +2085,22 @@ void MainWindow::openNodeWindow(const QString& section) {
     }
     nodeWindow_->showSection(section);
     refreshVisibleNodeSection();
+}
+
+void MainWindow::openWalletManagerWindow() {
+    if (!walletManagerWindow_) {
+        return;
+    }
+    walletManagerWindow_->showWindow();
+    refreshVisibleWalletManager();
+}
+
+void MainWindow::openChatWindow(const QString& section) {
+    if (!chatWindow_) {
+        return;
+    }
+    chatWindow_->showSection(section);
+    refreshVisibleChatSection();
 }
 
 void MainWindow::refreshNodeInformation() {
@@ -2047,6 +2188,8 @@ void MainWindow::refreshAll() {
     reconcilePendingMinedBlocks();
     refreshCurrentMainTab();
     refreshVisibleNodeSection();
+    refreshVisibleWalletManager();
+    refreshVisibleChatSection();
 }
 
 void MainWindow::refreshCurrentMainTab() {
@@ -2081,17 +2224,28 @@ void MainWindow::refreshVisibleNodeSection() {
     if (section == QStringLiteral("information")) {
         refreshNodeInformation();
         refreshCheckpointManager();
-    } else if (section == QStringLiteral("wallets")) {
-        refreshWalletRegistry();
     } else if (section == QStringLiteral("wallet")) {
         walletPage_->refresh();
-    } else if (section == QStringLiteral("chat")) {
-        chatPage_->refresh();
     } else if (section == QStringLiteral("mining")) {
         miningPage_->refresh();
     } else if (section == QStringLiteral("network")) {
         networkGraphPage_->refresh();
     }
+}
+
+void MainWindow::refreshVisibleWalletManager() {
+    if (!walletManagerWindow_ || !walletManagerWindow_->isVisible()) {
+        return;
+    }
+    refreshWalletRegistry();
+    refreshWalletSessionState();
+}
+
+void MainWindow::refreshVisibleChatSection() {
+    if (!chatWindow_ || !chatWindow_->isVisible()) {
+        return;
+    }
+    chatWindow_->refreshCurrentSection();
 }
 
 void MainWindow::refreshCheckpointManager() {
@@ -2310,6 +2464,17 @@ void MainWindow::launchBackendProcess() {
         : dataDirEdit_->text().trimmed();
     config.rpcBind = QStringLiteral("127.0.0.1");
     config.rpcPort = QUrl(rpcUrlEdit_->text().trimmed()).port(9332);
+    config.rpcTls = rpcTlsCheck_ && rpcTlsCheck_->isChecked();
+    config.rpcTlsCertPath = rpcTlsCertPathEdit_ ? rpcTlsCertPathEdit_->text().trimmed() : QString();
+    config.rpcTlsKeyPath = rpcTlsKeyPathEdit_ ? rpcTlsKeyPathEdit_->text().trimmed() : QString();
+    if (config.rpcTls) {
+        if (config.rpcTlsCertPath.isEmpty()) {
+            config.rpcTlsCertPath = QDir(config.dataDir).filePath(QStringLiteral("rpc_tls_cert.pem"));
+        }
+        if (config.rpcTlsKeyPath.isEmpty()) {
+            config.rpcTlsKeyPath = QDir(config.dataDir).filePath(QStringLiteral("rpc_tls_key.pem"));
+        }
+    }
     config.rpcUser = rpcUserEdit_->text().trimmed();
     config.rpcPassword = rpcPasswordEdit_->text();
     config.connectTargets = parsePeerEntryList(directPeersEdit_->text());

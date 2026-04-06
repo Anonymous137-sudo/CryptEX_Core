@@ -15,13 +15,16 @@
 #include <array>
 #include <cstring>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
+#include <openssl/err.h>
 #include <openssl/hmac.h>
 #include <openssl/obj_mac.h>
 #include <openssl/bn.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
 
 namespace cryptex {
 
@@ -59,11 +62,228 @@ std::filesystem::path wallet_temp_path(const std::filesystem::path& wallet_path)
     return wallet_path.string() + ".tmp";
 }
 
+std::filesystem::path wallet_chat_rsa_public_path(const std::filesystem::path& wallet_path) {
+    return wallet_path.string() + ".chat_rsa_pub.pem";
+}
+
+std::filesystem::path wallet_chat_rsa_private_path(const std::filesystem::path& wallet_path) {
+    return wallet_path.string() + ".chat_rsa_priv.pem";
+}
+
 std::vector<uint8_t> read_wallet_blob(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("wallet file not found");
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("wallet chat key file not found");
+    }
+    return std::string((std::istreambuf_iterator<char>(input)),
+                       std::istreambuf_iterator<char>());
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& text, bool private_file) {
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("failed to write wallet chat key file");
+    }
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    output.flush();
+    output.close();
+    if (private_file) {
+        std::error_code ec;
+        std::filesystem::permissions(path,
+                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace,
+                                     ec);
+    }
+}
+
+std::string bio_to_string(BIO* bio) {
+    BUF_MEM* buffer = nullptr;
+    BIO_get_mem_ptr(bio, &buffer);
+    if (!buffer || !buffer->data || buffer->length == 0) {
+        throw std::runtime_error("failed to serialize PEM data");
+    }
+    return std::string(buffer->data, buffer->length);
+}
+
+std::string private_key_to_unencrypted_pem(EVP_PKEY* pkey) {
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (!bio) {
+        throw std::runtime_error("failed to allocate in-memory private key buffer");
+    }
+    if (PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+        BIO_free(bio);
+        throw std::runtime_error("failed to export unencrypted RSA private key");
+    }
+    auto pem = bio_to_string(bio);
+    BIO_free(bio);
+    return pem;
+}
+
+EVP_PKEY* load_private_pem(const std::string& pem, const std::string& password) {
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) {
+        throw std::runtime_error("failed to allocate PEM BIO");
+    }
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, const_cast<char*>(password.c_str()));
+    BIO_free(bio);
+    if (!pkey) {
+        throw std::runtime_error("failed to decode encrypted RSA private key");
+    }
+    return pkey;
+}
+
+void validate_public_pem(const std::string& pem) {
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) {
+        throw std::runtime_error("failed to allocate public PEM BIO");
+    }
+    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!pkey) {
+        throw std::runtime_error("failed to decode RSA public key");
+    }
+    EVP_PKEY_free(pkey);
+}
+
+std::pair<std::string, std::string> generate_wallet_chat_rsa_pems(const std::string& password) {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!ctx) {
+        throw std::runtime_error("failed to allocate RSA keygen context");
+    }
+    if (EVP_PKEY_keygen_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 3072) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        throw std::runtime_error("failed to initialize RSA key generation");
+    }
+
+    EVP_PKEY* pkey = nullptr;
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0 || !pkey) {
+        EVP_PKEY_CTX_free(ctx);
+        throw std::runtime_error("failed to generate RSA keypair");
+    }
+    EVP_PKEY_CTX_free(ctx);
+
+    BIO* pub_bio = BIO_new(BIO_s_mem());
+    BIO* priv_bio = BIO_new(BIO_s_mem());
+    if (!pub_bio || !priv_bio) {
+        if (pub_bio) BIO_free(pub_bio);
+        if (priv_bio) BIO_free(priv_bio);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to allocate RSA PEM buffers");
+    }
+
+    if (PEM_write_bio_PUBKEY(pub_bio, pkey) != 1 ||
+        PEM_write_bio_PrivateKey(priv_bio,
+                                 pkey,
+                                 EVP_aes_256_cbc(),
+                                 reinterpret_cast<unsigned char*>(const_cast<char*>(password.data())),
+                                 static_cast<int>(password.size()),
+                                 nullptr,
+                                 nullptr) != 1) {
+        BIO_free(pub_bio);
+        BIO_free(priv_bio);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to encode RSA keypair");
+    }
+
+    auto public_pem = bio_to_string(pub_bio);
+    auto private_pem = bio_to_string(priv_bio);
+    BIO_free(pub_bio);
+    BIO_free(priv_bio);
+    EVP_PKEY_free(pkey);
+    return {public_pem, private_pem};
+}
+
+void ensure_wallet_chat_rsa_keys(const std::string& path, const std::string& password, Wallet& wallet) {
+    const auto wallet_path = std::filesystem::path(path);
+    const auto public_path = wallet_chat_rsa_public_path(wallet_path);
+    const auto private_path = wallet_chat_rsa_private_path(wallet_path);
+
+    std::error_code public_ec;
+    std::error_code private_ec;
+    const bool public_exists = std::filesystem::exists(public_path, public_ec);
+    const bool private_exists = std::filesystem::exists(private_path, private_ec);
+    if (public_ec || private_ec) {
+        throw std::runtime_error("failed to inspect wallet RSA sidecar files");
+    }
+
+    if (!public_exists || !private_exists) {
+        auto [public_pem, private_pem] = generate_wallet_chat_rsa_pems(password);
+        write_text_file(public_path, public_pem, false);
+        write_text_file(private_path, private_pem, true);
+        wallet.chat_rsa_public_key_pem = std::move(public_pem);
+        EVP_PKEY* private_key = load_private_pem(private_pem, password);
+        wallet.chat_rsa_private_key_pem = private_key_to_unencrypted_pem(private_key);
+        EVP_PKEY_free(private_key);
+        return;
+    }
+
+    wallet.chat_rsa_public_key_pem = read_text_file(public_path);
+    const auto encrypted_private = read_text_file(private_path);
+    validate_public_pem(wallet.chat_rsa_public_key_pem);
+    EVP_PKEY* private_key = load_private_pem(encrypted_private, password);
+    wallet.chat_rsa_private_key_pem = private_key_to_unencrypted_pem(private_key);
+    EVP_PKEY_free(private_key);
+}
+
+void reencrypt_wallet_chat_rsa_keys(const std::string& path,
+                                    const std::string& old_password,
+                                    const std::string& new_password,
+                                    Wallet& wallet) {
+    const auto wallet_path = std::filesystem::path(path);
+    const auto public_path = wallet_chat_rsa_public_path(wallet_path);
+    const auto private_path = wallet_chat_rsa_private_path(wallet_path);
+
+    std::error_code public_ec;
+    std::error_code private_ec;
+    const bool public_exists = std::filesystem::exists(public_path, public_ec);
+    const bool private_exists = std::filesystem::exists(private_path, private_ec);
+    if (public_ec || private_ec) {
+        throw std::runtime_error("failed to inspect wallet RSA sidecar files");
+    }
+    if (!public_exists || !private_exists) {
+        ensure_wallet_chat_rsa_keys(path, new_password, wallet);
+        return;
+    }
+
+    if (wallet.chat_rsa_public_key_pem.empty()) {
+        wallet.chat_rsa_public_key_pem = read_text_file(public_path);
+    }
+    std::string encrypted_private = read_text_file(private_path);
+    EVP_PKEY* pkey = load_private_pem(encrypted_private, old_password);
+    BIO* priv_bio = BIO_new(BIO_s_mem());
+    if (!priv_bio) {
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to allocate RSA re-encryption buffer");
+    }
+    if (PEM_write_bio_PrivateKey(priv_bio,
+                                 pkey,
+                                 EVP_aes_256_cbc(),
+                                 reinterpret_cast<unsigned char*>(const_cast<char*>(new_password.data())),
+                                 static_cast<int>(new_password.size()),
+                                 nullptr,
+                                 nullptr) != 1) {
+        BIO_free(priv_bio);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to re-encrypt RSA private key");
+    }
+    const auto encrypted_pem = bio_to_string(priv_bio);
+    BIO_free(priv_bio);
+    wallet.chat_rsa_private_key_pem = private_key_to_unencrypted_pem(pkey);
+    EVP_PKEY_free(pkey);
+
+    write_text_file(public_path, wallet.chat_rsa_public_key_pem, false);
+    write_text_file(private_path, encrypted_pem, true);
 }
 
 std::array<uint8_t, 64> hmac_sha512(const uint8_t* key, size_t key_len,
@@ -160,15 +380,84 @@ std::vector<uint8_t> compressed_pubkey_from_secret(const std::array<uint8_t, 32>
 
 } // namespace
 
-static std::vector<uint8_t> derive_key(const std::string& password, const std::vector<uint8_t>& salt) {
-    std::vector<uint8_t> key(constants::AES_KEY_SIZE);
-    if (1 != PKCS5_PBKDF2_HMAC(password.c_str(), password.size(),
-                               salt.data(), static_cast<int>(salt.size()),
-                               constants::PBKDF2_ITERATIONS,
-                               EVP_sha256(), key.size(), key.data())) {
-        throw std::runtime_error("PBKDF2 failed");
+std::vector<uint8_t> derive_provider_key(const char* algorithm,
+                                         const std::vector<uint8_t>& password,
+                                         const std::vector<OSSL_PARAM>& params,
+                                         size_t key_size) {
+    EVP_KDF* kdf = EVP_KDF_fetch(nullptr, algorithm, nullptr);
+    if (!kdf) {
+        throw std::runtime_error(std::string("OpenSSL KDF unavailable: ") + algorithm);
     }
+    EVP_KDF_CTX* ctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (!ctx) {
+        throw std::runtime_error(std::string("KDF context allocation failed: ") + algorithm);
+    }
+
+    std::vector<OSSL_PARAM> local = params;
+    local.push_back(OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
+                                                      const_cast<unsigned char*>(password.data()),
+                                                      password.size()));
+    local.push_back(OSSL_PARAM_construct_end());
+
+    std::vector<uint8_t> key(key_size);
+    if (EVP_KDF_derive(ctx, key.data(), key.size(), local.data()) <= 0) {
+        unsigned long err = ERR_peek_last_error();
+        std::string message = std::string("KDF derive failed: ") + algorithm;
+        if (err != 0) {
+            message += " (";
+            message += ERR_reason_error_string(err);
+            message += ")";
+        }
+        EVP_KDF_CTX_free(ctx);
+        throw std::runtime_error(message);
+    }
+    EVP_KDF_CTX_free(ctx);
     return key;
+}
+
+static std::vector<uint8_t> derive_key(const std::string& password,
+                                       const std::vector<uint8_t>& salt,
+                                       Wallet::KeyDerivation kdf) {
+    std::vector<uint8_t> key(constants::AES_KEY_SIZE);
+    if (kdf == Wallet::KeyDerivation::PBKDF2) {
+        if (1 != PKCS5_PBKDF2_HMAC(password.c_str(), password.size(),
+                                   salt.data(), static_cast<int>(salt.size()),
+                                   constants::PBKDF2_ITERATIONS,
+                                   EVP_sha256(), key.size(), key.data())) {
+            throw std::runtime_error("PBKDF2 failed");
+        }
+        return key;
+    }
+
+    const std::vector<uint8_t> password_bytes(password.begin(), password.end());
+    std::vector<OSSL_PARAM> params;
+    params.push_back(OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
+                                                       const_cast<unsigned char*>(salt.data()),
+                                                       salt.size()));
+    if (kdf == Wallet::KeyDerivation::Scrypt) {
+        uint64_t n = constants::WALLET_SCRYPT_N;
+        uint64_t r = constants::WALLET_SCRYPT_R;
+        uint64_t p = constants::WALLET_SCRYPT_P;
+        uint64_t maxmem = constants::WALLET_SCRYPT_MAXMEM;
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_N, &n));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_R, &r));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_P, &p));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_MAXMEM, &maxmem));
+        return derive_provider_key(OSSL_KDF_NAME_SCRYPT, password_bytes, params, constants::AES_KEY_SIZE);
+    }
+
+    unsigned int iter = constants::WALLET_ARGON2_ITERATIONS;
+    unsigned int threads = constants::WALLET_ARGON2_THREADS;
+    unsigned int lanes = constants::WALLET_ARGON2_LANES;
+    unsigned int version = 0x13;
+    uint64_t memcost = constants::WALLET_ARGON2_MEMCOST_KIB;
+    params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ITER, &iter));
+    params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_THREADS, &threads));
+    params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ARGON2_LANES, &lanes));
+    params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ARGON2_VERSION, &version));
+    params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost));
+    return derive_provider_key("ARGON2ID", password_bytes, params, constants::AES_KEY_SIZE);
 }
 
 static std::vector<uint8_t> aes_encrypt(const std::vector<uint8_t>& plaintext,
@@ -540,6 +829,42 @@ std::optional<Wallet::AddressFormat> Wallet::parse_address_format(const std::str
     return std::nullopt;
 }
 
+std::optional<Wallet::KeyDerivation> Wallet::parse_key_derivation(const std::string& text) {
+    std::string normalized = text;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (normalized == "pbkdf2" || normalized == "pbkdf2-sha256") {
+        return KeyDerivation::PBKDF2;
+    }
+    if (normalized == "scrypt") {
+        return KeyDerivation::Scrypt;
+    }
+    if (normalized == "argon2" || normalized == "argon2id") {
+        return KeyDerivation::Argon2id;
+    }
+    return std::nullopt;
+}
+
+const char* Wallet::kdf_name() const {
+    switch (key_derivation_) {
+    case KeyDerivation::PBKDF2:
+        return "pbkdf2";
+    case KeyDerivation::Scrypt:
+        return "scrypt";
+    case KeyDerivation::Argon2id:
+        return "argon2id";
+    }
+    return "pbkdf2";
+}
+
+std::string Wallet::chat_rsa_public_key_b64() const {
+    if (chat_rsa_public_key_pem.empty()) {
+        return {};
+    }
+    return crypto::base64_encode(chat_rsa_public_key_pem);
+}
+
 std::vector<uint8_t> Wallet::serialize_plaintext() const {
     std::vector<uint8_t> out;
     serialization::write_int<uint32_t>(out, 7);
@@ -565,13 +890,13 @@ std::vector<uint8_t> Wallet::serialize_plaintext() const {
 }
 
 void Wallet::save_encrypted(const std::string& password, const std::string& path) const {
-    std::vector<uint8_t> salt(constants::AES_IV_SIZE);
+    std::vector<uint8_t> salt(constants::WALLET_KDF_SALT_SIZE);
     std::vector<uint8_t> iv(constants::AES_IV_SIZE);
     fill_random(salt);
     fill_random(iv);
-    auto key_bytes = derive_key(password, salt);
+    auto key_bytes = derive_key(password, salt, key_derivation_);
     auto ciphertext = aes_encrypt(serialize_plaintext(), key_bytes, iv);
-    persist(path, salt, iv, ciphertext);
+    persist(path, key_derivation_, salt, iv, ciphertext);
 }
 
 Wallet Wallet::deserialize_plaintext(const std::vector<uint8_t>& plaintext) {
@@ -829,10 +1154,12 @@ Wallet Wallet::create_new(const std::string& password,
                           const std::string& path,
                           AddressFormat address_format,
                           size_t mnemonic_words,
-                          const std::string& mnemonic_passphrase) {
+                          const std::string& mnemonic_passphrase,
+                          KeyDerivation kdf) {
     Wallet w;
     w.address_format_ = address_format;
     w.hd_scheme_ = HdScheme::Bip32;
+    w.key_derivation_ = kdf;
     w.mnemonic_entropy_.resize(bip39::entropy_bytes_for_words(mnemonic_words));
     fill_random(w.mnemonic_entropy_);
     auto mnemonic = bip39::entropy_to_mnemonic(w.mnemonic_entropy_);
@@ -842,32 +1169,29 @@ Wallet Wallet::create_new(const std::string& password,
     derive_wallet_keypair(w.hd_scheme_, w.master_seed_, w.next_hd_index_, new_priv, new_pub);
     w.next_hd_index_++;
     w.append_key(new_priv, new_pub);
-
-    std::vector<uint8_t> salt(constants::AES_IV_SIZE);
-    std::vector<uint8_t> iv(constants::AES_IV_SIZE);
-    fill_random(salt);
-    fill_random(iv);
-    auto key = derive_key(password, salt);
-    auto ciphertext = aes_encrypt(w.serialize_plaintext(), key, iv);
-    persist(path, salt, iv, ciphertext);
+    w.save_encrypted(password, path);
+    ensure_wallet_chat_rsa_keys(path, password, w);
     return w;
 }
 
 Wallet Wallet::create_new(const std::string& password,
                           const std::string& path,
                           size_t mnemonic_words,
-                          const std::string& mnemonic_passphrase) {
-    return create_new(password, path, AddressFormat::Base64, mnemonic_words, mnemonic_passphrase);
+                          const std::string& mnemonic_passphrase,
+                          KeyDerivation kdf) {
+    return create_new(password, path, AddressFormat::Base64, mnemonic_words, mnemonic_passphrase, kdf);
 }
 
 Wallet Wallet::create_from_mnemonic(const std::string& password,
                                     const std::string& path,
                                     const std::string& mnemonic,
                                     AddressFormat address_format,
-                                    const std::string& mnemonic_passphrase) {
+                                    const std::string& mnemonic_passphrase,
+                                    KeyDerivation kdf) {
     Wallet w;
     w.address_format_ = address_format;
     w.hd_scheme_ = HdScheme::Bip32;
+    w.key_derivation_ = kdf;
     w.mnemonic_entropy_ = bip39::mnemonic_to_entropy(mnemonic);
     auto canonical_mnemonic = bip39::entropy_to_mnemonic(w.mnemonic_entropy_);
     w.master_seed_ = bip39::mnemonic_to_seed(canonical_mnemonic, mnemonic_passphrase);
@@ -877,22 +1201,17 @@ Wallet Wallet::create_from_mnemonic(const std::string& password,
     derive_wallet_keypair(w.hd_scheme_, w.master_seed_, w.next_hd_index_, new_priv, new_pub);
     w.next_hd_index_++;
     w.append_key(new_priv, new_pub);
-
-    std::vector<uint8_t> salt(constants::AES_IV_SIZE);
-    std::vector<uint8_t> iv(constants::AES_IV_SIZE);
-    fill_random(salt);
-    fill_random(iv);
-    auto key = derive_key(password, salt);
-    auto ciphertext = aes_encrypt(w.serialize_plaintext(), key, iv);
-    persist(path, salt, iv, ciphertext);
+    w.save_encrypted(password, path);
+    ensure_wallet_chat_rsa_keys(path, password, w);
     return w;
 }
 
 Wallet Wallet::create_from_mnemonic(const std::string& password,
                                     const std::string& path,
                                     const std::string& mnemonic,
-                                    const std::string& mnemonic_passphrase) {
-    return create_from_mnemonic(password, path, mnemonic, AddressFormat::Base64, mnemonic_passphrase);
+                                    const std::string& mnemonic_passphrase,
+                                    KeyDerivation kdf) {
+    return create_from_mnemonic(password, path, mnemonic, AddressFormat::Base64, mnemonic_passphrase, kdf);
 }
 
 Wallet Wallet::load(const std::string& password, const std::string& path) {
@@ -907,16 +1226,27 @@ Wallet Wallet::load(const std::string& password, const std::string& path) {
         std::error_code ec;
         if (!std::filesystem::exists(candidate, ec)) continue;
         try {
+            KeyDerivation kdf = KeyDerivation::PBKDF2;
             std::vector<uint8_t> salt, iv, ciphertext;
-            read_file(candidate.string(), salt, iv, ciphertext);
-            auto key = derive_key(password, salt);
+            read_file(candidate.string(), kdf, salt, iv, ciphertext);
+            auto key = derive_key(password, salt, kdf);
             auto plaintext = aes_decrypt(ciphertext, key, iv);
-            return deserialize_plaintext(plaintext);
+            Wallet wallet = deserialize_plaintext(plaintext);
+            wallet.key_derivation_ = kdf;
+            ensure_wallet_chat_rsa_keys(wallet_path.string(), password, wallet);
+            return wallet;
         } catch (const std::exception& ex) {
             last_error = ex.what();
         }
     }
     throw std::runtime_error(last_error);
+}
+
+Wallet::KeyDerivation Wallet::inspect_key_derivation(const std::string& path) {
+    KeyDerivation kdf = KeyDerivation::PBKDF2;
+    std::vector<uint8_t> salt, iv, ciphertext;
+    read_file(path, kdf, salt, iv, ciphertext);
+    return kdf;
 }
 
 Wallet Wallet::recover(const std::string& password, const std::string& path) {
@@ -958,6 +1288,7 @@ std::string Wallet::add_address(const std::string& password, const std::string& 
 }
 
 void Wallet::persist(const std::string& path,
+                     KeyDerivation kdf,
                      const std::vector<uint8_t>& salt,
                      const std::vector<uint8_t>& iv,
                      const std::vector<uint8_t>& ciphertext) {
@@ -966,8 +1297,11 @@ void Wallet::persist(const std::string& path,
         std::filesystem::create_directories(wallet_path.parent_path());
     }
     std::vector<uint8_t> out;
-    serialization::write_int<uint32_t>(out, 1); // version
+    serialization::write_int<uint32_t>(out, 2); // version
+    serialization::write_int<uint32_t>(out, static_cast<uint32_t>(kdf));
+    serialization::write_int<uint32_t>(out, static_cast<uint32_t>(salt.size()));
     out.insert(out.end(), salt.begin(), salt.end());
+    serialization::write_int<uint32_t>(out, static_cast<uint32_t>(iv.size()));
     out.insert(out.end(), iv.begin(), iv.end());
     serialization::write_int<uint32_t>(out, static_cast<uint32_t>(ciphertext.size()));
     out.insert(out.end(), ciphertext.begin(), ciphertext.end());
@@ -1009,6 +1343,7 @@ void Wallet::persist(const std::string& path,
 }
 
 void Wallet::read_file(const std::string& path,
+                       KeyDerivation& kdf,
                        std::vector<uint8_t>& salt,
                        std::vector<uint8_t>& iv,
                        std::vector<uint8_t>& ciphertext) {
@@ -1016,12 +1351,30 @@ void Wallet::read_file(const std::string& path,
     const uint8_t* ptr = data.data();
     size_t rem = data.size();
     uint32_t version = serialization::read_int<uint32_t>(ptr, rem);
-    if (version != 1) throw std::runtime_error("wallet version unsupported");
-    if (rem < constants::AES_IV_SIZE * 2 + 4) throw std::runtime_error("wallet truncated");
-    salt.assign(ptr, ptr + constants::AES_IV_SIZE);
-    ptr += constants::AES_IV_SIZE; rem -= constants::AES_IV_SIZE;
-    iv.assign(ptr, ptr + constants::AES_IV_SIZE);
-    ptr += constants::AES_IV_SIZE; rem -= constants::AES_IV_SIZE;
+    if (version == 1) {
+        kdf = KeyDerivation::PBKDF2;
+        if (rem < constants::AES_IV_SIZE * 2 + 4) throw std::runtime_error("wallet truncated");
+        salt.assign(ptr, ptr + constants::AES_IV_SIZE);
+        ptr += constants::AES_IV_SIZE; rem -= constants::AES_IV_SIZE;
+        iv.assign(ptr, ptr + constants::AES_IV_SIZE);
+        ptr += constants::AES_IV_SIZE; rem -= constants::AES_IV_SIZE;
+    } else if (version == 2) {
+        const auto raw_kdf = serialization::read_int<uint32_t>(ptr, rem);
+        if (raw_kdf > static_cast<uint32_t>(KeyDerivation::Argon2id)) {
+            throw std::runtime_error("wallet kdf unsupported");
+        }
+        kdf = static_cast<KeyDerivation>(raw_kdf);
+        uint32_t salt_len = serialization::read_int<uint32_t>(ptr, rem);
+        if (rem < salt_len) throw std::runtime_error("wallet salt truncated");
+        salt.assign(ptr, ptr + salt_len);
+        ptr += salt_len; rem -= salt_len;
+        uint32_t iv_len = serialization::read_int<uint32_t>(ptr, rem);
+        if (rem < iv_len) throw std::runtime_error("wallet iv truncated");
+        iv.assign(ptr, ptr + iv_len);
+        ptr += iv_len; rem -= iv_len;
+    } else {
+        throw std::runtime_error("wallet version unsupported");
+    }
     uint32_t clen = serialization::read_int<uint32_t>(ptr, rem);
     if (rem < clen) throw std::runtime_error("wallet ciphertext truncated");
     ciphertext.assign(ptr, ptr + clen);
@@ -1232,6 +1585,35 @@ void Wallet::set_label(const std::string& password,
     save_encrypted(password, path);
 }
 
+void Wallet::set_primary_address(const std::string& password,
+                                 const std::string& path,
+                                 const std::string& address_value) {
+    *this = Wallet::load(password, path);
+    const auto target = crypto::canonicalize_address(address_value);
+    auto it = std::find_if(addresses.begin(), addresses.end(), [&](const std::string& existing) {
+        return crypto::addresses_equal(existing, target);
+    });
+    if (it == addresses.end()) {
+        throw std::runtime_error("address not found in wallet");
+    }
+
+    const auto index = static_cast<size_t>(std::distance(addresses.begin(), it));
+    if (index == 0) {
+        return;
+    }
+
+    auto rotate_primary = [index](auto& rows) {
+        if (rows.size() > index) {
+            std::rotate(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(index), rows.begin() + static_cast<std::ptrdiff_t>(index + 1));
+        }
+    };
+    rotate_primary(privkeys);
+    rotate_primary(pubkeys);
+    rotate_primary(addresses);
+    sync_primary();
+    save_encrypted(password, path);
+}
+
 std::string Wallet::import_private_key_hex(const std::string& password,
                                            const std::string& path,
                                            const std::string& private_key_hex,
@@ -1271,12 +1653,15 @@ std::string Wallet::import_private_key_hex(const std::string& password,
 
 void Wallet::change_password(const std::string& old_password,
                              const std::string& new_password,
-                             const std::string& path) {
+                             const std::string& path,
+                             KeyDerivation new_kdf) {
     if (new_password.empty()) {
         throw std::runtime_error("new password cannot be empty");
     }
     *this = Wallet::load(old_password, path);
+    key_derivation_ = new_kdf;
     save_encrypted(new_password, path);
+    reencrypt_wallet_chat_rsa_keys(path, old_password, new_password, *this);
 }
 
 void Wallet::ensure_unused_pool(Blockchain& chain,

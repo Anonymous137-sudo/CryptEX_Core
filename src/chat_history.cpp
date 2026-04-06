@@ -87,7 +87,7 @@ bool matches_query(const HistoryEntry& entry, const HistoryQuery& query) {
 
 bool parse_history_entry(const std::string& line, HistoryEntry& entry) {
     auto fields = split_line(line);
-    if (fields.size() != 18) return false;
+    if (fields.size() != 18 && fields.size() != 25 && fields.size() != 26) return false;
     try {
         entry.version = static_cast<uint32_t>(std::stoul(fields[0]));
         entry.direction = fields[1];
@@ -107,6 +107,18 @@ bool parse_history_entry(const std::string& line, HistoryEntry& entry) {
         entry.message = decode_field(fields[15]);
         entry.peer_label = decode_field(fields[16]);
         entry.status = decode_field(fields[17]);
+        if (fields.size() >= 25) {
+            entry.content_type = decode_field(fields[18]);
+            entry.mime_type = decode_field(fields[19]);
+            entry.attachment_name = decode_field(fields[20]);
+            entry.attachment_path = decode_field(fields[21]);
+            entry.attachment_size = std::stoull(fields[22]);
+            entry.audio_privacy = decode_field(fields[23]);
+            entry.encryption_mode = decode_field(fields[24]);
+            if (fields.size() >= 26) {
+                entry.transcript = decode_field(fields[25]);
+            }
+        }
         return true;
     } catch (...) {
         return false;
@@ -132,7 +144,15 @@ std::string serialize_history_entry(const HistoryEntry& entry) {
         << encode_field(entry.channel) << '\t'
         << encode_field(entry.message) << '\t'
         << encode_field(entry.peer_label) << '\t'
-        << encode_field(entry.status);
+        << encode_field(entry.status) << '\t'
+        << encode_field(entry.content_type) << '\t'
+        << encode_field(entry.mime_type) << '\t'
+        << encode_field(entry.attachment_name) << '\t'
+        << encode_field(entry.attachment_path) << '\t'
+        << entry.attachment_size << '\t'
+        << encode_field(entry.audio_privacy) << '\t'
+        << encode_field(entry.encryption_mode) << '\t'
+        << encode_field(entry.transcript);
     return out.str();
 }
 
@@ -185,6 +205,58 @@ size_t history_count(const std::filesystem::path& path) {
     return count;
 }
 
+bool delete_history_entry(const std::filesystem::path& path, const std::string& message_id) {
+    if (message_id.empty()) return false;
+
+    std::ifstream in(path);
+    if (!in) return false;
+
+    std::vector<std::string> kept_lines;
+    kept_lines.reserve(128);
+    bool removed = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        HistoryEntry entry;
+        if (!parse_history_entry(line, entry)) {
+            kept_lines.push_back(line);
+            continue;
+        }
+        if (entry.message_id == message_id) {
+            removed = true;
+            continue;
+        }
+        kept_lines.push_back(line);
+    }
+
+    if (!removed) {
+        return false;
+    }
+
+    const auto tmp_path = path.string() + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("failed to open temporary chat history file for rewrite");
+        }
+        for (const auto& kept : kept_lines) {
+            out << kept << '\n';
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (!ec) {
+        return true;
+    }
+
+    std::filesystem::copy_file(tmp_path, path, std::filesystem::copy_options::overwrite_existing, ec);
+    std::filesystem::remove(tmp_path, ec);
+    if (ec) {
+        throw std::runtime_error("failed to rewrite chat history file: " + ec.message());
+    }
+    return true;
+}
+
 std::string describe_history_entry(const HistoryEntry& entry) {
     std::ostringstream out;
     out << "[" << format_timestamp(entry.timestamp) << "] "
@@ -196,6 +268,15 @@ std::string describe_history_entry(const HistoryEntry& entry) {
     if (!entry.status.empty()) out << " status=" << entry.status;
     if (entry.authenticated) out << " auth=ok";
     if (entry.encrypted) out << (entry.decrypted ? " encrypted=decrypted" : " encrypted=opaque");
+    if (!entry.content_type.empty() && entry.content_type != "text") {
+        out << " type=" << entry.content_type;
+    }
+    if (!entry.attachment_path.empty()) {
+        out << " attachment=" << entry.attachment_path;
+    }
+    if (!entry.transcript.empty()) {
+        out << " transcript=\"" << sanitize_message(entry.transcript) << "\"";
+    }
     out << " id=" << entry.message_id;
     out << " msg=\"" << sanitize_message(entry.message) << "\"";
     return out.str();

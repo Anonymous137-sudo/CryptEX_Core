@@ -654,7 +654,7 @@ static void usage() {
               << "  wallet-send <password> <to_addr> <amount_sats> [wallet.dat] [--datadir path] [--connect host:port] [--opret msg] [--debug]\n"
               << "  sign-message <password> <message> [wallet.dat]\n"
               << "  rpcauth-generate <user> <password>\n"
-              << "  node [--connect host:port] [--seed host[:port]] [--externalip ip[:port]] [--discover 0|1] [--ipdetecthost host] [--ipdetectport n] [--ipdetectpath path] [--duckdns-domain name] [--duckdns-token token] [--duckdns-interval seconds] [--proxy host:port] [--proxydns 0|1] [--upnp 0|1] [--natpmp 0|1] [--nat-lease seconds] [--datadir path] [--debug] [--rpcbind ip] [--rpcport n] [--rpcuser u] [--rpcpassword p] [--rpcauth spec] [--rpcallowip rule] [--rpcmaxbody bytes] [--wallet path] [--walletpass p]\n"
+              << "  node [--connect host:port] [--seed host[:port]] [--externalip ip[:port]] [--discover 0|1] [--ipdetecthost host] [--ipdetectport n] [--ipdetectpath path] [--duckdns-domain name] [--duckdns-token token] [--duckdns-interval seconds] [--proxy host:port] [--proxydns 0|1] [--upnp 0|1] [--natpmp 0|1] [--nat-lease seconds] [--datadir path] [--debug] [--rpcbind ip] [--rpcport n] [--rpctls] [--rpctlscert pem] [--rpctlskey pem] [--rpcuser u] [--rpcpassword p] [--rpcauth spec] [--rpcallowip rule] [--rpcmaxbody bytes] [--wallet path] [--walletpass p]\n"
               << "  chat-public [host:port] <channel> <message> [--peer host:port] [--seed host[:port]] [--wallet path] [--walletpass p] [--from address] [--datadir path] [--wait-ms n]\n"
               << "  chat-private [host:port] <recipient-address> <message> --recipient-pubkey base64 [--peer host:port] [--seed host[:port]] [--wallet path] [--walletpass p] [--from address] [--datadir path] [--wait-ms n]\n"
               << "  chat-inbox [--datadir path] [--limit N] [--channel name] [--address addr] [--direction in|out] [--private|--public]\n"
@@ -1116,6 +1116,18 @@ int main(int argc, char** argv) {
             rpc_cfg.port = static_cast<uint16_t>(*port);
             rpc_requested = true;
         }
+        if (auto tls = runtime.config.get_bool("rpctls")) {
+            rpc_cfg.tls_enabled = *tls;
+            rpc_requested = rpc_requested || *tls;
+        }
+        if (auto cert = runtime.config.get_string("rpctlscert")) {
+            rpc_cfg.tls_cert_path = *cert;
+            rpc_requested = true;
+        }
+        if (auto key = runtime.config.get_string("rpctlskey")) {
+            rpc_cfg.tls_key_path = *key;
+            rpc_requested = true;
+        }
         if (auto user = runtime.config.get_string("rpcuser")) {
             rpc_cfg.username = *user;
             rpc_requested = true;
@@ -1196,6 +1208,15 @@ int main(int argc, char** argv) {
                 rpc_requested = true;
             } else if (arg == "--rpcport" && i + 1 < argc) {
                 rpc_cfg.port = static_cast<uint16_t>(std::stoul(argv[++i]));
+                rpc_requested = true;
+            } else if (arg == "--rpctls") {
+                rpc_cfg.tls_enabled = true;
+                rpc_requested = true;
+            } else if (arg == "--rpctlscert" && i + 1 < argc) {
+                rpc_cfg.tls_cert_path = argv[++i];
+                rpc_requested = true;
+            } else if (arg == "--rpctlskey" && i + 1 < argc) {
+                rpc_cfg.tls_key_path = argv[++i];
                 rpc_requested = true;
             } else if (arg == "--rpcuser" && i + 1 < argc) {
                 rpc_cfg.username = argv[++i];

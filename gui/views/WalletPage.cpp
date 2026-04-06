@@ -137,9 +137,11 @@ WalletPage::WalletPage(QWidget* parent)
     labelAddressEdit_->setReadOnly(true);
     labelEdit_ = new QLineEdit(this);
     labelEdit_->setPlaceholderText(QStringLiteral("Label"));
+    setPrimaryButton_ = new QPushButton(QStringLiteral("Set Primary"), this);
     saveLabelButton_ = new QPushButton(QStringLiteral("Save Label"), this);
     labelLayout->addWidget(labelAddressEdit_, 3);
     labelLayout->addWidget(labelEdit_, 2);
+    labelLayout->addWidget(setPrimaryButton_);
     labelLayout->addWidget(saveLabelButton_);
     addressLayout->addWidget(labelRow);
 
@@ -189,6 +191,7 @@ WalletPage::WalletPage(QWidget* parent)
     newAddressButton_->setEnabled(false);
     rescanButton_->setEnabled(false);
     mnemonicButton_->setEnabled(false);
+    setPrimaryButton_->setEnabled(false);
     saveLabelButton_->setEnabled(false);
     sendButton_->setEnabled(false);
     sendLayout->addRow(QStringLiteral("Recipient"), sendToEdit_);
@@ -252,6 +255,7 @@ WalletPage::WalletPage(QWidget* parent)
     connect(newAddressButton_, &QPushButton::clicked, this, [this]() { requestNewAddress(); });
     connect(rescanButton_, &QPushButton::clicked, this, [this]() { requestRescan(); });
     connect(mnemonicButton_, &QPushButton::clicked, this, [this]() { requestMnemonic(); });
+    connect(setPrimaryButton_, &QPushButton::clicked, this, [this]() { requestPrimaryAddressChange(); });
     connect(saveLabelButton_, &QPushButton::clicked, this, [this]() { saveLabel(); });
     connect(sendButton_, &QPushButton::clicked, this, [this]() { sendPayment(); });
     connect(includeMempoolCheck_, &QCheckBox::toggled, this, [this]() { refresh(); });
@@ -427,6 +431,7 @@ void WalletPage::refresh() {
             newAddressButton_->setEnabled(true);
             rescanButton_->setEnabled(true);
             mnemonicButton_->setEnabled(true);
+            setPrimaryButton_->setEnabled(true);
             saveLabelButton_->setEnabled(true);
             sendButton_->setEnabled(chainApproved_);
             setStatus(chainApproved_
@@ -454,6 +459,7 @@ void WalletPage::refresh() {
             newAddressButton_->setEnabled(false);
             rescanButton_->setEnabled(false);
             mnemonicButton_->setEnabled(false);
+            setPrimaryButton_->setEnabled(false);
             saveLabelButton_->setEnabled(false);
             sendButton_->setEnabled(false);
             if (error.contains(QStringLiteral("no wallet is open"), Qt::CaseInsensitive)) {
@@ -671,6 +677,24 @@ void WalletPage::requestRescan() {
             const auto obj = result.toObject();
             setStatus(QStringLiteral("Rescan complete. Discovered %1 addresses.")
                 .arg(obj.value(QStringLiteral("discovered")).toInteger()));
+            refresh();
+        },
+        [this](const QString& error) { setStatus(error, true); });
+}
+
+void WalletPage::requestPrimaryAddressChange() {
+    if (!rpc_) {
+        setStatus(QStringLiteral("RPC client not configured."), true);
+        return;
+    }
+    const auto address = labelAddressEdit_->text().trimmed();
+    if (address.isEmpty()) {
+        setStatus(QStringLiteral("Select an address before setting it as primary."), true);
+        return;
+    }
+    rpc_->call(QStringLiteral("setprimaryaddress"), QJsonArray{address}, this,
+        [this](const QJsonValue&) {
+            setStatus(QStringLiteral("Primary wallet address updated."));
             refresh();
         },
         [this](const QString& error) { setStatus(error, true); });

@@ -3,13 +3,19 @@
 #include "base64.hpp"
 #include "block.hpp"
 #include "blockchain.hpp"
+#include "chat_state.hpp"
 #include "chat_secure.hpp"
 #include "network.hpp"
 #include "serialization.hpp"
 #include "wallet.hpp"
+#include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read_until.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/asio/ip/network_v4.hpp>
 #include <filesystem>
@@ -30,20 +36,169 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <openssl/crypto.h>
+#include <openssl/ec.h>
 #include <openssl/hmac.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 namespace cryptex {
 namespace rpc {
 
 namespace beast = boost::beast;
 namespace http = beast::http;
+namespace ssl = boost::asio::ssl;
 using tcp = boost::asio::ip::tcp;
 
 namespace {
+
+void ensure_parent_directory(const std::filesystem::path& path) {
+    auto parent = path.parent_path();
+    if (parent.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) {
+        throw std::runtime_error("failed to create TLS directory: " + ec.message());
+    }
+}
+
+void write_private_key_pem(const std::filesystem::path& path, EVP_PKEY* pkey) {
+    ensure_parent_directory(path);
+    FILE* file = std::fopen(path.string().c_str(), "wb");
+    if (!file) {
+        throw std::runtime_error("failed to open TLS key path for writing");
+    }
+    if (PEM_write_PrivateKey(file, pkey, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+        std::fclose(file);
+        throw std::runtime_error("failed to write TLS private key");
+    }
+    std::fclose(file);
+    std::error_code perm_ec;
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace,
+                                 perm_ec);
+}
+
+void write_certificate_pem(const std::filesystem::path& path, X509* cert) {
+    ensure_parent_directory(path);
+    FILE* file = std::fopen(path.string().c_str(), "wb");
+    if (!file) {
+        throw std::runtime_error("failed to open TLS certificate path for writing");
+    }
+    if (PEM_write_X509(file, cert) != 1) {
+        std::fclose(file);
+        throw std::runtime_error("failed to write TLS certificate");
+    }
+    std::fclose(file);
+}
+
+void add_certificate_extension(X509* cert, int nid, const char* value) {
+    X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, nullptr, nid, const_cast<char*>(value));
+    if (!ext) {
+        throw std::runtime_error("failed to create TLS certificate extension");
+    }
+    const int ok = X509_add_ext(cert, ext, -1);
+    X509_EXTENSION_free(ext);
+    if (ok != 1) {
+        throw std::runtime_error("failed to attach TLS certificate extension");
+    }
+}
+
+void generate_self_signed_rpc_certificate(const std::filesystem::path& cert_path,
+                                          const std::filesystem::path& key_path) {
+    EC_KEY* ec_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!ec_key) {
+        throw std::runtime_error("failed to allocate TLS EC key");
+    }
+    if (EC_KEY_generate_key(ec_key) != 1) {
+        EC_KEY_free(ec_key);
+        throw std::runtime_error("failed to generate TLS EC key");
+    }
+
+    EVP_PKEY* pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, ec_key) != 1) {
+        if (pkey) EVP_PKEY_free(pkey);
+        else EC_KEY_free(ec_key);
+        throw std::runtime_error("failed to wrap TLS private key");
+    }
+
+    X509* cert = X509_new();
+    if (!cert) {
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to allocate TLS certificate");
+    }
+
+    if (X509_set_version(cert, 2) != 1 ||
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), static_cast<long>(std::time(nullptr))) != 1 ||
+        X509_gmtime_adj(X509_get_notBefore(cert), 0) == nullptr ||
+        X509_gmtime_adj(X509_get_notAfter(cert), 60L * 60L * 24L * 365L * 5L) == nullptr ||
+        X509_set_pubkey(cert, pkey) != 1) {
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to initialize TLS certificate");
+    }
+
+    X509_NAME* name = X509_get_subject_name(cert);
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>("CryptEX RPC"), -1, -1, 0) != 1 ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert, name) != 1) {
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to populate TLS certificate subject");
+    }
+
+    add_certificate_extension(cert, NID_basic_constraints, "critical,CA:FALSE");
+    add_certificate_extension(cert, NID_key_usage, "critical,digitalSignature,keyEncipherment");
+    add_certificate_extension(cert, NID_ext_key_usage, "serverAuth");
+    add_certificate_extension(cert, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1,IP:::1");
+
+    if (X509_sign(cert, pkey, EVP_sha256()) == 0) {
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("failed to sign TLS certificate");
+    }
+
+    write_private_key_pem(key_path, pkey);
+    try {
+        write_certificate_pem(cert_path, cert);
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(key_path, ec);
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        throw;
+    }
+
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
+}
+
+void ensure_rpc_tls_material(const std::filesystem::path& cert_path,
+                             const std::filesystem::path& key_path) {
+    std::error_code cert_ec;
+    std::error_code key_ec;
+    const bool cert_exists = std::filesystem::exists(cert_path, cert_ec);
+    const bool key_exists = std::filesystem::exists(key_path, key_ec);
+    if (cert_ec || key_ec) {
+        throw std::runtime_error("failed to inspect TLS certificate paths");
+    }
+    if (cert_exists && key_exists) {
+        return;
+    }
+    if (cert_exists != key_exists) {
+        throw std::runtime_error("rpc tls requires matching certificate and key files");
+    }
+    generate_self_signed_rpc_certificate(cert_path, key_path);
+}
 
 class RpcException : public std::runtime_error {
 public:
@@ -959,6 +1114,7 @@ struct SendOptions {
 struct WalletMetadataRecord {
     std::string name;
     std::string format;
+    std::string kdf;
 };
 
 std::filesystem::path wallet_metadata_path(const std::filesystem::path& wallet_file) {
@@ -997,6 +1153,8 @@ WalletMetadataRecord read_wallet_metadata(const std::filesystem::path& wallet_fi
             record.name = value;
         } else if (key == "format") {
             record.format = value;
+        } else if (key == "kdf") {
+            record.kdf = value;
         }
     }
     return record;
@@ -1004,7 +1162,8 @@ WalletMetadataRecord read_wallet_metadata(const std::filesystem::path& wallet_fi
 
 void write_wallet_metadata(const std::filesystem::path& wallet_file,
                            const std::string& suggested_name,
-                           const std::string& format) {
+                           const std::string& format,
+                           const std::string& kdf) {
     const auto meta_path = wallet_metadata_path(wallet_file);
     std::error_code ec;
     if (meta_path.has_parent_path()) {
@@ -1019,6 +1178,7 @@ void write_wallet_metadata(const std::filesystem::path& wallet_file,
     }
     output << "name=" << sanitize_wallet_name(suggested_name.empty() ? wallet_file.stem().string() : suggested_name) << "\n";
     output << "format=" << trim_copy(format) << "\n";
+    output << "kdf=" << trim_copy(kdf) << "\n";
 }
 
 void remove_wallet_metadata(const std::filesystem::path& wallet_file) {
@@ -1043,11 +1203,24 @@ JsonValue wallet_listing_json(const std::filesystem::path& wallet_file,
     const auto active = active_wallet && std::filesystem::path(*active_wallet).lexically_normal() == wallet_file.lexically_normal();
     const auto name = metadata.name.empty() ? sanitize_wallet_name(wallet_file.stem().string()) : metadata.name;
     const auto format = !metadata.format.empty() ? metadata.format : infer_wallet_format_from_path(wallet_file);
+    std::string kdf = metadata.kdf;
+    if (kdf.empty()) {
+        try {
+            const auto inspected = Wallet::inspect_key_derivation(wallet_file.string());
+            switch (inspected) {
+            case Wallet::KeyDerivation::PBKDF2: kdf = "pbkdf2"; break;
+            case Wallet::KeyDerivation::Scrypt: kdf = "scrypt"; break;
+            case Wallet::KeyDerivation::Argon2id: kdf = "argon2id"; break;
+            }
+        } catch (...) {
+        }
+    }
     const bool managed = wallet_file.parent_path().filename() == "wallets";
     info.set("name", JsonValue::string(name));
     info.set("path", JsonValue::string(normalized));
     info.set("active", JsonValue(active));
     info.set("address_format", format.empty() ? JsonValue() : JsonValue::string(format));
+    info.set("kdf", kdf.empty() ? JsonValue() : JsonValue::string(kdf));
     info.set("managed", JsonValue(managed));
     return info;
 }
@@ -1233,6 +1406,72 @@ JsonValue chat_entry_to_json(const chat::HistoryEntry& entry) {
     obj.set("message", JsonValue::string(entry.message));
     obj.set("peer", JsonValue::string(entry.peer_label));
     obj.set("status", JsonValue::string(entry.status));
+    obj.set("content_type", JsonValue::string(entry.content_type));
+    obj.set("mime_type", JsonValue::string(entry.mime_type));
+    obj.set("attachment_name", JsonValue::string(entry.attachment_name));
+    obj.set("attachment_path", JsonValue::string(entry.attachment_path));
+    obj.set("attachment_size", JsonValue::number(entry.attachment_size));
+    obj.set("audio_privacy", JsonValue::string(entry.audio_privacy));
+    obj.set("encryption_mode", JsonValue::string(entry.encryption_mode));
+    obj.set("transcript", JsonValue::string(entry.transcript));
+    return obj;
+}
+
+JsonValue voice_audio_frame_to_json(const voice::AudioFrame& frame) {
+    JsonValue obj = JsonValue::object();
+    obj.set("timestamp", JsonValue::number(frame.timestamp));
+    obj.set("sequence", JsonValue::number(frame.sequence));
+    obj.set("call_id", JsonValue::string(frame.call_id));
+    obj.set("sample_rate", JsonValue::number(static_cast<uint64_t>(frame.sample_rate)));
+    obj.set("channels", JsonValue::number(static_cast<uint64_t>(frame.channels)));
+    obj.set("bits_per_sample", JsonValue::number(static_cast<uint64_t>(frame.bits_per_sample)));
+    obj.set("frame_duration_ms", JsonValue::number(static_cast<uint64_t>(frame.frame_duration_ms)));
+    obj.set("codec", JsonValue::string(voice::codec_name(frame.codec)));
+    obj.set("obfuscated", JsonValue(frame.obfuscated));
+    obj.set("audio_b64", JsonValue::string(crypto::base64_encode(frame.pcm_bytes)));
+    return obj;
+}
+
+JsonValue voice_call_info_to_json(const net::NetworkNode::VoiceCallInfo& info) {
+    JsonValue obj = JsonValue::object();
+    obj.set("active", JsonValue(info.active));
+    obj.set("incoming", JsonValue(info.incoming));
+    obj.set("outgoing", JsonValue(info.outgoing));
+    obj.set("ringing", JsonValue(info.ringing));
+    obj.set("connected", JsonValue(info.connected));
+    obj.set("session_ready", JsonValue(info.session_ready));
+    obj.set("obfuscate_audio", JsonValue(info.obfuscate_audio));
+    obj.set("started_at", JsonValue::number(info.started_at));
+    obj.set("connected_at", JsonValue::number(info.connected_at));
+    obj.set("last_signal_at", JsonValue::number(info.last_signal_at));
+    obj.set("last_audio_at", JsonValue::number(info.last_audio_at));
+    obj.set("latency_ms", JsonValue::number(info.latency_ms));
+    obj.set("jitter_ms", JsonValue::number(info.jitter_ms));
+    obj.set("sample_rate", JsonValue::number(static_cast<uint64_t>(info.sample_rate)));
+    obj.set("channels", JsonValue::number(static_cast<uint64_t>(info.channels)));
+    obj.set("bits_per_sample", JsonValue::number(static_cast<uint64_t>(info.bits_per_sample)));
+    obj.set("frame_duration_ms", JsonValue::number(static_cast<uint64_t>(info.frame_duration_ms)));
+    obj.set("status", JsonValue::string(info.status));
+    obj.set("call_id", JsonValue::string(info.call_id));
+    obj.set("peer", JsonValue::string(info.peer_label));
+    obj.set("encryption", JsonValue::string(info.encryption_mode));
+    obj.set("codec", JsonValue::string(info.codec));
+    obj.set("capability_flags", JsonValue::number(static_cast<uint64_t>(info.capability_flags)));
+    obj.set("capabilities", JsonValue::string(voice::capability_summary(info.capability_flags)));
+    obj.set("remote_pubkey_b64", JsonValue::string(info.remote_pubkey_b64));
+    obj.set("remote_rsa_pubkey_pem", JsonValue::string(info.remote_rsa_public_pem));
+    if (!info.local_address.empty()) add_address_formats(obj, "local_address", info.local_address);
+    else obj.set("local_address", JsonValue::string(""));
+    if (!info.remote_address.empty()) add_address_formats(obj, "remote_address", info.remote_address);
+    else obj.set("remote_address", JsonValue::string(""));
+    if (!info.caller_address.empty()) add_address_formats(obj, "caller_address", info.caller_address);
+    else obj.set("caller_address", JsonValue::string(""));
+    if (!info.callee_address.empty()) add_address_formats(obj, "callee_address", info.callee_address);
+    else obj.set("callee_address", JsonValue::string(""));
+    const std::string route = !info.caller_address.empty() || !info.callee_address.empty()
+        ? (info.caller_address + " -> " + info.callee_address)
+        : std::string();
+    obj.set("call_route", JsonValue::string(route));
     return obj;
 }
 
@@ -1259,7 +1498,7 @@ chat::HistoryQuery chat_query_from_params(const JsonValue::array_t& params) {
 }
 
 chat::HistoryEntry build_outbound_chat_history(const net::ChatPayload& payload,
-                                               const std::string& plaintext,
+                                               const chat::ContentEnvelope& content,
                                                const std::string& peer_label) {
     chat::HistoryEntry entry;
     entry.direction = "out";
@@ -1276,9 +1515,20 @@ chat::HistoryEntry build_outbound_chat_history(const net::ChatPayload& payload,
     entry.recipient_address = payload.recipient;
     entry.recipient_pubkey = crypto::base64_encode(payload.recipient_pubkey);
     entry.channel = payload.channel;
-    entry.message = plaintext;
+    entry.message = chat::content_summary(content);
     entry.peer_label = peer_label;
     entry.status = "queued";
+    entry.content_type = chat::content_type_name(content.type);
+    entry.mime_type = content.mime_type;
+    entry.attachment_name = content.attachment_name;
+    entry.attachment_size = static_cast<uint64_t>(content.attachment_bytes.size());
+    entry.audio_privacy = chat::audio_privacy_name(content.audio_privacy);
+    entry.transcript = content.transcript;
+    entry.encryption_mode = payload.chat_type == 1
+        ? chat::encryption_mode_name(payload.version >= 4
+                                         ? static_cast<chat::EncryptionMode>(payload.cipher_profile)
+                                         : chat::EncryptionMode::ECDH)
+        : "signed";
     return entry;
 }
 
@@ -1296,8 +1546,17 @@ struct ChatSendRequest {
     std::string route;
     std::string recipient_address;
     std::string recipient_pubkey_b64;
+    std::string recipient_rsa_pubkey_pem;
     std::string message;
     std::string from_address;
+    std::string attachment_path;
+    std::string attachment_name;
+    std::string mime_type;
+    std::string attachment_transcript;
+    std::optional<chat::ContentType> content_type;
+    bool obfuscate_audio{false};
+    std::optional<chat::KeyDerivation> kdf;
+    std::optional<chat::EncryptionMode> encryption_mode;
 };
 
 ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool private_chat) {
@@ -1308,27 +1567,60 @@ ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool p
         if (const auto* peer = object.find("peer")) request.peer_label = peer->as_string();
         if (const auto* from = object.find("from_address")) request.from_address = from->as_string();
         else if (const auto* from = object.find("from")) request.from_address = from->as_string();
+        if (const auto* attachment = object.find("attachment_path")) request.attachment_path = attachment->as_string();
+        if (const auto* name = object.find("attachment_name")) request.attachment_name = name->as_string();
+        if (const auto* mime = object.find("mime_type")) request.mime_type = mime->as_string();
+        if (const auto* transcript = object.find("attachment_transcript")) request.attachment_transcript = transcript->as_string();
+        if (const auto* media = object.find("media_type")) {
+            auto parsed_type = chat::parse_content_type(media->as_string());
+            if (!parsed_type || *parsed_type == chat::ContentType::Text) {
+                throw RpcException(-32602, "unknown chat media_type");
+            }
+            request.content_type = *parsed_type;
+        }
+        if (const auto* privacy = object.find("obfuscate_audio")) request.obfuscate_audio = privacy->as_bool();
 
         if (!private_chat) {
             const auto* channel = object.find("channel");
             const auto* message = object.find("message");
-            if (!channel || !message) {
-                throw RpcException(-32602, "sendchatpublic object expects {channel, message, peer?, from_address?}");
+            if (!channel || (!message && request.attachment_path.empty())) {
+                throw RpcException(-32602, "sendchatpublic object expects {channel, message?, attachment_path?, media_type?, peer?, from_address?}");
             }
             request.route = channel->as_string();
-            request.message = message->as_string();
+            if (message) request.message = message->as_string();
         } else {
             const auto* recipient = object.find("recipient_address");
             const auto* pubkey = object.find("recipient_pubkey_b64")
                                       ? object.find("recipient_pubkey_b64")
                                       : object.find("recipient_pubkey");
             const auto* message = object.find("message");
-            if (!recipient || !pubkey || !message) {
-                throw RpcException(-32602, "sendchatprivate object expects {recipient_address, recipient_pubkey_b64, message, peer?, from_address?}");
+            if (!recipient || (!pubkey && !object.find("recipient_rsa_pubkey_pem") && !object.find("recipient_rsa_pubkey") && !object.find("recipient_rsa_pubkey_b64")) ||
+                (!message && request.attachment_path.empty())) {
+                throw RpcException(-32602, "sendchatprivate object expects {recipient_address, recipient_pubkey_b64?, recipient_rsa_pubkey_pem?, message?, attachment_path?, peer?, from_address?, kdf?, encryption?}");
             }
             request.recipient_address = recipient->as_string();
-            request.recipient_pubkey_b64 = pubkey->as_string();
-            request.message = message->as_string();
+            if (pubkey) request.recipient_pubkey_b64 = pubkey->as_string();
+            if (const auto* rsa = object.find("recipient_rsa_pubkey_pem")) request.recipient_rsa_pubkey_pem = rsa->as_string();
+            else if (const auto* rsa = object.find("recipient_rsa_pubkey")) request.recipient_rsa_pubkey_pem = rsa->as_string();
+            else if (const auto* rsa = object.find("recipient_rsa_pubkey_b64")) {
+                auto decoded = crypto::base64_decode(rsa->as_string());
+                request.recipient_rsa_pubkey_pem.assign(decoded.begin(), decoded.end());
+            }
+            if (message) request.message = message->as_string();
+            if (const auto* kdf = object.find("kdf")) {
+                auto parsed = chat::parse_kdf(kdf->as_string());
+                if (!parsed) {
+                    throw RpcException(-32602, "unknown private chat kdf");
+                }
+                request.kdf = *parsed;
+            }
+            if (const auto* encryption = object.find("encryption")) {
+                auto parsed = chat::parse_encryption_mode(encryption->as_string());
+                if (!parsed) {
+                    throw RpcException(-32602, "unknown private chat encryption mode");
+                }
+                request.encryption_mode = *parsed;
+            }
         }
         return request;
     }
@@ -1365,6 +1657,458 @@ ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool p
     return request;
 }
 
+chat::ContentEnvelope build_chat_content_from_request(const ChatSendRequest& request) {
+    if (!request.attachment_path.empty()) {
+        return chat::load_attachment_content(request.attachment_path,
+                                             request.content_type,
+                                             request.message,
+                                             request.obfuscate_audio,
+                                             request.mime_type.empty() ? std::nullopt : std::make_optional(request.mime_type),
+                                             request.attachment_name.empty() ? std::nullopt : std::make_optional(request.attachment_name),
+                                             request.attachment_transcript.empty() ? std::nullopt : std::make_optional(request.attachment_transcript));
+    }
+    return chat::make_text_content(request.message);
+}
+
+std::filesystem::path runtime_data_dir(const net::NetworkNode* node,
+                                       const std::optional<std::string>& wallet_path,
+                                       const std::optional<std::string>& wallet_directory) {
+    if (node) {
+        const auto chat_path = node->chat_history_path();
+        if (chat_path.has_parent_path()) {
+            return chat_path.parent_path();
+        }
+    }
+    if (wallet_directory && !wallet_directory->empty()) {
+        const auto root = std::filesystem::path(*wallet_directory);
+        if (root.has_parent_path()) return root.parent_path();
+        return root;
+    }
+    if (wallet_path && !wallet_path->empty()) {
+        const auto path = std::filesystem::path(*wallet_path);
+        if (path.has_parent_path()) return path.parent_path();
+    }
+    return std::filesystem::current_path();
+}
+
+std::filesystem::path private_contacts_path(const std::filesystem::path& data_dir) {
+    return data_dir / "chat_private_contacts.dat";
+}
+
+std::filesystem::path proxy_config_path(const std::filesystem::path& data_dir) {
+    return data_dir / "chat_proxy.conf";
+}
+
+std::filesystem::path irc_config_path(const std::filesystem::path& data_dir) {
+    return data_dir / "irc.conf";
+}
+
+std::filesystem::path irc_log_path(const std::filesystem::path& data_dir) {
+    return data_dir / "irc_history.dat";
+}
+
+std::string normalize_directory_address(const std::string& address) {
+    try {
+        return crypto::canonicalize_address(address);
+    } catch (...) {
+        return address;
+    }
+}
+
+std::optional<std::string> try_directory_address(const std::string& address) {
+    try {
+        return crypto::canonicalize_address(address);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+JsonValue private_contact_to_json(const chatstate::PrivateContact& contact) {
+    JsonValue row = JsonValue::object();
+    add_address_formats(row, "address", contact.address);
+    row.set("label", JsonValue::string(contact.label));
+    row.set("pubkey_b64", JsonValue::string(contact.pubkey_b64));
+    row.set("rsa_pubkey_pem", JsonValue::string(contact.rsa_pubkey_pem));
+    row.set("rsa_pubkey_b64", JsonValue::string(crypto::base64_encode(contact.rsa_pubkey_pem)));
+    row.set("peer", JsonValue::string(contact.peer_label));
+    row.set("notes", JsonValue::string(contact.notes));
+    row.set("added_at", JsonValue::number(contact.added_at));
+    row.set("last_used_at", JsonValue::number(contact.last_used_at));
+    return row;
+}
+
+chatstate::PrivateContact private_contact_from_json(const JsonValue& value) {
+    if (!value.is_object()) throw RpcException(-32602, "private contact must be an object");
+    chatstate::PrivateContact contact;
+    if (const auto* field = value.find("label")) contact.label = field->as_string();
+    if (const auto* field = value.find("address")) contact.address = normalize_directory_address(field->as_string());
+    if (const auto* field = value.find("pubkey_b64")) contact.pubkey_b64 = field->as_string();
+    else if (const auto* field = value.find("pubkey")) contact.pubkey_b64 = field->as_string();
+    if (const auto* field = value.find("rsa_pubkey_pem")) contact.rsa_pubkey_pem = field->as_string();
+    else if (const auto* field = value.find("rsa_pubkey")) contact.rsa_pubkey_pem = field->as_string();
+    else if (const auto* field = value.find("rsa_pubkey_b64")) {
+        auto decoded = crypto::base64_decode(field->as_string());
+        contact.rsa_pubkey_pem.assign(decoded.begin(), decoded.end());
+    }
+    if (const auto* field = value.find("peer")) contact.peer_label = field->as_string();
+    if (const auto* field = value.find("notes")) contact.notes = field->as_string();
+    if (contact.address.empty()) throw RpcException(-32602, "private contact address is required");
+    return contact;
+}
+
+JsonValue proxy_config_to_json(const chatstate::ProxyConfig& config) {
+    JsonValue row = JsonValue::object();
+    row.set("enabled", JsonValue(config.enabled));
+    row.set("host", JsonValue::string(config.host));
+    row.set("port", JsonValue::number(static_cast<uint64_t>(config.port)));
+    row.set("remote_dns", JsonValue(config.remote_dns));
+    return row;
+}
+
+chatstate::ProxyConfig proxy_config_from_json(const JsonValue& value) {
+    if (!value.is_object()) throw RpcException(-32602, "proxy config must be an object");
+    chatstate::ProxyConfig config;
+    if (const auto* field = value.find("enabled")) config.enabled = field->as_bool();
+    if (const auto* field = value.find("host")) config.host = field->as_string();
+    if (const auto* field = value.find("port")) config.port = static_cast<uint16_t>(field->as_u64());
+    if (const auto* field = value.find("remote_dns")) config.remote_dns = field->as_bool();
+    if (config.enabled && (config.host.empty() || config.port == 0)) {
+        throw RpcException(-32602, "enabled proxy requires host and port");
+    }
+    return config;
+}
+
+JsonValue irc_config_to_json(const chatstate::IrcConfig& config) {
+    JsonValue row = JsonValue::object();
+    row.set("enabled", JsonValue(config.enabled));
+    row.set("server", JsonValue::string(config.server));
+    row.set("port", JsonValue::number(static_cast<uint64_t>(config.port)));
+    row.set("nick", JsonValue::string(config.nick));
+    row.set("username", JsonValue::string(config.username));
+    row.set("realname", JsonValue::string(config.realname));
+    row.set("channel", JsonValue::string(config.channel));
+    row.set("use_tls", JsonValue(config.use_tls));
+    return row;
+}
+
+chatstate::IrcConfig irc_config_from_json(const JsonValue& value) {
+    if (!value.is_object()) throw RpcException(-32602, "IRC config must be an object");
+    chatstate::IrcConfig config;
+    if (const auto* field = value.find("enabled")) config.enabled = field->as_bool();
+    if (const auto* field = value.find("server")) config.server = field->as_string();
+    if (const auto* field = value.find("port")) config.port = static_cast<uint16_t>(field->as_u64());
+    if (const auto* field = value.find("nick")) config.nick = field->as_string();
+    if (const auto* field = value.find("username")) config.username = field->as_string();
+    if (const auto* field = value.find("realname")) config.realname = field->as_string();
+    if (const auto* field = value.find("channel")) config.channel = field->as_string();
+    if (const auto* field = value.find("use_tls")) config.use_tls = field->as_bool();
+    return config;
+}
+
+JsonValue irc_log_to_json(const chatstate::IrcLogEntry& row) {
+    JsonValue out = JsonValue::object();
+    out.set("timestamp", JsonValue::number(row.timestamp));
+    out.set("direction", JsonValue::string(row.direction));
+    out.set("server", JsonValue::string(row.server));
+    out.set("channel", JsonValue::string(row.channel));
+    out.set("nick", JsonValue::string(row.nick));
+    out.set("message", JsonValue::string(row.message));
+    out.set("status", JsonValue::string(row.status));
+    return out;
+}
+
+std::optional<std::vector<uint8_t>> extract_pubkey_from_scriptsig(const std::vector<uint8_t>& script_sig) {
+    if (script_sig.size() >= 33) {
+        const auto start = script_sig.end() - 33;
+        if ((*start == 0x02 || *start == 0x03)) {
+            return std::vector<uint8_t>(start, script_sig.end());
+        }
+    }
+    if (script_sig.size() >= 65) {
+        const auto start = script_sig.end() - 65;
+        if (*start == 0x04) {
+            return std::vector<uint8_t>(start, script_sig.end());
+        }
+    }
+    return std::nullopt;
+}
+
+struct PublicDirectoryEntry {
+    std::string address;
+    int64_t balance_sats{0};
+    int64_t received_sats{0};
+    int64_t sent_sats{0};
+    uint64_t tx_count{0};
+    uint64_t last_timestamp{0};
+    std::optional<uint64_t> last_height;
+    std::string public_key_b64;
+    bool online{false};
+    std::string ip;
+    std::string peer_label;
+};
+
+std::vector<PublicDirectoryEntry> scan_public_directory(const Blockchain& chain,
+                                                        net::NetworkNode* node,
+                                                        const Wallet* wallet,
+                                                        uint64_t limit) {
+    std::unordered_map<std::string, PublicDirectoryEntry> entries;
+    std::unordered_map<OutPoint, UTXOEntry> seen_outputs;
+
+    for (uint64_t height = 0; height <= chain.best_height(); ++height) {
+        auto block = chain.get_block(height);
+        if (!block) continue;
+
+        for (const auto& tx : block->transactions) {
+            std::unordered_set<std::string> touched;
+            for (const auto& input : tx.inputs) {
+                auto prev = seen_outputs.find(input.prevout);
+                if (prev != seen_outputs.end()) {
+                    auto canonical = prev->second.output.scriptPubKey;
+                    auto& entry = entries[canonical];
+                    entry.address = canonical;
+                    entry.balance_sats -= prev->second.output.value;
+                    entry.sent_sats += prev->second.output.value;
+                    touched.insert(canonical);
+                }
+
+                if (auto pubkey = extract_pubkey_from_scriptsig(input.scriptSig)) {
+                    try {
+                        const auto derived = normalize_directory_address(script::pubkey_to_address(*pubkey));
+                        auto& entry = entries[derived];
+                        entry.address = derived;
+                        if (entry.public_key_b64.empty()) {
+                            entry.public_key_b64 = crypto::base64_encode(*pubkey);
+                        }
+                    } catch (...) {
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < tx.outputs.size(); ++i) {
+                if (auto canonical = try_directory_address(tx.outputs[i].scriptPubKey)) {
+                    auto& entry = entries[*canonical];
+                    entry.address = *canonical;
+                    entry.balance_sats += tx.outputs[i].value;
+                    entry.received_sats += tx.outputs[i].value;
+                    touched.insert(*canonical);
+                }
+                if (auto canonical = try_directory_address(tx.outputs[i].scriptPubKey)) {
+                    seen_outputs[OutPoint{tx.hash(), static_cast<uint32_t>(i)}] =
+                        UTXOEntry{TxOut{tx.outputs[i].value, *canonical}, static_cast<uint32_t>(height), tx.is_coinbase()};
+                }
+            }
+
+            for (const auto& address : touched) {
+                auto& entry = entries[address];
+                entry.tx_count += 1;
+                entry.last_timestamp = std::max<uint64_t>(entry.last_timestamp, block->header.timestamp);
+                if (!entry.last_height || height > *entry.last_height) {
+                    entry.last_height = height;
+                }
+            }
+        }
+    }
+
+    if (wallet) {
+        for (const auto& row : wallet->address_book()) {
+            const auto canonical = normalize_directory_address(row.address_base64.empty() ? row.address : row.address_base64);
+            auto it = entries.find(canonical);
+            if (it != entries.end() && it->second.public_key_b64.empty()) {
+                it->second.public_key_b64 = row.pubkey_b64;
+            }
+        }
+    }
+
+    if (node) {
+        std::unordered_map<std::string, bool> connected_by_label;
+        for (const auto& peer : node->peer_statuses()) {
+            connected_by_label[peer.label] = peer.connected;
+        }
+
+        chat::HistoryQuery query;
+        query.limit = 0;
+        for (const auto& history : node->chat_history(query)) {
+            auto note_address = [&](const std::string& address,
+                                    const std::string& pubkey_b64,
+                                    const std::string& peer_label) {
+                if (address.empty()) return;
+                auto canonical = try_directory_address(address);
+                if (!canonical) return;
+                auto it = entries.find(*canonical);
+                if (it == entries.end()) return;
+                if (!pubkey_b64.empty() && it->second.public_key_b64.empty()) {
+                    it->second.public_key_b64 = pubkey_b64;
+                }
+                if (!peer_label.empty() && peer_label != "network") {
+                    const bool connected = connected_by_label[peer_label];
+                    if (history.timestamp >= it->second.last_timestamp || it->second.peer_label.empty()) {
+                        it->second.peer_label = peer_label;
+                        it->second.ip = peer_label;
+                        it->second.online = connected;
+                    } else if (connected) {
+                        it->second.online = true;
+                    }
+                }
+            };
+            note_address(history.sender_address, history.sender_pubkey, history.peer_label);
+            note_address(history.recipient_address, history.recipient_pubkey, history.peer_label);
+        }
+    }
+
+    if (wallet) {
+        const auto self_online = node ? node->network_active() : false;
+        const auto self_endpoint = node ? node->advertised_endpoint() : std::optional<std::string>{};
+        for (const auto& row : wallet->address_book()) {
+            const auto canonical = normalize_directory_address(row.address_base64.empty() ? row.address : row.address_base64);
+            auto it = entries.find(canonical);
+            if (it == entries.end()) continue;
+            if (!row.pubkey_b64.empty() && it->second.public_key_b64.empty()) {
+                it->second.public_key_b64 = row.pubkey_b64;
+            }
+            if (node) {
+                it->second.online = self_online;
+                it->second.peer_label = "self";
+                if (self_endpoint) {
+                    it->second.ip = *self_endpoint;
+                } else if (self_online && it->second.ip.empty()) {
+                    it->second.ip = "local node";
+                }
+            }
+        }
+    }
+
+    std::vector<PublicDirectoryEntry> rows;
+    rows.reserve(entries.size());
+    for (auto& [address, entry] : entries) {
+        (void)address;
+        rows.push_back(std::move(entry));
+    }
+    std::sort(rows.begin(), rows.end(), [](const PublicDirectoryEntry& a, const PublicDirectoryEntry& b) {
+        if (a.last_timestamp != b.last_timestamp) return a.last_timestamp > b.last_timestamp;
+        if (a.balance_sats != b.balance_sats) return a.balance_sats > b.balance_sats;
+        return a.address < b.address;
+    });
+    if (limit > 0 && rows.size() > limit) {
+        rows.resize(static_cast<size_t>(limit));
+    }
+    return rows;
+}
+
+JsonValue public_directory_entry_to_json(const PublicDirectoryEntry& entry) {
+    JsonValue row = JsonValue::object();
+    add_address_formats(row, "address", entry.address);
+    row.set("balance_sats", JsonValue::number(entry.balance_sats));
+    row.set("received_sats", JsonValue::number(entry.received_sats));
+    row.set("sent_sats", JsonValue::number(entry.sent_sats));
+    row.set("tx_count", JsonValue::number(entry.tx_count));
+    row.set("last_timestamp", JsonValue::number(entry.last_timestamp));
+    if (entry.last_height) row.set("last_height", JsonValue::number(*entry.last_height));
+    else row.set("last_height", JsonValue());
+    row.set("online", JsonValue(entry.online));
+    row.set("ip", JsonValue::string(entry.ip));
+    row.set("peer", JsonValue::string(entry.peer_label));
+    row.set("pubkey_b64", JsonValue::string(entry.public_key_b64));
+    return row;
+}
+
+struct IrcSendResult {
+    std::string status;
+    std::vector<std::string> lines;
+};
+
+std::vector<std::string> parse_irc_lines(std::string& buffer) {
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while ((pos = buffer.find("\r\n")) != std::string::npos) {
+        lines.push_back(buffer.substr(0, pos));
+        buffer.erase(0, pos + 2);
+    }
+    return lines;
+}
+
+void send_irc_line(tcp::socket& socket, const std::string& line) {
+    const auto payload = line + "\r\n";
+    boost::asio::write(socket, boost::asio::buffer(payload));
+}
+
+std::vector<std::string> read_irc_lines(tcp::socket& socket, int timeout_ms) {
+    std::vector<std::string> lines;
+    std::string buffer;
+    socket.non_blocking(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::array<char, 1024> chunk{};
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code ec;
+        size_t bytes = socket.read_some(boost::asio::buffer(chunk), ec);
+        if (!ec && bytes > 0) {
+            buffer.append(chunk.data(), bytes);
+            auto parsed = parse_irc_lines(buffer);
+            lines.insert(lines.end(), parsed.begin(), parsed.end());
+            continue;
+        }
+        if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            continue;
+        }
+        if (ec) break;
+    }
+    auto parsed = parse_irc_lines(buffer);
+    lines.insert(lines.end(), parsed.begin(), parsed.end());
+    return lines;
+}
+
+IrcSendResult send_irc_message(const chatstate::IrcConfig& config, const std::string& message) {
+    if (config.use_tls) {
+        throw RpcException(-32603, "TLS IRC is not supported by the current bridge");
+    }
+    if (config.server.empty() || config.channel.empty() || config.nick.empty()) {
+        throw RpcException(-32602, "IRC server, channel, and nick are required");
+    }
+
+    boost::asio::io_context ctx;
+    tcp::resolver resolver(ctx);
+    tcp::socket socket(ctx);
+    boost::asio::connect(socket, resolver.resolve(config.server, std::to_string(config.port)));
+
+    send_irc_line(socket, "NICK " + config.nick);
+    send_irc_line(socket, "USER " + config.username + " 0 * :" + config.realname);
+
+    IrcSendResult result;
+    result.status = "connected";
+    for (const auto& line : read_irc_lines(socket, 1200)) {
+        result.lines.push_back(line);
+        if (line.rfind("PING ", 0) == 0) {
+            send_irc_line(socket, "PONG " + line.substr(5));
+        }
+        if (line.find(" 001 ") != std::string::npos) {
+            result.status = "ready";
+        }
+    }
+
+    send_irc_line(socket, "JOIN " + config.channel);
+    for (const auto& line : read_irc_lines(socket, 500)) {
+        result.lines.push_back(line);
+        if (line.rfind("PING ", 0) == 0) {
+            send_irc_line(socket, "PONG " + line.substr(5));
+        }
+    }
+
+    if (!message.empty()) {
+        send_irc_line(socket, "PRIVMSG " + config.channel + " :" + message);
+        result.status = "sent";
+    }
+
+    for (const auto& line : read_irc_lines(socket, 500)) {
+        result.lines.push_back(line);
+    }
+
+    boost::system::error_code ignored;
+    send_irc_line(socket, "QUIT :CryptEX bridge");
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+    return result;
+}
+
 } // namespace
 
 RpcService::RpcService(Blockchain& chain,
@@ -1378,7 +2122,18 @@ RpcService::RpcService(Blockchain& chain,
       wallet_path_(std::move(wallet_path)),
       wallet_password_(std::move(wallet_password)),
       rpc_port_(rpc_port),
-      wallet_directory_(std::move(wallet_directory)) {}
+      wallet_directory_(std::move(wallet_directory)) {
+    if (node_) {
+        const auto data_dir = runtime_data_dir(node_, wallet_path_, wallet_directory_);
+        const auto proxy = chatstate::load_proxy_config(proxy_config_path(data_dir));
+        if (proxy.enabled && !proxy.host.empty() && proxy.port != 0) {
+            node_->set_socks5_proxy(proxy.host, proxy.port, proxy.remote_dns);
+        }
+        if (wallet_path_ && wallet_password_) {
+            node_->set_chat_wallet(std::make_shared<Wallet>(Wallet::load(*wallet_password_, *wallet_path_)));
+        }
+    }
+}
 
 bool RpcService::has_wallet_session() const {
     return wallet_path_.has_value() && wallet_password_.has_value();
@@ -1426,6 +2181,9 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             require_wallet_session();
             return Wallet::load(*wallet_password_, *wallet_path_);
         };
+        auto chat_data_root = [&]() -> std::filesystem::path {
+            return runtime_data_dir(node_, wallet_path_, wallet_directory_);
+        };
 
         if (method == "help") {
             JsonValue methods = JsonValue::array({});
@@ -1438,10 +2196,16 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                      "getblocktemplate",
                      "getwalletsessioninfo", "listwallets", "createwallet", "openwallet", "closewallet", "deletewallet",
                      "getcheckpointinfo", "pincheckpoint", "clearcheckpointpin", "refreshcheckpoint",
-                     "getchatinfo", "getchatinbox", "sendchatpublic", "sendchatprivate",
+                     "getchatinfo", "getchatinbox", "deletechatmessage", "sendchatpublic", "sendchatprivate",
+                     "getvoicecallstate", "startvoicecall", "acceptvoicecall", "declinevoicecall", "endvoicecall",
+                     "sendvoicecallaudio", "pullvoicecallaudio",
+                     "getchatprivatecontacts", "upsertchatprivatecontact", "removechatprivatecontact",
+                     "getchatproxyconfig", "setchatproxyconfig",
+                     "getircconfig", "setircconfig", "getirclog", "sendircmessage",
+                     "getpublicaddressdirectory",
                      "getpeerinfo", "getpeergraph", "getnetworkinfo", "getportmappinginfo", "getmininginfo", "getmempoolinfo",
                      "getwalletinfo", "getbalance", "listunspent", "getwalletaddresses",
-                     "getwalletaddressbook", "setaddresslabel",
+                     "getwalletaddressbook", "setaddresslabel", "setprimaryaddress",
                      "getwallethistory", "getwallettransactions", "getwallettransaction", "getnewaddress", "getunusedaddress",
                      "setwalletformat",
                      "dumpprivkey", "importprivkey", "importmnemonic", "backupwallet", "recoverwallet", "walletpassphrasechange",
@@ -1737,15 +2501,286 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             JsonValue info = JsonValue::object();
             auto history_path = node_->chat_history_path();
             auto sync = node_->sync_status();
+            const auto data_dir = chat_data_root();
+            const auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+            const auto proxy_file = chatstate::load_proxy_config(proxy_config_path(data_dir));
+            const auto irc_file = chatstate::load_irc_config(irc_config_path(data_dir));
+            const auto live_proxy = node_->proxy_settings();
             info.set("historyfile", JsonValue::string(history_path.string()));
             info.set("messages", JsonValue::number(static_cast<uint64_t>(chat::history_count(history_path))));
             info.set("wallet_loaded", JsonValue(has_wallet_session()));
             info.set("connections", JsonValue::number(static_cast<uint64_t>(sync.connected_peers)));
             info.set("validated_peers", JsonValue::number(static_cast<uint64_t>(sync.validated_peers)));
+            info.set("private_contacts", JsonValue::number(static_cast<uint64_t>(contacts.size())));
+            info.set("proxy_enabled", JsonValue(live_proxy.has_value() ? true : proxy_file.enabled));
+            info.set("irc_enabled", JsonValue(irc_file.enabled));
             info.set("routing_mode", JsonValue::string(sync.connected_peers > 0
                 ? "peer-network"
                 : "awaiting-peers"));
             result = std::move(info);
+        } else if (method == "getvoicecallstate") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            result = voice_call_info_to_json(node_->voice_call_state());
+        } else if (method == "startvoicecall") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            require_wallet_session();
+            if (params.size() != 1 || !params[0].is_object()) {
+                throw RpcException(-32602, "startvoicecall expects [{recipient_address, recipient_pubkey_b64?, recipient_rsa_pubkey_pem?, peer?, from_address?, obfuscate_audio?, encryption?}]");
+            }
+            const auto& object = params[0];
+            const auto* recipient = object.find("recipient_address");
+            if (!recipient) {
+                throw RpcException(-32602, "recipient_address is required");
+            }
+            std::string recipient_pubkey_b64;
+            if (const auto* value = object.find("recipient_pubkey_b64")) recipient_pubkey_b64 = value->as_string();
+            else if (const auto* value = object.find("recipient_pubkey")) recipient_pubkey_b64 = value->as_string();
+
+            std::string recipient_rsa_pubkey_pem;
+            if (const auto* value = object.find("recipient_rsa_pubkey_pem")) recipient_rsa_pubkey_pem = value->as_string();
+            else if (const auto* value = object.find("recipient_rsa_pubkey")) recipient_rsa_pubkey_pem = value->as_string();
+            else if (const auto* value = object.find("recipient_rsa_pubkey_b64")) {
+                auto decoded = crypto::base64_decode(value->as_string());
+                recipient_rsa_pubkey_pem.assign(decoded.begin(), decoded.end());
+            }
+
+            if (recipient_pubkey_b64.empty()) {
+                throw RpcException(-32602, "recipient_pubkey_b64 is required for secure voice calls");
+            }
+
+            const std::string peer = object.find("peer") ? object.find("peer")->as_string() : std::string();
+            const std::string from_address = object.find("from_address") ? object.find("from_address")->as_string() : std::string();
+            const bool obfuscate_audio = object.find("obfuscate_audio") ? object.find("obfuscate_audio")->as_bool() : false;
+            auto wallet = load_session_wallet();
+            node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
+            const bool started = node_->start_voice_call(recipient->as_string(),
+                                                         recipient_pubkey_b64.empty() ? std::vector<uint8_t>{}
+                                                                                      : crypto::base64_decode(recipient_pubkey_b64),
+                                                         recipient_rsa_pubkey_pem,
+                                                         peer,
+                                                         from_address,
+                                                         obfuscate_audio,
+                                                         chat::EncryptionMode::ECDH);
+            if (!started) {
+                const auto state = node_->voice_call_state();
+                if (state.status == "no-route") {
+                    throw RpcException(-32603, "no route to the requested voice call recipient");
+                }
+                throw RpcException(-32603, "unable to start voice call");
+            }
+            result = voice_call_info_to_json(node_->voice_call_state());
+        } else if (method == "acceptvoicecall") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            require_wallet_session();
+            auto wallet = load_session_wallet();
+            node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
+            if (!node_->accept_voice_call()) {
+                throw RpcException(-32603, "no incoming voice call is waiting to be accepted");
+            }
+            result = voice_call_info_to_json(node_->voice_call_state());
+        } else if (method == "declinevoicecall") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            require_wallet_session();
+            std::string note;
+            if (!params.empty()) {
+                if (params[0].is_string()) note = params[0].as_string();
+                else if (params[0].is_object() && params[0].find("note")) note = params[0].find("note")->as_string();
+            }
+            auto wallet = load_session_wallet();
+            node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
+            if (!node_->decline_voice_call(note)) {
+                throw RpcException(-32603, "no active voice call is available to decline");
+            }
+            result = voice_call_info_to_json(node_->voice_call_state());
+        } else if (method == "endvoicecall") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            require_wallet_session();
+            std::string note;
+            if (!params.empty()) {
+                if (params[0].is_string()) note = params[0].as_string();
+                else if (params[0].is_object() && params[0].find("note")) note = params[0].find("note")->as_string();
+            }
+            auto wallet = load_session_wallet();
+            node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
+            if (!node_->end_voice_call(note)) {
+                throw RpcException(-32603, "no active voice call is available to end");
+            }
+            result = voice_call_info_to_json(node_->voice_call_state());
+        } else if (method == "sendvoicecallaudio") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            require_wallet_session();
+            if (params.size() != 1 || !params[0].is_object()) {
+                throw RpcException(-32602, "sendvoicecallaudio expects [{audio_b64, sample_rate?, channels?, bits_per_sample?, obfuscated?}]");
+            }
+            const auto& object = params[0];
+            const auto* audio_b64 = object.find("audio_b64");
+            if (!audio_b64) throw RpcException(-32602, "audio_b64 is required");
+            auto wallet = load_session_wallet();
+            node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
+            const auto bytes = crypto::base64_decode(audio_b64->as_string());
+            const auto state = node_->voice_call_state();
+            const auto sample_rate = object.find("sample_rate")
+                ? static_cast<uint32_t>(object.find("sample_rate")->as_u64())
+                : state.sample_rate;
+            const auto channels = object.find("channels")
+                ? static_cast<uint16_t>(object.find("channels")->as_u64())
+                : state.channels;
+            const auto bits_per_sample = object.find("bits_per_sample")
+                ? static_cast<uint16_t>(object.find("bits_per_sample")->as_u64())
+                : state.bits_per_sample;
+            const bool obfuscated = object.find("obfuscated")
+                ? object.find("obfuscated")->as_bool()
+                : state.obfuscate_audio;
+            const auto peers = node_->send_voice_audio(bytes, sample_rate, channels, bits_per_sample, obfuscated);
+            JsonValue info = JsonValue::object();
+            info.set("peers", JsonValue::number(static_cast<uint64_t>(peers)));
+            info.set("bytes", JsonValue::number(static_cast<uint64_t>(bytes.size())));
+            info.set("call", voice_call_info_to_json(node_->voice_call_state()));
+            result = std::move(info);
+        } else if (method == "pullvoicecallaudio") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            size_t limit = 16;
+            if (!params.empty()) {
+                if (params[0].is_number()) {
+                    limit = static_cast<size_t>(params[0].as_u64());
+                } else if (params[0].is_object() && params[0].find("limit")) {
+                    limit = static_cast<size_t>(params[0].find("limit")->as_u64());
+                }
+            }
+            JsonValue rows = JsonValue::array({});
+            for (const auto& frame : node_->take_voice_audio_frames(limit)) {
+                rows.push_back(voice_audio_frame_to_json(frame));
+            }
+            result = std::move(rows);
+        } else if (method == "getchatprivatecontacts") {
+            const auto contacts = chatstate::load_private_contacts(private_contacts_path(chat_data_root()));
+            JsonValue rows = JsonValue::array({});
+            for (const auto& contact : contacts) {
+                rows.push_back(private_contact_to_json(contact));
+            }
+            result = std::move(rows);
+        } else if (method == "upsertchatprivatecontact") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "upsertchatprivatecontact expects [{address, pubkey_b64?, label?, peer?, notes?}]");
+            }
+            auto data_dir = chat_data_root();
+            auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+            auto candidate = private_contact_from_json(params[0]);
+            const auto now = static_cast<uint64_t>(std::time(nullptr));
+            auto it = std::find_if(contacts.begin(), contacts.end(), [&](const chatstate::PrivateContact& existing) {
+                return crypto::addresses_equal(existing.address, candidate.address);
+            });
+            if (it == contacts.end()) {
+                candidate.added_at = now;
+                contacts.push_back(candidate);
+            } else {
+                if (!candidate.label.empty()) it->label = candidate.label;
+                if (!candidate.pubkey_b64.empty()) it->pubkey_b64 = candidate.pubkey_b64;
+                if (!candidate.peer_label.empty()) it->peer_label = candidate.peer_label;
+                if (!candidate.notes.empty() || params[0].find("notes")) it->notes = candidate.notes;
+                if (it->added_at == 0) it->added_at = now;
+            }
+            chatstate::save_private_contacts(private_contacts_path(data_dir), contacts);
+            result = JsonValue(true);
+        } else if (method == "removechatprivatecontact") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "removechatprivatecontact expects [address]");
+            }
+            const auto address = normalize_directory_address(params[0].as_string());
+            auto data_dir = chat_data_root();
+            auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+            contacts.erase(std::remove_if(contacts.begin(), contacts.end(), [&](const chatstate::PrivateContact& existing) {
+                return crypto::addresses_equal(existing.address, address);
+            }), contacts.end());
+            chatstate::save_private_contacts(private_contacts_path(data_dir), contacts);
+            result = JsonValue(true);
+        } else if (method == "getchatproxyconfig") {
+            auto config = chatstate::load_proxy_config(proxy_config_path(chat_data_root()));
+            if (node_) {
+                if (auto live = node_->proxy_settings()) {
+                    config.enabled = true;
+                    config.host = live->host;
+                    config.port = live->port;
+                    config.remote_dns = live->remote_dns;
+                }
+            }
+            result = proxy_config_to_json(config);
+        } else if (method == "setchatproxyconfig") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "setchatproxyconfig expects [{enabled, host, port, remote_dns}]");
+            }
+            auto config = proxy_config_from_json(params[0]);
+            chatstate::save_proxy_config(proxy_config_path(chat_data_root()), config);
+            if (node_) {
+                if (config.enabled) {
+                    node_->set_socks5_proxy(config.host, config.port, config.remote_dns);
+                } else {
+                    node_->set_socks5_proxy("", 0, true);
+                }
+            }
+            result = proxy_config_to_json(config);
+        } else if (method == "getircconfig") {
+            result = irc_config_to_json(chatstate::load_irc_config(irc_config_path(chat_data_root())));
+        } else if (method == "setircconfig") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "setircconfig expects [{enabled, server, port, nick, username, realname, channel, use_tls}]");
+            }
+            auto config = irc_config_from_json(params[0]);
+            chatstate::save_irc_config(irc_config_path(chat_data_root()), config);
+            result = irc_config_to_json(config);
+        } else if (method == "getirclog") {
+            uint64_t limit = params.empty() ? 100 : params[0].as_u64();
+            JsonValue rows = JsonValue::array({});
+            for (const auto& entry : chatstate::load_irc_log(irc_log_path(chat_data_root()), static_cast<size_t>(limit))) {
+                rows.push_back(irc_log_to_json(entry));
+            }
+            result = std::move(rows);
+        } else if (method == "sendircmessage") {
+            chatstate::IrcConfig config = chatstate::load_irc_config(irc_config_path(chat_data_root()));
+            std::string message;
+            if (params.size() == 1 && params[0].is_string()) {
+                message = params[0].as_string();
+            } else if (params.size() == 1 && params[0].is_object()) {
+                const auto& object = params[0];
+                if (const auto* field = object.find("message")) message = field->as_string();
+                if (const auto* field = object.find("server")) config.server = field->as_string();
+                if (const auto* field = object.find("port")) config.port = static_cast<uint16_t>(field->as_u64());
+                if (const auto* field = object.find("nick")) config.nick = field->as_string();
+                if (const auto* field = object.find("username")) config.username = field->as_string();
+                if (const auto* field = object.find("realname")) config.realname = field->as_string();
+                if (const auto* field = object.find("channel")) config.channel = field->as_string();
+                if (const auto* field = object.find("use_tls")) config.use_tls = field->as_bool();
+            } else {
+                throw RpcException(-32602, "sendircmessage expects [message] or [{message, server?, port?, nick?, username?, realname?, channel?, use_tls?}]");
+            }
+            if (message.empty()) throw RpcException(-32602, "IRC message is required");
+            auto data_dir = chat_data_root();
+            auto send = send_irc_message(config, message);
+            const auto now = static_cast<uint64_t>(std::time(nullptr));
+            chatstate::append_irc_log(irc_log_path(data_dir), {now, "out", config.server, config.channel, config.nick, message, send.status});
+            for (const auto& line : send.lines) {
+                chatstate::append_irc_log(irc_log_path(data_dir), {now, "in", config.server, config.channel, config.nick, line, "server"});
+            }
+            JsonValue info = JsonValue::object();
+            info.set("status", JsonValue::string(send.status));
+            info.set("server", JsonValue::string(config.server));
+            info.set("channel", JsonValue::string(config.channel));
+            info.set("nick", JsonValue::string(config.nick));
+            JsonValue lines = JsonValue::array({});
+            for (const auto& line : send.lines) lines.push_back(JsonValue::string(line));
+            info.set("lines", std::move(lines));
+            result = std::move(info);
+        } else if (method == "getpublicaddressdirectory") {
+            uint64_t limit = params.empty() ? 5000 : params[0].as_u64();
+            std::optional<Wallet> wallet;
+            if (has_wallet_session()) {
+                wallet = load_session_wallet();
+            }
+            JsonValue rows = JsonValue::array({});
+            for (const auto& entry : scan_public_directory(chain_, node_, wallet ? &*wallet : nullptr, limit)) {
+                rows.push_back(public_directory_entry_to_json(entry));
+            }
+            result = std::move(rows);
         } else if (method == "getchatinbox") {
             if (!node_) throw RpcException(-32603, "chat node unavailable");
             auto query = chat_query_from_params(params);
@@ -1754,6 +2789,20 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 rows.push_back(chat_entry_to_json(entry));
             }
             result = std::move(rows);
+        } else if (method == "deletechatmessage") {
+            if (!node_) throw RpcException(-32603, "chat node unavailable");
+            if (params.size() != 1) {
+                throw RpcException(-32602, "deletechatmessage expects [messageid]");
+            }
+            const auto message_id = params[0].as_string();
+            if (message_id.empty()) {
+                throw RpcException(-32602, "messageid is required");
+            }
+            JsonValue info = JsonValue::object();
+            info.set("messageid", JsonValue::string(message_id));
+            info.set("deleted", JsonValue(node_->delete_chat_message(message_id)));
+            info.set("historyfile", JsonValue::string(node_->chat_history_path().string()));
+            result = std::move(info);
         } else if (method == "sendchatpublic" || method == "sendchatprivate") {
             if (!node_) throw RpcException(-32603, "chat node unavailable");
             require_wallet_session();
@@ -1761,25 +2810,34 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             auto request = parse_chat_send_request(params, private_chat);
             Wallet wallet = load_session_wallet();
             net::ChatPayload payload;
-            std::string plaintext;
+            auto content = build_chat_content_from_request(request);
 
             if (!private_chat) {
-                plaintext = request.message;
-                payload = chat::make_signed_public_chat(wallet, request.from_address, request.route, plaintext);
+                payload = chat::make_signed_public_chat(wallet, request.from_address, request.route, content);
             } else {
-                plaintext = request.message;
+                const auto mode = request.encryption_mode.value_or(
+                    request.recipient_rsa_pubkey_pem.empty() ? chat::EncryptionMode::ECDH
+                                                             : chat::EncryptionMode::RSA);
                 payload = chat::make_encrypted_private_chat(wallet,
                                                             request.from_address,
                                                             request.recipient_address,
-                                                            crypto::base64_decode(request.recipient_pubkey_b64),
-                                                            plaintext);
+                                                            request.recipient_pubkey_b64.empty()
+                                                                ? std::vector<uint8_t>{}
+                                                                : crypto::base64_decode(request.recipient_pubkey_b64),
+                                                            content,
+                                                            request.kdf.value_or(chat::KeyDerivation::Argon2id),
+                                                            mode,
+                                                            request.recipient_rsa_pubkey_pem);
             }
 
             net::Message msg;
             msg.type = net::MessageType::CHAT;
             msg.payload = payload.serialize();
-            auto history = build_outbound_chat_history(payload, plaintext, request.peer_label.value_or("network"));
+            auto history = build_outbound_chat_history(payload, content, request.peer_label.value_or("network"));
             node_->remember_chat_message(history.message_id);
+            if (!content.attachment_bytes.empty()) {
+                history.attachment_path = chat::persist_attachment(content, chat_data_root(), history.message_id).string();
+            }
 
             size_t peers = 0;
             if (request.peer_label) {
@@ -1795,6 +2853,31 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 history.status = peers > 0 ? "broadcast" : "no-peer";
             }
             node_->record_chat_history(history);
+            if (private_chat) {
+                auto data_dir = chat_data_root();
+                auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+                const auto canonical_recipient = normalize_directory_address(request.recipient_address);
+                const auto now = static_cast<uint64_t>(std::time(nullptr));
+                auto it = std::find_if(contacts.begin(), contacts.end(), [&](const chatstate::PrivateContact& existing) {
+                    return crypto::addresses_equal(existing.address, canonical_recipient);
+                });
+                if (it == contacts.end()) {
+                    chatstate::PrivateContact contact;
+                    contact.address = canonical_recipient;
+                    contact.pubkey_b64 = request.recipient_pubkey_b64;
+                    contact.rsa_pubkey_pem = request.recipient_rsa_pubkey_pem;
+                    contact.peer_label = request.peer_label.value_or("network");
+                    contact.added_at = now;
+                    contact.last_used_at = now;
+                    contacts.push_back(std::move(contact));
+                } else {
+                    if (!request.recipient_pubkey_b64.empty()) it->pubkey_b64 = request.recipient_pubkey_b64;
+                    if (!request.recipient_rsa_pubkey_pem.empty()) it->rsa_pubkey_pem = request.recipient_rsa_pubkey_pem;
+                    if (request.peer_label) it->peer_label = *request.peer_label;
+                    it->last_used_at = now;
+                }
+                chatstate::save_private_contacts(private_contacts_path(data_dir), contacts);
+            }
 
             JsonValue info = JsonValue::object();
             info.set("messageid", JsonValue::string(history.message_id));
@@ -1802,6 +2885,22 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             info.set("peers", JsonValue::number(static_cast<uint64_t>(peers)));
             info.set("peer", JsonValue::string(request.peer_label.value_or("network")));
             info.set("historyfile", JsonValue::string(node_->chat_history_path().string()));
+            info.set("content_type", JsonValue::string(chat::content_type_name(content.type)));
+            info.set("encryption", JsonValue::string(chat::encryption_mode_name(
+                private_chat
+                    ? (payload.version >= 4 ? static_cast<chat::EncryptionMode>(payload.cipher_profile)
+                                            : chat::EncryptionMode::ECDH)
+                    : chat::EncryptionMode::ECDH)));
+            if (!history.attachment_path.empty()) {
+                info.set("attachment_path", JsonValue::string(history.attachment_path));
+                info.set("attachment_size", JsonValue::number(history.attachment_size));
+            }
+            if (!history.transcript.empty()) {
+                info.set("transcript", JsonValue::string(history.transcript));
+            }
+            if (private_chat) {
+                info.set("kdf", JsonValue::string(chat::kdf_name(request.kdf.value_or(chat::KeyDerivation::Argon2id))));
+            }
             result = std::move(info);
         } else if (method == "getcheckpointinfo") {
             auto checkpoint = chain_.checkpoint_info();
@@ -1854,6 +2953,7 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             auto advertised = node_ ? node_->advertised_endpoint() : std::optional<std::string>{};
             auto mapping = node_ ? node_->port_mapping_status() : net::NetworkNode::PortMappingStatus{};
             auto sync = node_ ? node_->sync_status() : net::NetworkNode::SyncStatus{};
+            auto proxy = node_ ? node_->proxy_settings() : std::optional<net::NetworkNode::ProxySettings>{};
             uint64_t banned = 0;
             for (const auto& peer : peers) {
                 if (peer.banned) ++banned;
@@ -1882,6 +2982,10 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             info.set("portmapping_protocol", JsonValue::string(mapping.protocol));
             info.set("portmapping_external", JsonValue::string(mapping.external_endpoint));
             info.set("portmapping_message", JsonValue::string(mapping.message));
+            info.set("proxy_enabled", JsonValue(proxy.has_value()));
+            info.set("proxy_host", JsonValue::string(proxy ? proxy->host : std::string()));
+            info.set("proxy_port", JsonValue::number(static_cast<uint64_t>(proxy ? proxy->port : 0)));
+            info.set("proxy_remote_dns", JsonValue(proxy ? proxy->remote_dns : true));
             result = std::move(info);
         } else if (method == "getportmappinginfo") {
             JsonValue info = JsonValue::object();
@@ -1926,6 +3030,7 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 Wallet wallet = load_session_wallet();
                 info.set("walletfile", JsonValue::string(*wallet_path_));
                 info.set("address_format", JsonValue::string(wallet.address_format_name()));
+                info.set("kdf", JsonValue::string(wallet.kdf_name()));
                 info.set("mode", JsonValue::string(wallet.hd_mode()));
                 info.set("addresscount", JsonValue::number(static_cast<uint64_t>(wallet.all_addresses().size())));
                 info.set("mnemonic_backed", JsonValue(wallet.has_mnemonic()));
@@ -1945,8 +3050,8 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             }
             result = JsonValue::array(std::move(rows));
         } else if (method == "createwallet") {
-            if (params.size() < 2 || params.size() > 6) {
-                throw RpcException(-32602, "createwallet expects [path, password, format?, words?, mnemonic_passphrase?, mnemonic?]");
+            if (params.size() < 2 || params.size() > 7) {
+                throw RpcException(-32602, "createwallet expects [path, password, format?, words?, mnemonic_passphrase?, mnemonic?, kdf?]");
             }
             std::filesystem::path wallet_file(params[0].as_string());
             if (wallet_file.empty()) {
@@ -1971,6 +3076,14 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 (params.size() >= 5 && !params[4].is_null()) ? params[4].as_string() : std::string();
             const std::string mnemonic =
                 (params.size() >= 6 && !params[5].is_null()) ? params[5].as_string() : std::string();
+            auto kdf = Wallet::KeyDerivation::Argon2id;
+            if (params.size() >= 7 && !params[6].is_null()) {
+                auto parsed = Wallet::parse_key_derivation(params[6].as_string());
+                if (!parsed) {
+                    throw RpcException(-32602, "unknown wallet kdf");
+                }
+                kdf = *parsed;
+            }
 
             std::error_code ec;
             if (std::filesystem::exists(wallet_file, ec)) {
@@ -1984,18 +3097,21 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             }
 
             Wallet wallet = mnemonic.empty()
-                ? Wallet::create_new(wallet_password, wallet_file.string(), format, mnemonic_words, mnemonic_passphrase)
-                : Wallet::create_from_mnemonic(wallet_password, wallet_file.string(), mnemonic, format, mnemonic_passphrase);
-            write_wallet_metadata(wallet_file, wallet_file.stem().string(), wallet.address_format_name());
+                ? Wallet::create_new(wallet_password, wallet_file.string(), format, mnemonic_words, mnemonic_passphrase, kdf)
+                : Wallet::create_from_mnemonic(wallet_password, wallet_file.string(), mnemonic, format, mnemonic_passphrase, kdf);
+            write_wallet_metadata(wallet_file, wallet_file.stem().string(), wallet.address_format_name(), wallet.kdf_name());
             set_wallet_session(wallet_file.string(), wallet_password);
 
             JsonValue info = JsonValue::object();
             info.set("wallet_loaded", JsonValue(true));
             info.set("walletfile", JsonValue::string(wallet_file.string()));
             info.set("address_format", JsonValue::string(wallet.address_format_name()));
+            info.set("kdf", JsonValue::string(wallet.kdf_name()));
             info.set("mode", JsonValue::string(wallet.hd_mode()));
             info.set("addresscount", JsonValue::number(static_cast<uint64_t>(wallet.all_addresses().size())));
             info.set("mnemonic_backed", JsonValue(wallet.has_mnemonic()));
+            info.set("chat_rsa_public_key_pem", JsonValue::string(wallet.chat_rsa_public_key_pem));
+            info.set("chat_rsa_public_key_b64", JsonValue::string(wallet.chat_rsa_public_key_b64()));
             add_address_formats(info, "primaryaddress", wallet.address);
             info.set("primaryaddress", JsonValue::string(wallet.display_address(wallet.address)));
             if (wallet.has_mnemonic()) {
@@ -2011,15 +3127,19 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             Wallet wallet = Wallet::load(wallet_password, wallet_path);
             write_wallet_metadata(std::filesystem::path(wallet_path),
                                   std::filesystem::path(wallet_path).stem().string(),
-                                  wallet.address_format_name());
+                                  wallet.address_format_name(),
+                                  wallet.kdf_name());
             set_wallet_session(wallet_path, wallet_password);
             JsonValue info = JsonValue::object();
             info.set("wallet_loaded", JsonValue(true));
             info.set("walletfile", JsonValue::string(wallet_path));
             info.set("address_format", JsonValue::string(wallet.address_format_name()));
+            info.set("kdf", JsonValue::string(wallet.kdf_name()));
             info.set("mode", JsonValue::string(wallet.hd_mode()));
             info.set("addresscount", JsonValue::number(static_cast<uint64_t>(wallet.all_addresses().size())));
             info.set("mnemonic_backed", JsonValue(wallet.has_mnemonic()));
+            info.set("chat_rsa_public_key_pem", JsonValue::string(wallet.chat_rsa_public_key_pem));
+            info.set("chat_rsa_public_key_b64", JsonValue::string(wallet.chat_rsa_public_key_b64()));
             add_address_formats(info, "primaryaddress", wallet.address);
             info.set("primaryaddress", JsonValue::string(wallet.display_address(wallet.address)));
             result = std::move(info);
@@ -2044,6 +3164,9 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             if (!std::filesystem::remove(wallet_file, ec) || ec) {
                 throw RpcException(-32603, "failed to delete wallet file: " + ec.message());
             }
+            std::filesystem::remove(std::filesystem::path(wallet_file.string() + ".chat_rsa_pub.pem"), ec);
+            ec.clear();
+            std::filesystem::remove(std::filesystem::path(wallet_file.string() + ".chat_rsa_priv.pem"), ec);
             remove_wallet_metadata(wallet_file);
             result = JsonValue(true);
         } else if (method == "getwalletinfo" || method == "getbalance" || method == "listunspent" ||
@@ -2051,7 +3174,7 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                    method == "getwallethistory" || method == "getwallettransactions" ||
                    method == "getwallettransaction" || method == "setaddresslabel" ||
                    method == "getnewaddress" || method == "getunusedaddress" ||
-                   method == "setwalletformat" ||
+                   method == "setwalletformat" || method == "setprimaryaddress" ||
                    method == "dumpprivkey" || method == "importprivkey" ||
                    method == "importmnemonic" || method == "backupwallet" || method == "recoverwallet" ||
                    method == "walletpassphrasechange" || method == "sendtoaddress" ||
@@ -2099,10 +3222,12 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 if (wallet_path_) {
                     write_wallet_metadata(std::filesystem::path(*wallet_path_),
                                           std::filesystem::path(*wallet_path_).stem().string(),
-                                          wallet.address_format_name());
+                                          wallet.address_format_name(),
+                                          wallet.kdf_name());
                 }
                 JsonValue info = JsonValue::object();
                 info.set("address_format", JsonValue::string(wallet.address_format_name()));
+                info.set("kdf", JsonValue::string(wallet.kdf_name()));
                 add_address_formats(info, "primaryaddress", wallet.address);
                 info.set("primaryaddress", JsonValue::string(wallet.display_address(wallet.address)));
                 info.set("addresscount", JsonValue::number(static_cast<uint64_t>(wallet.all_addresses().size())));
@@ -2160,12 +3285,18 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                                                                *wallet_path_,
                                                                params[0].as_string(),
                                                                current_wallet.address_format(),
-                                                               mnemonic_passphrase);
+                                                               mnemonic_passphrase,
+                                                               current_wallet.key_derivation());
+                write_wallet_metadata(std::filesystem::path(*wallet_path_),
+                                      std::filesystem::path(*wallet_path_).stem().string(),
+                                      restored.address_format_name(),
+                                      restored.kdf_name());
                 JsonValue info = JsonValue::object();
                 info.set("walletfile", JsonValue::string(*wallet_path_));
                 info.set("backupfile", JsonValue::string(backup_file.string()));
                 info.set("addresscount", JsonValue::number(static_cast<uint64_t>(restored.all_addresses().size())));
                 info.set("address_format", JsonValue::string(restored.address_format_name()));
+                info.set("kdf", JsonValue::string(restored.kdf_name()));
                 add_address_formats(info, "primaryaddress", restored.address);
                 info.set("primaryaddress", JsonValue::string(restored.display_address(restored.address)));
                 result = std::move(info);
@@ -2202,20 +3333,37 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                     throw RpcException(-32602, "recoverwallet expects []");
                 }
                 Wallet recovered = Wallet::recover(*wallet_password_, *wallet_path_);
+                write_wallet_metadata(std::filesystem::path(*wallet_path_),
+                                      std::filesystem::path(*wallet_path_).stem().string(),
+                                      recovered.address_format_name(),
+                                      recovered.kdf_name());
                 JsonValue info = JsonValue::object();
                 info.set("walletfile", JsonValue::string(*wallet_path_));
                 info.set("backupfile", JsonValue::string((std::filesystem::path(*wallet_path_).string() + ".bak")));
                 info.set("addresscount", JsonValue::number(static_cast<uint64_t>(recovered.all_addresses().size())));
                 info.set("address_format", JsonValue::string(recovered.address_format_name()));
+                info.set("kdf", JsonValue::string(recovered.kdf_name()));
                 add_address_formats(info, "primaryaddress", recovered.address);
                 info.set("primaryaddress", JsonValue::string(recovered.display_address(recovered.address)));
                 result = std::move(info);
             } else if (method == "walletpassphrasechange") {
-                if (params.size() != 2) {
-                    throw RpcException(-32602, "walletpassphrasechange expects [old_password, new_password]");
+                if (params.size() < 2 || params.size() > 3) {
+                    throw RpcException(-32602, "walletpassphrasechange expects [old_password, new_password, kdf?]");
                 }
                 Wallet wallet = Wallet::load(params[0].as_string(), *wallet_path_);
-                wallet.change_password(params[0].as_string(), params[1].as_string(), *wallet_path_);
+                auto next_kdf = wallet.key_derivation();
+                if (params.size() == 3 && !params[2].is_null()) {
+                    auto parsed = Wallet::parse_key_derivation(params[2].as_string());
+                    if (!parsed) {
+                        throw RpcException(-32602, "unknown wallet kdf");
+                    }
+                    next_kdf = *parsed;
+                }
+                wallet.change_password(params[0].as_string(), params[1].as_string(), *wallet_path_, next_kdf);
+                write_wallet_metadata(std::filesystem::path(*wallet_path_),
+                                      std::filesystem::path(*wallet_path_).stem().string(),
+                                      wallet.address_format_name(),
+                                      wallet.kdf_name());
                 set_wallet_session(*wallet_path_, params[1].as_string());
                 result = JsonValue(true);
             } else if (method == "rescanwallet") {
@@ -2275,6 +3423,9 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                     info.set("wallet_loaded", JsonValue(true));
                     info.set("mode", JsonValue::string(wallet.hd_mode()));
                     info.set("address_format", JsonValue::string(wallet.address_format_name()));
+                    info.set("kdf", JsonValue::string(wallet.kdf_name()));
+                    info.set("chat_rsa_public_key_pem", JsonValue::string(wallet.chat_rsa_public_key_pem));
+                    info.set("chat_rsa_public_key_b64", JsonValue::string(wallet.chat_rsa_public_key_b64()));
                     info.set("addresscount", JsonValue::number(static_cast<uint64_t>(wallet.all_addresses().size())));
                     add_address_formats(info, "primaryaddress", wallet.address);
                     info.set("primaryaddress", JsonValue::string(wallet.display_address(wallet.address)));
@@ -2299,6 +3450,16 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                         addresses.push_back(wallet_address_to_json(entry));
                     }
                     result = std::move(addresses);
+                } else if (method == "setprimaryaddress") {
+                    if (params.size() != 1) {
+                        throw RpcException(-32602, "setprimaryaddress expects [address]");
+                    }
+                    wallet.set_primary_address(*wallet_password_, *wallet_path_, params[0].as_string());
+                    wallet = Wallet::load(*wallet_password_, *wallet_path_);
+                    JsonValue info = JsonValue::object();
+                    add_address_formats(info, "primaryaddress", wallet.address);
+                    info.set("primaryaddress", JsonValue::string(wallet.display_address(wallet.address)));
+                    result = std::move(info);
                 } else if (method == "getwallethistory") {
                     if (params.size() > 1) {
                         throw RpcException(-32602, "getwallethistory expects [include_mempool?]");
@@ -2431,6 +3592,7 @@ public:
           acceptor_(ctx) {}
 
     void start() {
+        configure_tls();
         tcp::endpoint endpoint(boost::asio::ip::make_address(config_.bind), config_.port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(boost::asio::socket_base::reuse_address(true));
@@ -2454,103 +3616,149 @@ private:
         std::deque<std::chrono::steady_clock::time_point> requests;
     };
 
-    class Session : public std::enable_shared_from_this<Session> {
-    public:
-        Session(tcp::socket socket, std::shared_ptr<Impl> owner)
-            : socket_(std::move(socket)), owner_(std::move(owner)) {}
+    void configure_tls() {
+        if (!config_.tls_enabled) {
+            return;
+        }
+        if (!config_.tls_cert_path || !config_.tls_key_path) {
+            throw std::runtime_error("rpc tls requires both certificate and key paths");
+        }
+        ensure_rpc_tls_material(*config_.tls_cert_path, *config_.tls_key_path);
+        ssl_ctx_ = std::make_unique<ssl::context>(ssl::context::tls_server);
+        ssl_ctx_->set_options(ssl::context::default_workarounds |
+                              ssl::context::no_sslv2 |
+                              ssl::context::no_sslv3 |
+                              ssl::context::single_dh_use);
+        ssl_ctx_->use_certificate_chain_file(*config_.tls_cert_path);
+        ssl_ctx_->use_private_key_file(*config_.tls_key_path, ssl::context::pem);
+    }
 
-        void start() { do_read(); }
+    http::response<http::string_body> make_response(const tcp::endpoint& remote,
+                                                    const http::request<http::string_body>& request,
+                                                    bool& stop_requested) {
+        http::response<http::string_body> response;
+        response.version(request.version());
+        response.set(http::field::server, "CryptEX-RPC");
+        response.keep_alive(false);
+        response.set(http::field::content_type, "application/json");
 
-    private:
-        void do_read() {
-            auto self = shared_from_this();
-            parser_.body_limit(owner_->config_.max_body_bytes);
-            http::async_read(socket_, buffer_, parser_,
-                [self](beast::error_code ec, std::size_t) {
-                    if (ec == http::error::body_limit) {
-                        self->response_.version(11);
-                        self->response_.set(http::field::server, "CryptEX-RPC");
-                        self->response_.keep_alive(false);
-                        self->response_.result(http::status::payload_too_large);
-                        self->response_.set(http::field::content_type, "application/json");
-                        self->response_.body() = "{\"error\":\"request too large\"}";
-                        self->response_.prepare_payload();
-                        return self->do_write(false);
-                    }
-                    if (ec) return;
-                    self->request_ = self->parser_.release();
-                    self->process();
-                });
+        if (!allowed(remote)) {
+            response.result(http::status::forbidden);
+            response.body() = "{\"error\":\"forbidden\"}";
+            response.prepare_payload();
+            return response;
         }
 
-        void process() {
-            response_.version(request_.version());
-            response_.set(http::field::server, "CryptEX-RPC");
-            response_.keep_alive(false);
+        if (!allow_rate(remote)) {
+            response.result(static_cast<http::status>(429));
+            response.set(http::field::retry_after,
+                         std::to_string(config_.rate_limit_window_seconds));
+            response.body() = "{\"error\":\"rate limit exceeded\"}";
+            response.prepare_payload();
+            return response;
+        }
 
-            if (!owner_->allowed(socket_.remote_endpoint())) {
-                response_.result(http::status::forbidden);
-                response_.body() = "{\"error\":\"forbidden\"}";
-                response_.set(http::field::content_type, "application/json");
-                response_.prepare_payload();
-                return do_write(false);
-            }
+        if (!authorized(request)) {
+            response.result(http::status::unauthorized);
+            response.set(http::field::www_authenticate, "Basic realm=\"CryptEX RPC\"");
+            response.body() = "{\"error\":\"unauthorized\"}";
+            response.prepare_payload();
+            return response;
+        }
 
-            if (!owner_->allow_rate(socket_.remote_endpoint())) {
-                response_.result(static_cast<http::status>(429));
-                response_.set(http::field::retry_after,
-                              std::to_string(owner_->config_.rate_limit_window_seconds));
-                response_.body() = "{\"error\":\"rate limit exceeded\"}";
-                response_.set(http::field::content_type, "application/json");
-                response_.prepare_payload();
-                return do_write(false);
-            }
+        if (request.method() != http::verb::post) {
+            response.result(http::status::method_not_allowed);
+            response.body() = "{\"error\":\"POST required\"}";
+            response.prepare_payload();
+            return response;
+        }
 
-            if (!owner_->authorized(request_)) {
-                response_.result(http::status::unauthorized);
-                response_.set(http::field::www_authenticate, "Basic realm=\"CryptEX RPC\"");
-                response_.body() = "{\"error\":\"unauthorized\"}";
-                response_.set(http::field::content_type, "application/json");
-                response_.prepare_payload();
-                return do_write(false);
-            }
+        response.result(http::status::ok);
+        response.set(http::field::cache_control, "no-store");
+        response.body() = service_.handle_jsonrpc(request.body(), stop_requested);
+        response.prepare_payload();
+        return response;
+    }
 
-            if (request_.method() != http::verb::post) {
-                response_.result(http::status::method_not_allowed);
-                response_.body() = "{\"error\":\"POST required\"}";
-                response_.set(http::field::content_type, "application/json");
-                response_.prepare_payload();
-                return do_write(false);
-            }
+    void maybe_post_stop(bool stop_requested) {
+        if (stop_requested && stop_callback_) {
+            boost::asio::post(ctx_, stop_callback_);
+        }
+    }
 
+    void serve_plain(tcp::socket socket, tcp::endpoint remote) {
+        try {
+            beast::flat_buffer buffer;
+            http::request_parser<http::string_body> parser;
+            parser.body_limit(config_.max_body_bytes);
+            beast::error_code ec;
+            http::read(socket, buffer, parser, ec);
             bool stop_requested = false;
-            response_.result(http::status::ok);
-            response_.set(http::field::content_type, "application/json");
-            response_.set(http::field::cache_control, "no-store");
-            response_.body() = owner_->service_.handle_jsonrpc(request_.body(), stop_requested);
-            response_.prepare_payload();
-            do_write(stop_requested);
+            if (ec == http::error::body_limit) {
+                http::response<http::string_body> response;
+                response.version(11);
+                response.set(http::field::server, "CryptEX-RPC");
+                response.keep_alive(false);
+                response.result(http::status::payload_too_large);
+                response.set(http::field::content_type, "application/json");
+                response.body() = "{\"error\":\"request too large\"}";
+                response.prepare_payload();
+                http::write(socket, response, ec);
+            } else if (!ec) {
+                auto request = parser.release();
+                auto response = make_response(remote, request, stop_requested);
+                http::write(socket, response, ec);
+            }
+            beast::error_code ignored;
+            socket.shutdown(tcp::socket::shutdown_send, ignored);
+            if (!ec) {
+                maybe_post_stop(stop_requested);
+            }
+        } catch (...) {
         }
+    }
 
-        void do_write(bool stop_requested) {
-            auto self = shared_from_this();
-            http::async_write(socket_, response_,
-                [self, stop_requested](beast::error_code ec, std::size_t) {
-                    beast::error_code ignored;
-                    self->socket_.shutdown(tcp::socket::shutdown_send, ignored);
-                    if (!ec && stop_requested && self->owner_->stop_callback_) {
-                        boost::asio::post(self->owner_->ctx_, self->owner_->stop_callback_);
-                    }
-                });
+    void serve_tls(tcp::socket socket, tcp::endpoint remote) {
+        try {
+            beast::ssl_stream<beast::tcp_stream> stream(std::move(socket), *ssl_ctx_);
+            beast::error_code ec;
+            stream.handshake(ssl::stream_base::server, ec);
+            if (ec) {
+                return;
+            }
+
+            beast::flat_buffer buffer;
+            http::request_parser<http::string_body> parser;
+            parser.body_limit(config_.max_body_bytes);
+            http::read(stream, buffer, parser, ec);
+            bool stop_requested = false;
+            if (ec == http::error::body_limit) {
+                http::response<http::string_body> response;
+                response.version(11);
+                response.set(http::field::server, "CryptEX-RPC");
+                response.keep_alive(false);
+                response.result(http::status::payload_too_large);
+                response.set(http::field::content_type, "application/json");
+                response.body() = "{\"error\":\"request too large\"}";
+                response.prepare_payload();
+                http::write(stream, response, ec);
+            } else if (!ec) {
+                auto request = parser.release();
+                auto response = make_response(remote, request, stop_requested);
+                http::write(stream, response, ec);
+            }
+
+            beast::error_code shutdown_ec;
+            stream.shutdown(shutdown_ec);
+            if (shutdown_ec == boost::asio::error::eof) {
+                shutdown_ec = {};
+            }
+            if (!ec) {
+                maybe_post_stop(stop_requested);
+            }
+        } catch (...) {
         }
-
-        tcp::socket socket_;
-        beast::flat_buffer buffer_;
-        http::request_parser<http::string_body> parser_;
-        http::request<http::string_body> request_;
-        http::response<http::string_body> response_;
-        std::shared_ptr<Impl> owner_;
-    };
+    }
 
     bool authorized(const http::request<http::string_body>& request) const {
         std::optional<std::pair<std::string, std::string>> credentials;
@@ -2605,7 +3813,22 @@ private:
         auto self = shared_from_this();
         acceptor_.async_accept([self](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
-                std::make_shared<Session>(std::move(socket), self)->start();
+                tcp::endpoint remote;
+                try {
+                    remote = socket.remote_endpoint();
+                } catch (...) {
+                    boost::system::error_code close_ec;
+                    socket.close(close_ec);
+                    if (self->acceptor_.is_open()) self->do_accept();
+                    return;
+                }
+                std::thread([self, remote, socket = std::move(socket)]() mutable {
+                    if (self->config_.tls_enabled) {
+                        self->serve_tls(std::move(socket), remote);
+                    } else {
+                        self->serve_plain(std::move(socket), remote);
+                    }
+                }).detach();
             }
             if (self->acceptor_.is_open()) self->do_accept();
         });
@@ -2615,6 +3838,7 @@ private:
     RpcConfig config_;
     RpcService service_;
     tcp::acceptor acceptor_;
+    std::unique_ptr<ssl::context> ssl_ctx_;
     std::function<void()> stop_callback_;
     std::mutex rate_limit_mutex_;
     std::unordered_map<std::string, RateWindow> rate_windows_;

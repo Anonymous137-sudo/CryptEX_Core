@@ -27,6 +27,9 @@ struct RpcConfig {
     size_t max_body_bytes{1'048'576};
     size_t max_requests_per_window{120};
     uint32_t rate_limit_window_seconds{60};
+    bool tls_enabled{false};
+    std::optional<std::string> tls_cert_path;
+    std::optional<std::string> tls_key_path;
     std::optional<std::string> wallet_path;
     std::optional<std::string> wallet_password;
     std::optional<std::string> wallet_directory;

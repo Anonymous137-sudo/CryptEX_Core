@@ -12,7 +12,12 @@
 #include "blockchain.hpp"
 #include "rpc.hpp"
 #include "serialization.hpp"
+#include "voice_call.hpp"
 #include "wallet.hpp"
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
 #include <filesystem>
 #ifdef NDEBUG
 #undef NDEBUG
@@ -34,6 +39,11 @@
 using namespace cryptex;
 
 namespace {
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace ssl = boost::asio::ssl;
+using tcp = boost::asio::ip::tcp;
 
 struct NetworkScope {
     NetworkKind previous;
@@ -628,6 +638,37 @@ static void test_wallet_mnemonic_import_roundtrip() {
     std::filesystem::remove(wallet_b);
 }
 
+static void test_wallet_kdf_roundtrip_and_rotation() {
+    std::filesystem::path wallet_path = unique_temp_path("cryptex_wallet_kdf", ".dat");
+    std::filesystem::remove(wallet_path);
+
+    auto wallet = Wallet::create_new("argon-pass",
+                                     wallet_path.string(),
+                                     Wallet::AddressFormat::Base64,
+                                     12,
+                                     "",
+                                     Wallet::KeyDerivation::Argon2id);
+    assert(Wallet::inspect_key_derivation(wallet_path.string()) == Wallet::KeyDerivation::Argon2id);
+
+    auto loaded = Wallet::load("argon-pass", wallet_path.string());
+    assert(loaded.address == wallet.address);
+    assert(loaded.key_derivation() == Wallet::KeyDerivation::Argon2id);
+
+    loaded.change_password("argon-pass",
+                           "scrypt-pass",
+                           wallet_path.string(),
+                           Wallet::KeyDerivation::Scrypt);
+    assert(Wallet::inspect_key_derivation(wallet_path.string()) == Wallet::KeyDerivation::Scrypt);
+
+    auto rotated = Wallet::load("scrypt-pass", wallet_path.string());
+    assert(rotated.address == wallet.address);
+    assert(rotated.key_derivation() == Wallet::KeyDerivation::Scrypt);
+    assert(rotated.mnemonic_phrase() == wallet.mnemonic_phrase());
+
+    std::filesystem::remove(wallet_path);
+    std::filesystem::remove(wallet_path.string() + ".bak");
+}
+
 static void test_config_parse() {
     auto cfg = ConfigFile::parse(
         "# comment\n"
@@ -742,6 +783,44 @@ static void test_secure_chat_roundtrip() {
     assert(decrypted.decrypted);
     assert(decrypted.message == "secret hello");
     assert(decrypted.recipient_address == recipient.address);
+}
+
+static void test_secure_chat_kdf_profiles() {
+    auto sender_key = make_test_key();
+    Wallet sender;
+    sender.privkey = sender_key.priv;
+    sender.pubkey = sender_key.pub;
+    sender.address = sender_key.address;
+    sender.privkeys.push_back(sender.privkey);
+    sender.pubkeys.push_back(sender.pubkey);
+    sender.addresses.push_back(sender.address);
+
+    auto recipient_key = make_test_key();
+    Wallet recipient;
+    recipient.privkey = recipient_key.priv;
+    recipient.pubkey = recipient_key.pub;
+    recipient.address = recipient_key.address;
+    recipient.privkeys.push_back(recipient.privkey);
+    recipient.pubkeys.push_back(recipient.pubkey);
+    recipient.addresses.push_back(recipient.address);
+
+    for (auto kdf : {chat::KeyDerivation::PBKDF2,
+                     chat::KeyDerivation::Scrypt,
+                     chat::KeyDerivation::Argon2id}) {
+        auto payload = chat::make_encrypted_private_chat(sender,
+                                                         sender.address,
+                                                         recipient.address,
+                                                         recipient.pubkey,
+                                                         "profile test",
+                                                         kdf);
+        assert(payload.version >= 3);
+        assert(payload.kdf_profile == static_cast<uint8_t>(kdf));
+        auto decrypted = chat::parse_chat_payload(payload, &recipient);
+        assert(decrypted.authenticated);
+        assert(decrypted.encrypted);
+        assert(decrypted.decrypted);
+        assert(decrypted.message == "profile test");
+    }
 }
 
 static void test_structured_logging_to_file() {
@@ -1214,6 +1293,7 @@ static void test_rpc_service() {
     Blockchain chain(tmp);
     boost::asio::io_context rpc_ctx;
     net::NetworkNode rpc_node(rpc_ctx, 0, tmp);
+    rpc_node.set_external_address("127.0.0.1:9333");
     auto external_key = make_test_key();
 
     chat::HistoryEntry seeded_chat;
@@ -1300,6 +1380,16 @@ static void test_rpc_service() {
     assert(chatinfo_resp.find("\"messages\":1") != std::string::npos);
     assert(chatinfo_resp.find("chat_history.dat") != std::string::npos);
     assert(chatinfo_resp.find("\"routing_mode\":\"awaiting-peers\"") != std::string::npos);
+
+    auto voice_state_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":141,"method":"getvoicecallstate","params":[]})",
+        stop_requested);
+    assert(voice_state_resp.find("\"active\":false") != std::string::npos);
+
+    auto voice_pull_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":142,"method":"pullvoicecallaudio","params":[]})",
+        stop_requested);
+    assert(voice_pull_resp.find("\"result\":[]") != std::string::npos);
 
     auto chatinbox_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":15,"method":"getchatinbox","params":[{"channel":"dev"}]})",
@@ -1552,13 +1642,81 @@ static void test_rpc_service() {
     assert(chatinbox_after_send.find("hello network rpc") != std::string::npos);
     assert(chatinbox_after_send.find("\"status\":\"no-peer\"") != std::string::npos);
 
+    auto add_private_contact_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":44,"method":"upsertchatprivatecontact","params":[{"label":"Ops Relay","address":")") +
+        external_key.address +
+        R"(","pubkey_b64":")" +
+        crypto::base64_encode(external_key.pub) +
+        R"(","peer":"127.0.0.1:9333","notes":"seed private relay"}]})",
+        stop_requested);
+    assert(add_private_contact_resp.find("\"result\":true") != std::string::npos);
+
+    auto private_contacts_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":45,"method":"getchatprivatecontacts","params":[]})",
+        stop_requested);
+    assert(private_contacts_resp.find("Ops Relay") != std::string::npos);
+    assert(private_contacts_resp.find(external_key.address) != std::string::npos);
+
+    auto set_proxy_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":46,"method":"setchatproxyconfig","params":[{"enabled":true,"host":"127.0.0.1","port":9050,"remote_dns":true}]})",
+        stop_requested);
+    assert(set_proxy_resp.find("\"enabled\":true") != std::string::npos);
+    assert(set_proxy_resp.find("\"port\":9050") != std::string::npos);
+
+    auto get_proxy_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":47,"method":"getchatproxyconfig","params":[]})",
+        stop_requested);
+    assert(get_proxy_resp.find("\"host\":\"127.0.0.1\"") != std::string::npos);
+
+    auto send_private_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":52,"method":"sendchatprivate","params":[{"recipient_address":")") +
+        external_key.address +
+        R"(","recipient_pubkey_b64":")" +
+        crypto::base64_encode(external_key.pub) +
+        R"(","message":"quiet hello","kdf":"scrypt"}]})",
+        stop_requested);
+    assert(send_private_resp.find("\"status\":\"no-peer\"") != std::string::npos);
+    assert(send_private_resp.find("\"messageid\":\"") != std::string::npos);
+    assert(send_private_resp.find("\"kdf\":\"scrypt\"") != std::string::npos);
+
+    auto set_irc_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":48,"method":"setircconfig","params":[{"enabled":true,"server":"irc.example.net","port":6667,"nick":"cryptex-dev","username":"cryptex","realname":"CryptEX","channel":"#cryptex"}]})",
+        stop_requested);
+    assert(set_irc_resp.find("irc.example.net") != std::string::npos);
+
+    auto get_irc_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":49,"method":"getircconfig","params":[]})",
+        stop_requested);
+    assert(get_irc_resp.find("\"channel\":\"#cryptex\"") != std::string::npos);
+
+    auto directory_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":50,"method":"getpublicaddressdirectory","params":[50]})",
+        stop_requested);
+    assert(directory_resp.find(wallet.display_address(wallet.address)) != std::string::npos);
+    assert(directory_resp.find("\"balance_sats\":250000000000") != std::string::npos);
+    assert(directory_resp.find(wallet.address_book().front().pubkey_b64) != std::string::npos);
+    assert(directory_resp.find("\"peer\":\"self\"") != std::string::npos);
+    assert(directory_resp.find("\"ip\":\"127.0.0.1:9333\"") != std::string::npos);
+
+    auto before_primary_wallet = Wallet::load("testpass", wallet_path);
+    assert(before_primary_wallet.all_addresses().size() >= 2);
+    const auto second_primary_display = before_primary_wallet.display_address(before_primary_wallet.all_addresses()[1]);
+    auto set_primary_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":51,"method":"setprimaryaddress","params":[")") +
+        second_primary_display + R"("]})",
+        stop_requested);
+    assert(set_primary_resp.find("\"primaryaddress\"") != std::string::npos);
+    auto after_primary_wallet = Wallet::load("testpass", wallet_path);
+    assert(after_primary_wallet.display_address(after_primary_wallet.address) == second_primary_display);
+
     auto walletpassphrasechange_resp = rpc_service.handle_jsonrpc(
-        R"({"jsonrpc":"2.0","id":41,"method":"walletpassphrasechange","params":["testpass","freshpass"]})",
+        R"({"jsonrpc":"2.0","id":41,"method":"walletpassphrasechange","params":["testpass","freshpass","scrypt"]})",
         stop_requested);
     assert(walletpassphrasechange_resp.find("\"result\":true") != std::string::npos);
 
     auto wallet_after_passchange = Wallet::load("freshpass", wallet_path);
     assert(wallet_after_passchange.mnemonic_phrase() == wallet.mnemonic_phrase());
+    assert(wallet_after_passchange.key_derivation() == Wallet::KeyDerivation::Scrypt);
 
     auto mnemonic_after_passchange_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":42,"method":"dumpmnemonic","params":[]})",
@@ -1576,6 +1734,16 @@ static void test_rpc_service() {
     auto restored_wallet = Wallet::load("freshpass", wallet_path);
     assert(restored_wallet.address == wallet.address);
 
+    auto delete_chat_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":53,"method":"deletechatmessage","params":["seeded-chat-id"]})",
+        stop_requested);
+    assert(delete_chat_resp.find("\"deleted\":true") != std::string::npos);
+
+    auto chatinbox_after_delete = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":54,"method":"getchatinbox","params":[200]})",
+        stop_requested);
+    assert(chatinbox_after_delete.find("seeded-chat-id") == std::string::npos);
+
     auto stop_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":4,"method":"stop","params":[]})",
         stop_requested);
@@ -1583,6 +1751,83 @@ static void test_rpc_service() {
     assert(stop_resp.find("\"result\":\"stopping\"") != std::string::npos);
 
     remove_all_if_exists(tmp);
+}
+
+static void test_voice_call_content_roundtrip() {
+    voice::CallSignal signal;
+    signal.type = voice::SignalType::Offer;
+    signal.timestamp = 123456;
+    signal.call_id = "voice-call-001";
+    signal.caller_address = "caller-address";
+    signal.callee_address = "callee-address";
+    signal.peer_label = "127.0.0.1:9333";
+    signal.caller_pubkey_b64 = "ZmFrZS1wdWJrZXk=";
+    signal.caller_rsa_public_pem = "-----BEGIN PUBLIC KEY-----demo";
+    signal.encryption_mode = 0;
+    signal.obfuscate_audio = true;
+    signal.sample_rate = 16000;
+    signal.channels = 1;
+    signal.bits_per_sample = 16;
+    signal.frame_duration_ms = 20;
+    signal.capability_flags = voice::CAPABILITY_AES_GCM | voice::CAPABILITY_OPUS | voice::CAPABILITY_AUDIO_CLOAK;
+    signal.codec = "opus";
+    signal.note = "offer";
+
+    auto signal_content = voice::make_signal_content(signal);
+    auto parsed_signal = voice::parse_signal_content(signal_content);
+    assert(parsed_signal.has_value());
+    assert(parsed_signal->call_id == signal.call_id);
+    assert(parsed_signal->caller_address == signal.caller_address);
+    assert(parsed_signal->callee_address == signal.callee_address);
+    assert(parsed_signal->peer_label == signal.peer_label);
+    assert(parsed_signal->caller_pubkey_b64 == signal.caller_pubkey_b64);
+    assert(parsed_signal->caller_rsa_public_pem == signal.caller_rsa_public_pem);
+    assert(parsed_signal->obfuscate_audio == signal.obfuscate_audio);
+    assert(parsed_signal->sample_rate == signal.sample_rate);
+    assert(parsed_signal->channels == signal.channels);
+    assert(parsed_signal->bits_per_sample == signal.bits_per_sample);
+    assert(parsed_signal->frame_duration_ms == signal.frame_duration_ms);
+    assert(parsed_signal->capability_flags == signal.capability_flags);
+    assert(parsed_signal->codec == signal.codec);
+    assert(parsed_signal->note == signal.note);
+
+    const auto caller = make_test_key();
+    const auto callee = make_test_key();
+    const auto caller_session = voice::derive_session_key(caller.priv, callee.pub, signal.call_id, caller.address, callee.address);
+    const auto callee_session = voice::derive_session_key(callee.priv, caller.pub, signal.call_id, callee.address, caller.address);
+    assert(caller_session == callee_session);
+
+    std::vector<uint8_t> pcm(static_cast<size_t>(signal.sample_rate / 50) * sizeof(int16_t), 0);
+    for (size_t i = 0; i < pcm.size(); ++i) {
+        pcm[i] = static_cast<uint8_t>((i * 13) & 0xFF);
+    }
+    auto frame = voice::make_encrypted_audio_frame(pcm,
+                                                   caller_session,
+                                                   signal.call_id,
+                                                   654321,
+                                                   7,
+                                                   signal.sample_rate,
+                                                   signal.channels,
+                                                   signal.bits_per_sample,
+                                                   signal.frame_duration_ms,
+                                                   true);
+
+    auto frame_content = voice::make_audio_frame_content(frame);
+    auto parsed_frame = voice::parse_audio_frame_content(frame_content);
+    assert(parsed_frame.has_value());
+    assert(parsed_frame->timestamp == frame.timestamp);
+    assert(parsed_frame->sequence == frame.sequence);
+    assert(parsed_frame->call_id == frame.call_id);
+    assert(parsed_frame->sample_rate == frame.sample_rate);
+    assert(parsed_frame->channels == frame.channels);
+    assert(parsed_frame->bits_per_sample == frame.bits_per_sample);
+    assert(parsed_frame->frame_duration_ms == frame.frame_duration_ms);
+    assert(parsed_frame->codec == frame.codec);
+    assert(parsed_frame->obfuscated == frame.obfuscated);
+    assert(!parsed_frame->encoded_audio.empty());
+    assert(parsed_frame->pcm_bytes.empty());
+    assert(voice::decrypt_audio_frame_inplace(*parsed_frame, callee_session));
+    assert(!parsed_frame->pcm_bytes.empty());
 }
 
 static void test_late_node_syncs_to_best_chain() {
@@ -1791,6 +2036,7 @@ static void test_wallet_session_rpc_independent_of_startup_wallet_flags() {
         stop_requested);
     assert(wallet_create.find("\"wallet_loaded\":true") != std::string::npos);
     assert(wallet_create.find("\"address_format\":\"hex\"") != std::string::npos);
+    assert(wallet_create.find("\"kdf\":\"argon2id\"") != std::string::npos);
     assert(wallet_create.find("\"primaryaddress\":\"0x") != std::string::npos);
 
     auto wallet_list = rpc_service.handle_jsonrpc(
@@ -1822,6 +2068,7 @@ static void test_wallet_session_rpc_independent_of_startup_wallet_flags() {
         R"({"jsonrpc":"2.0","id":3,"method":"getwalletinfo","params":[]})",
         stop_requested);
     assert(wallet_info.find("\"address_format\":\"hex\"") != std::string::npos);
+    assert(wallet_info.find("\"kdf\":\"argon2id\"") != std::string::npos);
     assert(wallet_info.find("\"wallet_loaded\":true") != std::string::npos);
 
     auto format_change = rpc_service.handle_jsonrpc(
@@ -1867,6 +2114,67 @@ static void test_wallet_session_rpc_independent_of_startup_wallet_flags() {
     remove_all_if_exists(tmp);
 }
 
+static void test_rpc_tls_autogenerates_certificate_and_serves_https() {
+    auto tmp = unique_temp_path("cryptex_rpc_tls");
+    remove_all_if_exists(tmp);
+    std::filesystem::create_directories(tmp);
+
+    Blockchain chain(tmp);
+    boost::asio::io_context server_ctx;
+
+    rpc::RpcConfig config;
+    config.bind = "127.0.0.1";
+    config.port = pick_free_port();
+    config.username = "rpcuser";
+    config.password = "rpcpass";
+    config.tls_enabled = true;
+    config.tls_cert_path = (tmp / "rpc_tls_cert.pem").string();
+    config.tls_key_path = (tmp / "rpc_tls_key.pem").string();
+
+    rpc::RpcServer server(server_ctx, config, chain, nullptr);
+    server.start();
+    std::thread server_thread([&]() { server_ctx.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    boost::asio::io_context client_ctx;
+    ssl::context ssl_ctx(ssl::context::tls_client);
+    ssl_ctx.set_verify_mode(ssl::verify_none);
+    beast::ssl_stream<beast::tcp_stream> stream(client_ctx, ssl_ctx);
+    auto results = tcp::resolver(client_ctx).resolve("127.0.0.1", std::to_string(config.port));
+    beast::get_lowest_layer(stream).connect(results);
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::string_body> request{http::verb::post, "/", 11};
+    request.set(http::field::host, "127.0.0.1");
+    request.set(http::field::content_type, "application/json");
+    request.set(http::field::authorization,
+                "Basic " + crypto::base64_encode(std::string("rpcuser:rpcpass")));
+    request.body() = R"({"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]})";
+    request.prepare_payload();
+    http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> response;
+    http::read(stream, buffer, response);
+    assert(response.result() == http::status::ok);
+    assert(response.body().find("\"result\":0") != std::string::npos);
+
+    beast::error_code ec;
+    stream.shutdown(ec);
+    if (ec == boost::asio::error::eof) {
+        ec = {};
+    }
+    assert(!ec);
+
+    server.stop();
+    server_ctx.stop();
+    if (server_thread.joinable()) server_thread.join();
+
+    assert(std::filesystem::exists(*config.tls_cert_path));
+    assert(std::filesystem::exists(*config.tls_key_path));
+    remove_all_if_exists(tmp);
+}
+
 int main() {
     LogConfig quiet_logs;
     quiet_logs.console = false;
@@ -1882,6 +2190,7 @@ int main() {
     test_reward_schedule_matches_new_consensus();
     test_network_modes();
     test_secure_chat_roundtrip();
+    test_secure_chat_kdf_profiles();
     test_legacy_address_compatibility();
     test_mainnet_emergency_difficulty_allows_low_hash_takeover();
     test_future_timestamp_block_is_rejected();
@@ -1890,6 +2199,7 @@ int main() {
     test_utxo_apply_and_fee();
     test_wallet_multi_address();
     test_wallet_mnemonic_import_roundtrip();
+    test_wallet_kdf_roundtrip_and_rotation();
     test_wallet_balance_summary();
     test_coinbase_matures_on_100th_confirmation_boundary();
     test_wallet_rescan_discovers_used_hd_address();
@@ -1903,12 +2213,14 @@ int main() {
     test_mempool_orphan_promotion();
     test_peer_state_persistence();
     test_block_locator_and_header_slice();
+    test_voice_call_content_roundtrip();
     test_late_node_syncs_to_best_chain();
     test_deep_reorg_policy_blocks_history_rewrite();
     test_shallow_reorg_within_limit_is_allowed();
     test_local_checkpoint_persists_and_blocks_deep_rewrite();
     test_wallet_session_rpc_independent_of_startup_wallet_flags();
     test_rpc_service();
+    test_rpc_tls_autogenerates_certificate_and_serves_https();
     // Block reward enforcement: overpay coinbase should fail, correct should pass
     {
         std::filesystem::path tmp = unique_temp_path("cryptex_test_chain");

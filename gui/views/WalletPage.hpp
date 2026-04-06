@@ -32,6 +32,7 @@ private:
     void requestNewAddress();
     void requestMnemonic();
     void requestRescan();
+    void requestPrimaryAddressChange();
     void saveLabel();
     void sendPayment();
     void requestTransactionDetail(const QString& txid);
@@ -70,6 +71,7 @@ private:
     QPushButton* newAddressButton_{nullptr};
     QPushButton* rescanButton_{nullptr};
     QPushButton* mnemonicButton_{nullptr};
+    QPushButton* setPrimaryButton_{nullptr};
     QPushButton* saveLabelButton_{nullptr};
     QPushButton* sendButton_{nullptr};
     bool chainApproved_{true};

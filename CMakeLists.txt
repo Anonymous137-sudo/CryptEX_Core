@@ -9,7 +9,29 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_BINARY_DIR})
 
 option(CRYPTEX_BUILD_GUI "Build the standalone Qt GUI client" ON)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(CRYPTEX_LOCAL_INSTALL_PREFIX "$ENV{HOME}/Applications/CryptEX")
+elseif(WIN32)
+    if(DEFINED ENV{LOCALAPPDATA} AND NOT "$ENV{LOCALAPPDATA}" STREQUAL "")
+        set(CRYPTEX_LOCAL_INSTALL_PREFIX "$ENV{LOCALAPPDATA}/Programs/CryptEX")
+    else()
+        set(CRYPTEX_LOCAL_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install/CryptEX")
+    endif()
+else()
+    set(CRYPTEX_LOCAL_INSTALL_PREFIX "$ENV{HOME}/.local/opt/CryptEX")
+endif()
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OR
+   CMAKE_INSTALL_PREFIX STREQUAL "/usr/local" OR
+   CMAKE_INSTALL_PREFIX STREQUAL "C:/Program Files/${PROJECT_NAME}")
+    set(CMAKE_INSTALL_PREFIX "${CRYPTEX_LOCAL_INSTALL_PREFIX}" CACHE PATH "Install prefix" FORCE)
+endif()
+
 add_subdirectory(src)
 if(CRYPTEX_BUILD_GUI)
     add_subdirectory(gui)
 endif()
+
+add_custom_target(install_local_apps
+    COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix ${CRYPTEX_LOCAL_INSTALL_PREFIX}
+    COMMENT "Installing CryptEX binaries into the local application prefix")

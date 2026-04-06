@@ -59,9 +59,11 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
     buttonLayout->setContentsMargins(0, 0, 0, 0);
     newAddressButton_ = new QPushButton(QStringLiteral("New Address"), this);
     unusedAddressButton_ = new QPushButton(QStringLiteral("Unused Address"), this);
+    setPrimaryButton_ = new QPushButton(QStringLiteral("Set Selected Primary"), this);
     copyAddressButton_ = new QPushButton(QStringLiteral("Copy"), this);
     buttonLayout->addWidget(newAddressButton_);
     buttonLayout->addWidget(unusedAddressButton_);
+    buttonLayout->addWidget(setPrimaryButton_);
     buttonLayout->addStretch(1);
     buttonLayout->addWidget(copyAddressButton_);
     primaryLayout->addWidget(primaryAddressView_);
@@ -85,10 +87,15 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
 
     connect(newAddressButton_, &QPushButton::clicked, this, [this]() { requestNewAddress(); });
     connect(unusedAddressButton_, &QPushButton::clicked, this, [this]() { requestUnusedAddress(); });
+    connect(setPrimaryButton_, &QPushButton::clicked, this, [this]() { requestSetPrimaryAddress(); });
     connect(copyAddressButton_, &QPushButton::clicked, this, [this]() { copyPrimaryAddress(); });
+    connect(addressTable_, &QTableWidget::itemSelectionChanged, this, [this]() {
+        setPrimaryButton_->setEnabled(addressTable_->currentRow() >= 0);
+    });
 
     newAddressButton_->setEnabled(false);
     unusedAddressButton_->setEnabled(false);
+    setPrimaryButton_->setEnabled(false);
     copyAddressButton_->setEnabled(false);
 }
 
@@ -145,6 +152,7 @@ void ReceivePage::refresh() {
             primaryAddressView_->setPlainText(addressFromObject(obj, QStringLiteral("primaryaddress")));
             newAddressButton_->setEnabled(true);
             unusedAddressButton_->setEnabled(true);
+            setPrimaryButton_->setEnabled(addressTable_->currentRow() >= 0);
             copyAddressButton_->setEnabled(!primaryAddressView_->toPlainText().trimmed().isEmpty());
             setStatus(QStringLiteral("Wallet ready for receiving."));
         },
@@ -155,6 +163,7 @@ void ReceivePage::refresh() {
             primaryAddressView_->clear();
             newAddressButton_->setEnabled(false);
             unusedAddressButton_->setEnabled(false);
+            setPrimaryButton_->setEnabled(false);
             copyAddressButton_->setEnabled(false);
             if (error.contains(QStringLiteral("no wallet is open"), Qt::CaseInsensitive)) {
                 setStatus(QStringLiteral("Open a wallet from Wallet Manager to receive funds."), true);
@@ -176,9 +185,11 @@ void ReceivePage::refresh() {
                 addressTable_->setItem(i, 2, new QTableWidgetItem(obj.value(QStringLiteral("primary")).toBool() ? QStringLiteral("Yes") : QStringLiteral("No")));
                 addressTable_->setItem(i, 3, new QTableWidgetItem(QString::number(obj.value(QStringLiteral("hd_index")).toInteger())));
             }
+            setPrimaryButton_->setEnabled(rows.size() > 0);
         },
         [this](const QString& error) {
             addressTable_->setRowCount(0);
+            setPrimaryButton_->setEnabled(false);
             if (!error.contains(QStringLiteral("no wallet is open"), Qt::CaseInsensitive)) {
                 setStatus(error, true);
             }
@@ -215,6 +226,28 @@ void ReceivePage::requestUnusedAddress() {
         [this](const QString& error) {
             setStatus(error, true);
         });
+}
+
+void ReceivePage::requestSetPrimaryAddress() {
+    if (!rpc_) return;
+    const auto items = addressTable_->selectedItems();
+    if (items.isEmpty()) {
+        setStatus(QStringLiteral("Select an address row first."), true);
+        return;
+    }
+    const int row = items.first()->row();
+    const auto* item = addressTable_->item(row, 1);
+    const auto address = item ? item->text().trimmed() : QString();
+    if (address.isEmpty()) {
+        setStatus(QStringLiteral("Selected row has no address."), true);
+        return;
+    }
+    rpc_->call(QStringLiteral("setprimaryaddress"), QJsonArray{address}, this,
+        [this](const QJsonValue&) {
+            setStatus(QStringLiteral("Primary receive address updated."));
+            refresh();
+        },
+        [this](const QString& error) { setStatus(error, true); });
 }
 
 void ReceivePage::copyPrimaryAddress() {

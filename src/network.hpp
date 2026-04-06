@@ -4,6 +4,7 @@
 #include "chainparams.hpp"
 #include "block.hpp"
 #include "chat_history.hpp"
+#include "voice_call.hpp"
 #include "transaction.hpp"
 #include "types.hpp"
 #include "serialization.hpp"
@@ -25,6 +26,10 @@
 namespace cryptex {
 class Blockchain;
 class Wallet;
+namespace chat {
+enum class EncryptionMode : uint8_t;
+struct ParsedMessage;
+}
 namespace net {
 
 enum class MessageType : uint8_t {
@@ -65,9 +70,11 @@ struct PeerAddress {
 };
 
 struct ChatPayload {
-    uint8_t version{2};
+    uint8_t version{4};
     uint8_t chat_type{0}; // 0 public, 1 private
     uint8_t flags{0}; // bit0 signed, bit1 encrypted
+    uint8_t kdf_profile{0}; // version >= 3 private chat key derivation
+    uint8_t cipher_profile{0}; // version >= 4 private chat transport
     uint64_t timestamp{0};
     uint64_t nonce{0};
     std::string sender;
@@ -75,6 +82,7 @@ struct ChatPayload {
     std::string channel;
     std::string recipient; // for private
     std::vector<uint8_t> recipient_pubkey;
+    std::vector<uint8_t> wrapped_key;
     std::vector<uint8_t> body; // plaintext for public chat, ciphertext for private chat
     std::vector<uint8_t> iv;
     std::vector<uint8_t> auth_tag;
@@ -183,6 +191,46 @@ public:
         bool syncing{false};
     };
 
+    struct ProxySettings {
+        std::string host;
+        uint16_t port{0};
+        bool remote_dns{true};
+    };
+
+    struct VoiceCallInfo {
+        bool active{false};
+        bool incoming{false};
+        bool outgoing{false};
+        bool ringing{false};
+        bool connected{false};
+        bool session_ready{false};
+        bool obfuscate_audio{false};
+        uint64_t started_at{0};
+        uint64_t connected_at{0};
+        uint64_t last_signal_at{0};
+        uint64_t last_audio_at{0};
+        uint64_t next_outgoing_sequence{1};
+        uint64_t latency_ms{0};
+        uint64_t jitter_ms{0};
+        uint32_t sample_rate{16000};
+        uint16_t channels{1};
+        uint16_t bits_per_sample{16};
+        uint16_t frame_duration_ms{20};
+        uint32_t capability_flags{voice::CAPABILITY_AES_GCM | voice::CAPABILITY_OPUS | voice::CAPABILITY_AUDIO_CLOAK | voice::CAPABILITY_LIVE_WAVEFORM};
+        std::string status;
+        std::string call_id;
+        std::string local_address;
+        std::string remote_address;
+        std::string caller_address;
+        std::string callee_address;
+        std::string remote_pubkey_b64;
+        std::string remote_rsa_public_pem;
+        std::string peer_label;
+        std::string encryption_mode;
+        std::string codec{"opus"};
+        std::vector<uint8_t> session_key;
+    };
+
     NetworkNode(boost::asio::io_context& ctx, uint16_t port, std::filesystem::path data_dir = ".");
     void start();
     void stop();
@@ -199,6 +247,7 @@ public:
     std::vector<chat::HistoryEntry> chat_history(const chat::HistoryQuery& query = {}) const;
     std::filesystem::path chat_history_path() const;
     void record_chat_history(const chat::HistoryEntry& entry);
+    bool delete_chat_message(const std::string& message_id);
     void punish_label(const std::string& label, int score, const std::string& reason);
     void set_ban(const std::string& label, int duration_seconds = constants::BANNED_PEER_DURATION_SECONDS);
     void clear_bans();
@@ -211,11 +260,29 @@ public:
     void enable_port_mapping(bool upnp_enabled, bool natpmp_enabled, int lease_seconds = constants::DEFAULT_NAT_MAPPING_LEASE_SECONDS);
     void set_chat_wallet(std::shared_ptr<const Wallet> wallet);
     void remember_chat_message(const std::string& message_id);
+    VoiceCallInfo voice_call_state() const;
+    bool start_voice_call(const std::string& recipient_address,
+                          const std::vector<uint8_t>& recipient_pubkey,
+                          const std::string& recipient_rsa_public_pem,
+                          const std::string& peer_label,
+                          const std::string& from_address,
+                          bool obfuscate_audio,
+                          chat::EncryptionMode encryption_mode);
+    bool accept_voice_call();
+    bool decline_voice_call(const std::string& note = {});
+    bool end_voice_call(const std::string& note = {});
+    size_t send_voice_audio(const std::vector<uint8_t>& pcm_bytes,
+                            uint32_t sample_rate,
+                            uint16_t channels,
+                            uint16_t bits_per_sample,
+                            bool obfuscated);
+    std::vector<voice::AudioFrame> take_voice_audio_frames(size_t max_frames = 16);
     void enable_discovery(bool enabled) { discovery_enabled_ = enabled; }
     void bootstrap(bool auto_connect = true);
     void bootstrap_chat_routing();
     std::optional<std::string> advertised_endpoint() const;
     PortMappingStatus port_mapping_status() const;
+    std::optional<ProxySettings> proxy_settings() const;
     ip_address public_ip();
     uint32_t best_height{0};
     Block latest_block;
@@ -256,6 +323,16 @@ private:
     void refresh_port_mapping();
     void clear_port_mapping();
     bool mark_chat_seen(const std::string& message_id, int64_t now);
+    size_t dispatch_chat_payload(const ChatPayload& payload, const std::string& preferred_peer = {});
+    void handle_voice_signal(const voice::CallSignal& signal,
+                             const chat::ParsedMessage& parsed,
+                             const ChatPayload& payload,
+                             const std::shared_ptr<PeerSession>& peer);
+    void handle_voice_frame(const voice::AudioFrame& frame,
+                            const chat::ParsedMessage& parsed,
+                            const ChatPayload& payload,
+                            const std::shared_ptr<PeerSession>& peer);
+    void clear_voice_call_locked(const std::string& status = {});
     void append_chat_inbox(const std::string& line);
     bool begin_pending_connect(const std::string& label);
     void end_pending_connect(const std::string& label);
@@ -281,12 +358,6 @@ private:
     struct PendingBlockDownload {
         uint256_t hash;
         std::weak_ptr<PeerSession> peer;
-    };
-
-    struct ProxySettings {
-        std::string host;
-        uint16_t port{0};
-        bool remote_dns{true};
     };
 
     boost::asio::io_context& ctx_;
@@ -331,6 +402,9 @@ private:
     std::filesystem::path chat_history_file_;
     mutable std::mutex chat_mutex_;
     std::unordered_map<std::string, int64_t> recent_chat_ids_;
+    mutable std::mutex voice_call_mutex_;
+    VoiceCallInfo voice_call_;
+    std::deque<voice::AudioFrame> voice_audio_inbox_;
     mutable std::mutex pending_connect_mutex_;
     std::unordered_set<std::string> pending_connects_;
     std::atomic<bool> network_active_{true};

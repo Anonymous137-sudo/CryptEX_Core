@@ -40,7 +40,7 @@ constexpr size_t MAX_HEADERS_PER_MESSAGE = 2000;
 constexpr size_t MAX_PARALLEL_BLOCK_DOWNLOADS = 8;
 constexpr uint32_t MESSAGE_MAGIC = 0x43584558; // 'CXEX' for framing
 constexpr const char* IP_DETECT_HOST = "ifconfig.me";
-constexpr const char* IP_DETECT_PORT = "80";
+constexpr const char* IP_DETECT_PORT = "443";
 constexpr const char* IP_DETECT_PATH = "/ip";
 constexpr int BAN_THRESHOLD = 100;
 constexpr int BANNED_PEER_DURATION_SECONDS = 6 * 60 * 60;
@@ -89,6 +89,24 @@ constexpr int AES_KEY_SIZE = 32; // 256 bits
 constexpr int AES_IV_SIZE = 16;
 constexpr int AES_BLOCK_SIZE = 16;
 constexpr int PBKDF2_ITERATIONS = 100000; // For key derivation
+constexpr int WALLET_KDF_SALT_SIZE = 16;
+constexpr uint64_t WALLET_SCRYPT_N = 1ull << 15;
+constexpr uint64_t WALLET_SCRYPT_R = 8;
+constexpr uint64_t WALLET_SCRYPT_P = 1;
+constexpr uint64_t WALLET_SCRYPT_MAXMEM = 64ull * 1024ull * 1024ull;
+constexpr uint32_t WALLET_ARGON2_ITERATIONS = 3;
+constexpr uint32_t WALLET_ARGON2_THREADS = 1;
+constexpr uint32_t WALLET_ARGON2_LANES = 1;
+constexpr uint64_t WALLET_ARGON2_MEMCOST_KIB = 64ull * 1024ull;
+constexpr uint32_t CHAT_PBKDF2_ITERATIONS = 120000;
+constexpr uint64_t CHAT_SCRYPT_N = 1ull << 14;
+constexpr uint64_t CHAT_SCRYPT_R = 8;
+constexpr uint64_t CHAT_SCRYPT_P = 1;
+constexpr uint64_t CHAT_SCRYPT_MAXMEM = 32ull * 1024ull * 1024ull;
+constexpr uint32_t CHAT_ARGON2_ITERATIONS = 2;
+constexpr uint32_t CHAT_ARGON2_THREADS = 1;
+constexpr uint32_t CHAT_ARGON2_LANES = 1;
+constexpr uint64_t CHAT_ARGON2_MEMCOST_KIB = 32ull * 1024ull;
 
 } // namespace constants
 } // namespace cryptex

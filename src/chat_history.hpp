@@ -28,6 +28,14 @@ struct HistoryEntry {
     std::string message;
     std::string peer_label;
     std::string status;
+    std::string content_type;
+    std::string mime_type;
+    std::string attachment_name;
+    std::string attachment_path;
+    uint64_t attachment_size{0};
+    std::string audio_privacy;
+    std::string encryption_mode;
+    std::string transcript;
 };
 
 struct HistoryQuery {
@@ -42,6 +50,7 @@ struct HistoryQuery {
 void append_history_entry(const std::filesystem::path& path, const HistoryEntry& entry);
 std::vector<HistoryEntry> load_history(const std::filesystem::path& path, const HistoryQuery& query = {});
 size_t history_count(const std::filesystem::path& path);
+bool delete_history_entry(const std::filesystem::path& path, const std::string& message_id);
 std::string describe_history_entry(const HistoryEntry& entry);
 
 } // namespace chat

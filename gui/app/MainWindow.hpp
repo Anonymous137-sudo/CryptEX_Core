@@ -11,12 +11,14 @@ class ReceivePage;
 class TransactionsPage;
 class NetworkGraphPage;
 class WalletPage;
-class ChatPage;
 class MiningPage;
 class RpcConsolePage;
 class TerminalPage;
 class NodeWindow;
+class ChatWindow;
+class WalletManagerWindow;
 class QComboBox;
+class QCheckBox;
 class QLineEdit;
 class QTextEdit;
 class QTabWidget;
@@ -70,6 +72,8 @@ private:
     void refreshAll();
     void refreshCurrentMainTab();
     void refreshVisibleNodeSection();
+    void refreshVisibleWalletManager();
+    void refreshVisibleChatSection();
     void refreshSyncState();
     void refreshNodeInformation();
     void updateSyncOverlay(const QJsonObject& blockchainInfo);
@@ -77,6 +81,8 @@ private:
     void layoutStartupOverlay();
     void updateResponsiveLayout();
     void openNodeWindow(const QString& section = QString());
+    void openWalletManagerWindow();
+    void openChatWindow(const QString& section = QString());
     QString formatSyncEta(double hours_remaining) const;
     QString formatSyncTimestamp(qint64 epoch_seconds) const;
     void updateApprovalIndicators();
@@ -101,6 +107,11 @@ private:
     QLineEdit* rpcUrlEdit_{nullptr};
     QLineEdit* rpcUserEdit_{nullptr};
     QLineEdit* rpcPasswordEdit_{nullptr};
+    QCheckBox* rpcTlsCheck_{nullptr};
+    QCheckBox* rpcTlsAllowSelfSignedCheck_{nullptr};
+    QLineEdit* rpcTlsCertPathEdit_{nullptr};
+    QLineEdit* rpcTlsKeyPathEdit_{nullptr};
+    QLineEdit* rpcTlsCaPathEdit_{nullptr};
     QLineEdit* daemonPathEdit_{nullptr};
     QLineEdit* dataDirEdit_{nullptr};
     QWidget* walletManagerPage_{nullptr};
@@ -109,6 +120,7 @@ private:
     QLineEdit* walletPathEdit_{nullptr};
     QLineEdit* walletPassEdit_{nullptr};
     QComboBox* walletFormatCombo_{nullptr};
+    QComboBox* walletKdfCombo_{nullptr};
     QTableWidget* walletListTable_{nullptr};
     QLineEdit* directPeersEdit_{nullptr};
     QLineEdit* seedPeersEdit_{nullptr};
@@ -121,6 +133,8 @@ private:
     QProgressBar* syncStatusProgressBar_{nullptr};
     QTabWidget* tabs_{nullptr};
     NodeWindow* nodeWindow_{nullptr};
+    ChatWindow* chatWindow_{nullptr};
+    WalletManagerWindow* walletManagerWindow_{nullptr};
     QWidget* settingsPage_{nullptr};
     QWidget* nodeInfoPage_{nullptr};
     QWidget* consoleHubPage_{nullptr};
@@ -131,7 +145,6 @@ private:
     TransactionsPage* transactionsPage_{nullptr};
     NetworkGraphPage* networkGraphPage_{nullptr};
     WalletPage* walletPage_{nullptr};
-    ChatPage* chatPage_{nullptr};
     MiningPage* miningPage_{nullptr};
     RpcConsolePage* rpcConsolePage_{nullptr};
     TerminalPage* terminalPage_{nullptr};
@@ -171,6 +184,7 @@ private:
     QProgressBar* startupProgressBar_{nullptr};
     QPushButton* startupHideButton_{nullptr};
     QToolButton* nodeWindowButton_{nullptr};
+    QToolButton* chatWindowButton_{nullptr};
     QToolButton* syncDetailsButton_{nullptr};
     QToolButton* peerActivityButton_{nullptr};
     QToolButton* networkActivityButton_{nullptr};

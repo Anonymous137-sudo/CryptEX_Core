@@ -116,6 +116,9 @@ void DaemonController::startNode(const LaunchConfig& config) {
     if (!config.dataDir.isEmpty()) args << "--datadir" << config.dataDir;
     if (!config.rpcBind.isEmpty()) args << "--rpcbind" << config.rpcBind;
     if (config.rpcPort > 0) args << "--rpcport" << QString::number(config.rpcPort);
+    if (config.rpcTls) args << "--rpctls";
+    if (!config.rpcTlsCertPath.isEmpty()) args << "--rpctlscert" << config.rpcTlsCertPath;
+    if (!config.rpcTlsKeyPath.isEmpty()) args << "--rpctlskey" << config.rpcTlsKeyPath;
     if (!config.rpcUser.isEmpty()) args << "--rpcuser" << config.rpcUser;
     if (!config.rpcPassword.isEmpty()) args << "--rpcpassword" << config.rpcPassword;
     for (const auto& target : config.connectTargets) {

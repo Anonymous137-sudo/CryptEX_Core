@@ -28,10 +28,14 @@ if(WIN32 AND CMAKE_CROSSCOMPILING)
 else()
     find_package(Boost REQUIRED)
 endif()
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 
 add_executable(cryptexd
     main.cpp
     chainparams.cpp
+    chat_content.cpp
+    chat_state.cpp
     chat_history.cpp
     chat_secure.cpp
     config.cpp
@@ -40,6 +44,7 @@ add_executable(cryptexd
     block.cpp
     transaction.cpp
     types.cpp
+    voice_call.cpp
     base64.cpp
     bip39.cpp
     utxo.cpp
@@ -60,17 +65,19 @@ else()
     set_target_properties(cryptexd PROPERTIES OUTPUT_NAME "cryptexd_linux")
 endif()
 
-target_include_directories(cryptexd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+target_include_directories(cryptexd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
 target_compile_definitions(cryptexd PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
 if(WIN32 AND CMAKE_CROSSCOMPILING)
-    target_link_libraries(cryptexd PRIVATE ${OPENSSL_LIBRARIES})
+    target_link_libraries(cryptexd PRIVATE ${OPENSSL_LIBRARIES} PkgConfig::OPUS)
 else()
-    target_link_libraries(cryptexd PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z)
+    target_link_libraries(cryptexd PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z PkgConfig::OPUS)
 endif()
 
 add_executable(cryptex_tests
     tests.cpp
     chainparams.cpp
+    chat_content.cpp
+    chat_state.cpp
     chat_history.cpp
     chat_secure.cpp
     config.cpp
@@ -79,6 +86,7 @@ add_executable(cryptex_tests
     block.cpp
     transaction.cpp
     types.cpp
+    voice_call.cpp
     base64.cpp
     bip39.cpp
     utxo.cpp
@@ -90,10 +98,18 @@ add_executable(cryptex_tests
     blockchain.cpp
     wallet.cpp
 )
-target_include_directories(cryptex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+target_include_directories(cryptex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
 target_compile_definitions(cryptex_tests PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
 if(WIN32 AND CMAKE_CROSSCOMPILING)
-    target_link_libraries(cryptex_tests PRIVATE ${OPENSSL_LIBRARIES})
+    target_link_libraries(cryptex_tests PRIVATE ${OPENSSL_LIBRARIES} PkgConfig::OPUS)
 else()
-    target_link_libraries(cryptex_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z)
+    target_link_libraries(cryptex_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z PkgConfig::OPUS)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION ".")
+elseif(WIN32)
+    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION ".")
+else()
+    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION "bin")
 endif()

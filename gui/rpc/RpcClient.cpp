@@ -2,9 +2,26 @@
 
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QFile>
+#include <QHostAddress>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslError>
+
+namespace {
+
+bool isLoopbackHost(const QString& host) {
+    if (host.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0) {
+        return true;
+    }
+    const QHostAddress address(host);
+    return !address.isNull() && address.isLoopback();
+}
+
+} // namespace
 
 RpcClient::RpcClient(QObject* parent)
     : QObject(parent) {
@@ -40,9 +57,57 @@ void RpcClient::call(const QString& method,
     if (!settings_.username.isEmpty()) {
         request.setRawHeader("Authorization", authorizationHeader());
     }
+    if (settings_.url.scheme().compare(QStringLiteral("https"), Qt::CaseInsensitive) == 0) {
+        auto sslConfig = QSslConfiguration::defaultConfiguration();
+        if (!settings_.caCertificatePath.trimmed().isEmpty()) {
+            QFile caFile(settings_.caCertificatePath);
+            if (caFile.open(QIODevice::ReadOnly)) {
+                const auto certs = QSslCertificate::fromData(caFile.readAll(), QSsl::Pem);
+                if (!certs.isEmpty()) {
+                    auto authorities = sslConfig.caCertificates();
+                    authorities.append(certs);
+                    sslConfig.setCaCertificates(authorities);
+                }
+            }
+        }
+        request.setSslConfiguration(sslConfig);
+    }
 
     QPointer<QObject> guard(context);
     auto* reply = network_.post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::sslErrors, this, [this, reply](const QList<QSslError>& errors) {
+        if (settings_.allowSelfSigned && isLoopbackHost(settings_.url.host())) {
+            QList<QSslError> ignorable;
+            bool saw_unexpected = false;
+            for (const auto& error : errors) {
+                switch (error.error()) {
+                case QSslError::SelfSignedCertificate:
+                case QSslError::SelfSignedCertificateInChain:
+                case QSslError::CertificateUntrusted:
+                case QSslError::UnableToGetLocalIssuerCertificate:
+                case QSslError::HostNameMismatch:
+                    ignorable.push_back(error);
+                    break;
+                default:
+                    saw_unexpected = true;
+                    break;
+                }
+            }
+            if (!saw_unexpected && !ignorable.isEmpty()) {
+                reply->ignoreSslErrors(ignorable);
+                return;
+            }
+        }
+
+        QStringList parts;
+        for (const auto& error : errors) {
+            parts.push_back(error.errorString());
+        }
+        const QString message = parts.isEmpty()
+            ? QStringLiteral("TLS verification failed.")
+            : QStringLiteral("TLS verification failed: %1").arg(parts.join(QStringLiteral("; ")));
+        emit transportError(message);
+    });
     connect(reply, &QNetworkReply::finished, this, [this, reply, guard, context, onSuccess = std::move(onSuccess), onError = std::move(onError)]() mutable {
         if (context && guard.isNull()) {
             reply->deleteLater();

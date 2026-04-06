@@ -14,6 +14,8 @@ public:
         QUrl url;
         QString username;
         QString password;
+        bool allowSelfSigned{false};
+        QString caCertificatePath;
     };
 
     explicit RpcClient(QObject* parent = nullptr);

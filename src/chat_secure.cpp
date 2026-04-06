@@ -9,9 +9,13 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <openssl/rand.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 
 namespace cryptex {
 namespace chat {
@@ -181,6 +185,12 @@ std::vector<uint8_t> build_chat_aad(const net::ChatPayload& payload) {
     out.push_back(payload.version);
     out.push_back(payload.chat_type);
     out.push_back(payload.flags);
+    if (payload.version >= 3) {
+        out.push_back(payload.kdf_profile);
+    }
+    if (payload.version >= 4) {
+        out.push_back(payload.cipher_profile);
+    }
     serialization::write_int<uint64_t>(out, payload.timestamp);
     serialization::write_int<uint64_t>(out, payload.nonce);
     serialization::write_bytes(out,
@@ -194,6 +204,7 @@ std::vector<uint8_t> build_chat_aad(const net::ChatPayload& payload) {
                                reinterpret_cast<const uint8_t*>(payload.recipient.data()),
                                payload.recipient.size());
     serialization::write_bytes(out, payload.recipient_pubkey.data(), payload.recipient_pubkey.size());
+    serialization::write_bytes(out, payload.wrapped_key.data(), payload.wrapped_key.size());
     return out;
 }
 
@@ -205,7 +216,7 @@ std::vector<uint8_t> build_signature_payload(const net::ChatPayload& payload) {
     return out;
 }
 
-std::array<uint8_t, CHAT_KEY_BYTES> derive_chat_key(const std::vector<uint8_t>& shared_secret,
+std::array<uint8_t, CHAT_KEY_BYTES> legacy_chat_key(const std::vector<uint8_t>& shared_secret,
                                                     const net::ChatPayload& payload) {
     std::vector<uint8_t> material = build_chat_aad(payload);
     material.insert(material.end(), shared_secret.begin(), shared_secret.end());
@@ -213,6 +224,184 @@ std::array<uint8_t, CHAT_KEY_BYTES> derive_chat_key(const std::vector<uint8_t>& 
     std::array<uint8_t, CHAT_KEY_BYTES> key{};
     std::memcpy(key.data(), digest.data(), key.size());
     return key;
+}
+
+std::vector<uint8_t> derive_provider_key(const char* algorithm,
+                                         const std::vector<uint8_t>& secret,
+                                         const std::vector<uint8_t>& salt,
+                                         const std::vector<OSSL_PARAM>& extra_params) {
+    EVP_KDF* kdf = EVP_KDF_fetch(nullptr, algorithm, nullptr);
+    if (!kdf) {
+        throw std::runtime_error(std::string("chat kdf unavailable: ") + algorithm);
+    }
+    EVP_KDF_CTX* ctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (!ctx) {
+        throw std::runtime_error(std::string("chat kdf ctx failed: ") + algorithm);
+    }
+
+    std::vector<OSSL_PARAM> params = extra_params;
+    params.push_back(OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
+                                                       const_cast<uint8_t*>(secret.data()),
+                                                       secret.size()));
+    params.push_back(OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
+                                                       const_cast<uint8_t*>(salt.data()),
+                                                       salt.size()));
+    params.push_back(OSSL_PARAM_construct_end());
+
+    std::vector<uint8_t> key(CHAT_KEY_BYTES);
+    if (EVP_KDF_derive(ctx, key.data(), key.size(), params.data()) <= 0) {
+        EVP_KDF_CTX_free(ctx);
+        throw std::runtime_error(std::string("chat key derive failed: ") + algorithm);
+    }
+    EVP_KDF_CTX_free(ctx);
+    return key;
+}
+
+std::array<uint8_t, CHAT_KEY_BYTES> derive_chat_key(const std::vector<uint8_t>& shared_secret,
+                                                    const net::ChatPayload& payload) {
+    const auto profile = static_cast<KeyDerivation>(payload.kdf_profile);
+    if (payload.version < 3 || profile == KeyDerivation::LegacySha3) {
+        return legacy_chat_key(shared_secret, payload);
+    }
+
+    auto salt = build_chat_aad(payload);
+    std::vector<uint8_t> key;
+    if (profile == KeyDerivation::PBKDF2) {
+        unsigned int iter = constants::CHAT_PBKDF2_ITERATIONS;
+        char digest_name[] = "SHA256";
+        std::vector<OSSL_PARAM> params;
+        params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ITER, &iter));
+        params.push_back(OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest_name, 0));
+        key = derive_provider_key(OSSL_KDF_NAME_PBKDF2, shared_secret, salt, params);
+    } else if (profile == KeyDerivation::Scrypt) {
+        uint64_t n = constants::CHAT_SCRYPT_N;
+        uint64_t r = constants::CHAT_SCRYPT_R;
+        uint64_t p = constants::CHAT_SCRYPT_P;
+        uint64_t maxmem = constants::CHAT_SCRYPT_MAXMEM;
+        std::vector<OSSL_PARAM> params;
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_N, &n));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_R, &r));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_P, &p));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_MAXMEM, &maxmem));
+        key = derive_provider_key(OSSL_KDF_NAME_SCRYPT, shared_secret, salt, params);
+    } else {
+        unsigned int iter = constants::CHAT_ARGON2_ITERATIONS;
+        unsigned int threads = constants::CHAT_ARGON2_THREADS;
+        unsigned int lanes = constants::CHAT_ARGON2_LANES;
+        unsigned int version = 0x13;
+        uint64_t memcost = constants::CHAT_ARGON2_MEMCOST_KIB;
+        std::vector<OSSL_PARAM> params;
+        params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ITER, &iter));
+        params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_THREADS, &threads));
+        params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ARGON2_LANES, &lanes));
+        params.push_back(OSSL_PARAM_construct_uint(OSSL_KDF_PARAM_ARGON2_VERSION, &version));
+        params.push_back(OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost));
+        key = derive_provider_key("ARGON2ID", shared_secret, salt, params);
+    }
+
+    std::array<uint8_t, CHAT_KEY_BYTES> fixed{};
+    std::memcpy(fixed.data(), key.data(), fixed.size());
+    return fixed;
+}
+
+EVP_PKEY* load_public_pem_key(const std::string& pem) {
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) {
+        throw std::runtime_error("chat RSA public key buffer failed");
+    }
+    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!pkey) {
+        throw std::runtime_error("chat RSA public key decode failed");
+    }
+    return pkey;
+}
+
+EVP_PKEY* load_private_pem_key(const std::string& pem) {
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) {
+        throw std::runtime_error("chat RSA private key buffer failed");
+    }
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!pkey) {
+        throw std::runtime_error("chat RSA private key decode failed");
+    }
+    return pkey;
+}
+
+std::vector<uint8_t> rsa_wrap_session_key(const std::array<uint8_t, CHAT_KEY_BYTES>& session_key,
+                                          const std::string& recipient_public_pem) {
+    EVP_PKEY* pkey = load_public_pem_key(recipient_public_pem);
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA encrypt context failed");
+    }
+    if (EVP_PKEY_encrypt_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA encrypt init failed");
+    }
+    size_t wrapped_len = 0;
+    if (EVP_PKEY_encrypt(ctx, nullptr, &wrapped_len, session_key.data(), session_key.size()) <= 0 || wrapped_len == 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA wrap sizing failed");
+    }
+    std::vector<uint8_t> wrapped(wrapped_len);
+    if (EVP_PKEY_encrypt(ctx, wrapped.data(), &wrapped_len, session_key.data(), session_key.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA wrap failed");
+    }
+    wrapped.resize(wrapped_len);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return wrapped;
+}
+
+std::array<uint8_t, CHAT_KEY_BYTES> rsa_unwrap_session_key(const std::vector<uint8_t>& wrapped_key,
+                                                           const std::string& private_pem) {
+    EVP_PKEY* pkey = load_private_pem_key(private_pem);
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA decrypt context failed");
+    }
+    if (EVP_PKEY_decrypt_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA decrypt init failed");
+    }
+    size_t key_len = 0;
+    if (EVP_PKEY_decrypt(ctx, nullptr, &key_len, wrapped_key.data(), wrapped_key.size()) <= 0 || key_len == 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA unwrap sizing failed");
+    }
+    std::vector<uint8_t> key_material(key_len);
+    if (EVP_PKEY_decrypt(ctx, key_material.data(), &key_len, wrapped_key.data(), wrapped_key.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("chat RSA unwrap failed");
+    }
+    key_material.resize(key_len);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    if (key_material.size() != CHAT_KEY_BYTES) {
+        throw std::runtime_error("chat RSA session key size invalid");
+    }
+    std::array<uint8_t, CHAT_KEY_BYTES> fixed{};
+    std::memcpy(fixed.data(), key_material.data(), fixed.size());
+    return fixed;
 }
 
 void aes256_gcm_encrypt(const std::vector<uint8_t>& plaintext,
@@ -321,15 +510,40 @@ void validate_common_payload(const net::ChatPayload& payload) {
     if (!verify_blob(build_signature_payload(payload), payload.signature, payload.sender_pubkey)) {
         throw std::runtime_error("chat signature verification failed");
     }
-    if (payload.chat_type == 1) {
+    const bool transport_only = payload.chat_type == CHAT_TYPE_VOICE_FRAME;
+    if (payload.chat_type != CHAT_TYPE_PUBLIC && !transport_only) {
         if ((payload.flags & CHAT_FLAG_ENCRYPTED) == 0) {
             throw std::runtime_error("private chat payload missing encryption flag");
         }
-        if (payload.recipient.empty() || payload.recipient_pubkey.empty() || payload.iv.empty() || payload.auth_tag.empty()) {
+        if (payload.version >= 3 && payload.kdf_profile > static_cast<uint8_t>(KeyDerivation::Argon2id)) {
+            throw std::runtime_error("private chat payload kdf unsupported");
+        }
+        const auto mode = payload.version >= 4
+            ? static_cast<EncryptionMode>(payload.cipher_profile)
+            : EncryptionMode::ECDH;
+        if (payload.version >= 4 && payload.cipher_profile > static_cast<uint8_t>(EncryptionMode::RSA)) {
+            throw std::runtime_error("private chat payload cipher unsupported");
+        }
+        if (payload.recipient.empty() || payload.iv.empty() || payload.auth_tag.empty()) {
             throw std::runtime_error("private chat payload missing encryption metadata");
         }
-        if (!script::check_address(payload.recipient, payload.recipient_pubkey)) {
+        if (!payload.recipient_pubkey.empty() &&
+            !script::check_address(payload.recipient, payload.recipient_pubkey)) {
             throw std::runtime_error("chat recipient address/pubkey mismatch");
+        }
+        if (mode == EncryptionMode::ECDH && payload.recipient_pubkey.empty()) {
+            throw std::runtime_error("private ECDH chat payload missing recipient pubkey");
+        }
+        if (mode == EncryptionMode::RSA && payload.wrapped_key.empty()) {
+            throw std::runtime_error("private RSA chat payload missing wrapped session key");
+        }
+    } else if (transport_only) {
+        if (payload.recipient.empty()) {
+            throw std::runtime_error("voice transport payload missing recipient");
+        }
+        if (!payload.recipient_pubkey.empty() &&
+            !script::check_address(payload.recipient, payload.recipient_pubkey)) {
+            throw std::runtime_error("voice transport recipient address/pubkey mismatch");
         }
     }
 }
@@ -339,18 +553,19 @@ void validate_common_payload(const net::ChatPayload& payload) {
 net::ChatPayload make_signed_public_chat(const Wallet& wallet,
                                          const std::string& sender_address,
                                          const std::string& channel,
-                                         const std::string& message) {
+                                         const ContentEnvelope& content) {
     size_t idx = resolve_sender_index(wallet, sender_address);
     net::ChatPayload payload;
-    payload.version = 2;
-    payload.chat_type = 0;
+    payload.version = 4;
+    payload.chat_type = CHAT_TYPE_PUBLIC;
     payload.flags = CHAT_FLAG_SIGNED;
+    payload.cipher_profile = static_cast<uint8_t>(EncryptionMode::ECDH);
     payload.timestamp = static_cast<uint64_t>(now_seconds());
     payload.nonce = random_nonce64();
     payload.sender = wallet.addresses[idx];
     payload.sender_pubkey = wallet.pubkeys[idx];
     payload.channel = channel;
-    payload.body.assign(message.begin(), message.end());
+    payload.body = serialize_content(content);
     payload.signature = sign_blob(build_signature_payload(payload), wallet.privkeys[idx]);
     return payload;
 }
@@ -359,37 +574,170 @@ net::ChatPayload make_encrypted_private_chat(const Wallet& wallet,
                                              const std::string& sender_address,
                                              const std::string& recipient_address,
                                              const std::vector<uint8_t>& recipient_pubkey,
-                                             const std::string& message) {
-    if (recipient_pubkey.empty()) {
+                                             const ContentEnvelope& content,
+                                             KeyDerivation kdf,
+                                             EncryptionMode mode,
+                                             const std::string& recipient_rsa_public_pem,
+                                             uint8_t chat_type) {
+    if (mode == EncryptionMode::ECDH && recipient_pubkey.empty()) {
         throw std::runtime_error("private chat requires recipient public key");
     }
-    if (!recipient_address.empty() && !script::check_address(recipient_address, recipient_pubkey)) {
+    if (!recipient_pubkey.empty() &&
+        !recipient_address.empty() &&
+        !script::check_address(recipient_address, recipient_pubkey)) {
         throw std::runtime_error("recipient address does not match recipient public key");
+    }
+    if (mode == EncryptionMode::RSA && recipient_rsa_public_pem.empty()) {
+        throw std::runtime_error("private RSA chat requires recipient RSA public key");
     }
 
     size_t idx = resolve_sender_index(wallet, sender_address);
     net::ChatPayload payload;
-    payload.version = 2;
-    payload.chat_type = 1;
+    payload.version = 4;
+    payload.chat_type = chat_type;
     payload.flags = CHAT_FLAG_SIGNED | CHAT_FLAG_ENCRYPTED;
+    payload.kdf_profile = mode == EncryptionMode::ECDH ? static_cast<uint8_t>(kdf) : 0;
+    payload.cipher_profile = static_cast<uint8_t>(mode);
     payload.timestamp = static_cast<uint64_t>(now_seconds());
     payload.nonce = random_nonce64();
     payload.sender = wallet.addresses[idx];
     payload.sender_pubkey = wallet.pubkeys[idx];
-    payload.recipient = recipient_address.empty() ? script::pubkey_to_address(recipient_pubkey) : recipient_address;
+    payload.recipient = recipient_address.empty() && !recipient_pubkey.empty()
+        ? script::pubkey_to_address(recipient_pubkey)
+        : recipient_address;
     payload.recipient_pubkey = recipient_pubkey;
 
-    auto shared_secret = derive_shared_secret(wallet.privkeys[idx], recipient_pubkey);
+    const auto plaintext = serialize_content(content);
     auto aad = build_chat_aad(payload);
-    auto key = derive_chat_key(shared_secret, payload);
-    std::vector<uint8_t> plaintext(message.begin(), message.end());
+    std::array<uint8_t, CHAT_KEY_BYTES> key{};
+    if (mode == EncryptionMode::ECDH) {
+        auto shared_secret = derive_shared_secret(wallet.privkeys[idx], recipient_pubkey);
+        key = derive_chat_key(shared_secret, payload);
+    } else {
+        auto random_key = random_bytes(CHAT_KEY_BYTES);
+        std::memcpy(key.data(), random_key.data(), key.size());
+        payload.wrapped_key = rsa_wrap_session_key(key, recipient_rsa_public_pem);
+        aad = build_chat_aad(payload);
+    }
     aes256_gcm_encrypt(plaintext, key, aad, payload.iv, payload.body, payload.auth_tag);
     payload.signature = sign_blob(build_signature_payload(payload), wallet.privkeys[idx]);
     return payload;
 }
 
+net::ChatPayload make_signed_transport_chat(const Wallet& wallet,
+                                            const std::string& sender_address,
+                                            const std::string& recipient_address,
+                                            const std::vector<uint8_t>& recipient_pubkey,
+                                            const ContentEnvelope& content,
+                                            uint8_t chat_type) {
+    if (recipient_address.empty()) {
+        throw std::runtime_error("transport chat requires recipient address");
+    }
+    if (!recipient_pubkey.empty() &&
+        !script::check_address(recipient_address, recipient_pubkey)) {
+        throw std::runtime_error("transport recipient address does not match recipient public key");
+    }
+
+    size_t idx = resolve_sender_index(wallet, sender_address);
+    net::ChatPayload payload;
+    payload.version = 4;
+    payload.chat_type = chat_type;
+    payload.flags = CHAT_FLAG_SIGNED;
+    payload.cipher_profile = static_cast<uint8_t>(EncryptionMode::ECDH);
+    payload.timestamp = static_cast<uint64_t>(now_seconds());
+    payload.nonce = random_nonce64();
+    payload.sender = wallet.addresses[idx];
+    payload.sender_pubkey = wallet.pubkeys[idx];
+    payload.recipient = recipient_address;
+    payload.recipient_pubkey = recipient_pubkey;
+    payload.body = serialize_content(content);
+    payload.signature = sign_blob(build_signature_payload(payload), wallet.privkeys[idx]);
+    return payload;
+}
+
+net::ChatPayload make_signed_public_chat(const Wallet& wallet,
+                                         const std::string& sender_address,
+                                         const std::string& channel,
+                                         const std::string& message) {
+    return make_signed_public_chat(wallet, sender_address, channel, make_text_content(message));
+}
+
+net::ChatPayload make_encrypted_private_chat(const Wallet& wallet,
+                                             const std::string& sender_address,
+                                             const std::string& recipient_address,
+                                             const std::vector<uint8_t>& recipient_pubkey,
+                                             const std::string& message,
+                                             KeyDerivation kdf) {
+    return make_encrypted_private_chat(wallet,
+                                       sender_address,
+                                       recipient_address,
+                                       recipient_pubkey,
+                                       make_text_content(message),
+                                       kdf,
+                                       EncryptionMode::ECDH,
+                                       {});
+}
+
 std::string message_id(const net::ChatPayload& payload) {
     return payload_message_id(payload);
+}
+
+const char* kdf_name(KeyDerivation kdf) {
+    switch (kdf) {
+    case KeyDerivation::LegacySha3:
+        return "legacy-sha3";
+    case KeyDerivation::PBKDF2:
+        return "pbkdf2";
+    case KeyDerivation::Scrypt:
+        return "scrypt";
+    case KeyDerivation::Argon2id:
+        return "argon2id";
+    }
+    return "argon2id";
+}
+
+std::optional<KeyDerivation> parse_kdf(const std::string& text) {
+    std::string normalized = text;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (normalized == "legacy" || normalized == "legacy-sha3" || normalized == "sha3") {
+        return KeyDerivation::LegacySha3;
+    }
+    if (normalized == "pbkdf2" || normalized == "pbkdf2-sha256") {
+        return KeyDerivation::PBKDF2;
+    }
+    if (normalized == "scrypt") {
+        return KeyDerivation::Scrypt;
+    }
+    if (normalized == "argon2" || normalized == "argon2id") {
+        return KeyDerivation::Argon2id;
+    }
+    return std::nullopt;
+}
+
+const char* encryption_mode_name(EncryptionMode mode) {
+    switch (mode) {
+    case EncryptionMode::ECDH:
+        return "ecdh";
+    case EncryptionMode::RSA:
+        return "rsa";
+    }
+    return "ecdh";
+}
+
+std::optional<EncryptionMode> parse_encryption_mode(const std::string& text) {
+    std::string normalized = text;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (normalized.empty() || normalized == "ecdh" || normalized == "default") {
+        return EncryptionMode::ECDH;
+    }
+    if (normalized == "rsa" || normalized == "rsa-oaep") {
+        return EncryptionMode::RSA;
+    }
+    return std::nullopt;
 }
 
 ParsedMessage parse_chat_payload(const net::ChatPayload& payload, const Wallet* wallet) {
@@ -400,11 +748,15 @@ ParsedMessage parse_chat_payload(const net::ChatPayload& payload, const Wallet* 
     parsed.timestamp = payload.timestamp;
     parsed.nonce = payload.nonce;
     parsed.message_id = payload_message_id(payload);
+    parsed.encryption_mode = payload.version >= 4
+        ? static_cast<EncryptionMode>(payload.cipher_profile)
+        : EncryptionMode::ECDH;
 
     if (payload.version < 2) {
         parsed.legacy = true;
         parsed.encrypted = false;
-        parsed.message.assign(payload.body.begin(), payload.body.end());
+        parsed.content = make_text_content(std::string(payload.body.begin(), payload.body.end()));
+        parsed.message = parsed.content.text;
         return parsed;
     }
 
@@ -413,7 +765,8 @@ ParsedMessage parse_chat_payload(const net::ChatPayload& payload, const Wallet* 
     parsed.encrypted = (payload.flags & CHAT_FLAG_ENCRYPTED) != 0;
 
     if (!parsed.encrypted) {
-        parsed.message.assign(payload.body.begin(), payload.body.end());
+        parsed.content = deserialize_content(payload.body);
+        parsed.message = content_summary(parsed.content);
         return parsed;
     }
 
@@ -422,18 +775,35 @@ ParsedMessage parse_chat_payload(const net::ChatPayload& payload, const Wallet* 
         return parsed;
     }
 
-    std::optional<size_t> recipient_idx = wallet_index_for_pubkey(*wallet, payload.recipient_pubkey);
-    if (!recipient_idx) {
-        recipient_idx = wallet_index_for_address(*wallet, payload.recipient);
+    std::array<uint8_t, CHAT_KEY_BYTES> key{};
+    if (parsed.encryption_mode == EncryptionMode::RSA) {
+        bool owns_recipient = false;
+        if (!payload.recipient.empty()) {
+            owns_recipient = wallet_index_for_address(*wallet, payload.recipient).has_value();
+        }
+        if (!owns_recipient && !payload.recipient_pubkey.empty()) {
+            owns_recipient = wallet_index_for_pubkey(*wallet, payload.recipient_pubkey).has_value();
+        }
+        if (!owns_recipient || wallet->chat_rsa_private_key_pem.empty()) {
+            parsed.message = "<encrypted message>";
+            return parsed;
+        }
+        key = rsa_unwrap_session_key(payload.wrapped_key, wallet->chat_rsa_private_key_pem);
+    } else {
+        std::optional<size_t> recipient_idx = wallet_index_for_pubkey(*wallet, payload.recipient_pubkey);
+        if (!recipient_idx) {
+            recipient_idx = wallet_index_for_address(*wallet, payload.recipient);
+        }
+        if (!recipient_idx) {
+            parsed.message = "<encrypted message>";
+            return parsed;
+        }
+        auto shared_secret = derive_shared_secret(wallet->privkeys[*recipient_idx], payload.sender_pubkey);
+        key = derive_chat_key(shared_secret, payload);
     }
-    if (!recipient_idx) {
-        parsed.message = "<encrypted message>";
-        return parsed;
-    }
-
-    auto shared_secret = derive_shared_secret(wallet->privkeys[*recipient_idx], payload.sender_pubkey);
-    auto key = derive_chat_key(shared_secret, payload);
-    parsed.message = aes256_gcm_decrypt(payload.body, key, build_chat_aad(payload), payload.iv, payload.auth_tag);
+    const auto plaintext = aes256_gcm_decrypt(payload.body, key, build_chat_aad(payload), payload.iv, payload.auth_tag);
+    parsed.content = deserialize_content(std::vector<uint8_t>(plaintext.begin(), plaintext.end()));
+    parsed.message = content_summary(parsed.content);
     parsed.decrypted = true;
     return parsed;
 }

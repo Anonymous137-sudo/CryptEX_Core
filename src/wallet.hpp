@@ -29,6 +29,12 @@ public:
         Bip32 = 2,
     };
 
+    enum class KeyDerivation : uint32_t {
+        PBKDF2 = 0,
+        Scrypt = 1,
+        Argon2id = 2,
+    };
+
     struct BalanceSummary {
         int64_t spendable{0};
         int64_t immature{0};
@@ -69,6 +75,8 @@ public:
     std::vector<uint8_t> privkey;
     std::vector<uint8_t> pubkey;
     std::string address;
+    std::string chat_rsa_public_key_pem;
+    std::string chat_rsa_private_key_pem;
     std::vector<std::vector<uint8_t>> privkeys;
     std::vector<std::vector<uint8_t>> pubkeys;
     std::vector<std::string> addresses;
@@ -77,22 +85,27 @@ public:
                              const std::string& path,
                              AddressFormat address_format = AddressFormat::Base64,
                              size_t mnemonic_words = 24,
-                             const std::string& mnemonic_passphrase = "");
+                             const std::string& mnemonic_passphrase = "",
+                             KeyDerivation kdf = KeyDerivation::Argon2id);
     static Wallet create_new(const std::string& password,
                              const std::string& path,
                              size_t mnemonic_words,
-                             const std::string& mnemonic_passphrase = "");
+                             const std::string& mnemonic_passphrase = "",
+                             KeyDerivation kdf = KeyDerivation::Argon2id);
     static Wallet create_from_mnemonic(const std::string& password,
                                        const std::string& path,
                                        const std::string& mnemonic,
                                        AddressFormat address_format = AddressFormat::Base64,
-                                       const std::string& mnemonic_passphrase = "");
+                                       const std::string& mnemonic_passphrase = "",
+                                       KeyDerivation kdf = KeyDerivation::Argon2id);
     static Wallet create_from_mnemonic(const std::string& password,
                                        const std::string& path,
                                        const std::string& mnemonic,
-                                       const std::string& mnemonic_passphrase);
+                                       const std::string& mnemonic_passphrase,
+                                       KeyDerivation kdf = KeyDerivation::Argon2id);
     static Wallet load(const std::string& password, const std::string& path);
     static Wallet recover(const std::string& password, const std::string& path);
+    static KeyDerivation inspect_key_derivation(const std::string& path);
     std::string add_address(const std::string& password, const std::string& path);
     const std::vector<std::string>& all_addresses() const { return addresses; }
     std::vector<std::pair<OutPoint, UTXOEntry>> list_unspent(Blockchain& chain) const;
@@ -104,13 +117,17 @@ public:
                    const std::string& path,
                    const std::string& address,
                    const std::string& label);
+    void set_primary_address(const std::string& password,
+                             const std::string& path,
+                             const std::string& address);
     std::string import_private_key_hex(const std::string& password,
                                        const std::string& path,
                                        const std::string& private_key_hex,
                                        const std::string& label = "");
     void change_password(const std::string& old_password,
                          const std::string& new_password,
-                         const std::string& path);
+                         const std::string& path,
+                         KeyDerivation new_kdf = KeyDerivation::Argon2id);
     void ensure_unused_pool(Blockchain& chain,
                             const std::string& password,
                             const std::string& path,
@@ -129,10 +146,15 @@ public:
                                AddressFormat format);
     const char* hd_mode() const;
     const char* address_format_name() const;
+    const char* kdf_name() const;
+    bool has_chat_rsa_keys() const { return !chat_rsa_public_key_pem.empty() && !chat_rsa_private_key_pem.empty(); }
+    std::string chat_rsa_public_key_b64() const;
     AddressFormat address_format() const { return address_format_; }
+    KeyDerivation key_derivation() const { return key_derivation_; }
     std::string display_address(const std::string& address_value) const;
     std::string display_address(const std::string& address_value, AddressFormat format) const;
     static std::optional<AddressFormat> parse_address_format(const std::string& text);
+    static std::optional<KeyDerivation> parse_key_derivation(const std::string& text);
     size_t rescan(Blockchain& chain,
                   const std::string& password,
                   const std::string& path,
@@ -157,6 +179,7 @@ public:
 private:
     AddressFormat address_format_{AddressFormat::Base64};
     HdScheme hd_scheme_{HdScheme::None};
+    KeyDerivation key_derivation_{KeyDerivation::PBKDF2};
     std::vector<uint8_t> master_seed_;
     std::vector<uint8_t> mnemonic_entropy_;
     uint32_t next_hd_index_{0};
@@ -168,10 +191,12 @@ private:
     void save_encrypted(const std::string& password, const std::string& path) const;
     static Wallet deserialize_plaintext(const std::vector<uint8_t>& plaintext);
     static void persist(const std::string& path,
+                        KeyDerivation kdf,
                         const std::vector<uint8_t>& salt,
                         const std::vector<uint8_t>& iv,
                         const std::vector<uint8_t>& ciphertext);
     static void read_file(const std::string& path,
+                          KeyDerivation& kdf,
                           std::vector<uint8_t>& salt,
                           std::vector<uint8_t>& iv,
                           std::vector<uint8_t>& ciphertext);

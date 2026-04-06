@@ -13,6 +13,9 @@ public:
         QString dataDir;
         QString rpcBind;
         int rpcPort{9332};
+        bool rpcTls{false};
+        QString rpcTlsCertPath;
+        QString rpcTlsKeyPath;
         QString rpcUser;
         QString rpcPassword;
         QString walletPath;
