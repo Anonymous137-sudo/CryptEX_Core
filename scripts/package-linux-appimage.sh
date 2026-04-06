@@ -9,6 +9,7 @@ fi
 ARCH_INPUT="$1"
 ROOT_DIR="$2"
 BUILD_DIR="$3"
+RELEASE_VERSION="${CRYPTEX_RELEASE_VERSION:-0.6.0}"
 
 case "${ARCH_INPUT}" in
   x86_64) ARCH_TAG="x86_64" ;;
@@ -120,7 +121,7 @@ patchelf --set-rpath '$ORIGIN/../lib' "${APPDIR}/usr/bin/cryptexd_linux"
 patchelf --set-rpath '$ORIGIN/../../lib' "${APPDIR}/usr/plugins/platforms/libqxcb.so"
 
 rm -f "${BUILD_DIR}"/*.AppImage
-(cd "${BUILD_DIR}" && VERSION=0.5.3 ARCH="${ARCH_TAG}" "${APPIMAGETOOL_BIN}" "${APPDIR}" >/dev/null)
+(cd "${BUILD_DIR}" && VERSION="${RELEASE_VERSION}" ARCH="${ARCH_TAG}" "${APPIMAGETOOL_BIN}" "${APPDIR}" >/dev/null)
 PRODUCED="$(find "${BUILD_DIR}" -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
 if [[ -z "${PRODUCED}" ]]; then
   echo "AppImage output was not produced" >&2

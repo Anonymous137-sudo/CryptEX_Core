@@ -100,8 +100,13 @@ build_macos_universal() {
 build_windows_x86_64() {
   local openssl_root="${OPENSSL_ROOT_DIR_WIN_X86_64:-}"
   local qt_root="${QT6_ROOT_WIN_X86_64:-}"
+  local opus_root="${OPUS_ROOT_DIR_WIN_X86_64:-}"
   if [[ -z "${openssl_root}" ]]; then
     record_skipped "windows-x86_64" "set OPENSSL_ROOT_DIR_WIN_X86_64 to a Windows x86_64 OpenSSL prefix"
+    return 0
+  fi
+  if [[ -z "${opus_root}" ]]; then
+    record_skipped "windows-x86_64" "set OPUS_ROOT_DIR_WIN_X86_64 to a Windows x86_64 Opus prefix"
     return 0
   fi
   local build_dir="${BUILD_ROOT}/windows-x86_64"
@@ -110,7 +115,8 @@ build_windows_x86_64() {
     -DCMAKE_TOOLCHAIN_FILE="${ROOT_DIR}/toolchains/mingw-w64-x86_64.cmake" \
     ${qt_root:+-DCMAKE_PREFIX_PATH="${qt_root}"} \
     ${qt_root:+-DQT_HOST_PATH="/opt/homebrew/opt/qt"} \
-    -DOPENSSL_ROOT_DIR="${openssl_root}" >/dev/null
+    -DOPENSSL_ROOT_DIR="${openssl_root}" \
+    -DOPUS_ROOT_DIR="${opus_root}" >/dev/null
   if [[ -n "${qt_root}" ]]; then
     cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
   else
@@ -126,8 +132,13 @@ build_windows_x86_64() {
 build_windows_arm64() {
   local openssl_root="${OPENSSL_ROOT_DIR_WIN_ARM64:-}"
   local qt_root="${QT6_ROOT_WIN_ARM64:-}"
+  local opus_root="${OPUS_ROOT_DIR_WIN_ARM64:-}"
   if [[ -z "${openssl_root}" ]]; then
     record_skipped "windows-arm64" "set OPENSSL_ROOT_DIR_WIN_ARM64 to a Windows ARM64 OpenSSL prefix"
+    return 0
+  fi
+  if [[ -z "${opus_root}" ]]; then
+    record_skipped "windows-arm64" "set OPUS_ROOT_DIR_WIN_ARM64 to a Windows ARM64 Opus prefix"
     return 0
   fi
   if [[ -z "${MINGW_W64_ARM64_ROOT:-}" && -z "${LLVM_MINGW_ROOT:-}" ]]; then
@@ -140,7 +151,8 @@ build_windows_arm64() {
     -DCMAKE_TOOLCHAIN_FILE="${ROOT_DIR}/toolchains/mingw-w64-arm64.cmake" \
     ${qt_root:+-DCMAKE_PREFIX_PATH="${qt_root}"} \
     ${qt_root:+-DQT_HOST_PATH="/opt/homebrew/opt/qt"} \
-    -DOPENSSL_ROOT_DIR="${openssl_root}" >/dev/null
+    -DOPENSSL_ROOT_DIR="${openssl_root}" \
+    -DOPUS_ROOT_DIR="${opus_root}" >/dev/null
   if [[ -n "${qt_root}" ]]; then
     cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
   else
@@ -167,9 +179,10 @@ build_linux_target() {
   fi
   local build_dir="/src/build-release/linux-${arch}"
   docker run --rm --platform "${platform}" \
-    -v "${ROOT_DIR}:/src" -w /src golang:1.24-bookworm bash -lc \
+    -e DEBIAN_FRONTEND=noninteractive \
+    -v "${ROOT_DIR}:/src" -w /src golang:1.24-trixie bash -lc \
     "apt-get update >/dev/null && \
-     apt-get install -y g++ gcc cmake libssl-dev libboost-system-dev zlib1g-dev qt6-base-dev git squashfs-tools desktop-file-utils patchelf file >/dev/null && \
+     apt-get install -y g++ gcc cmake libssl-dev libboost-system-dev libopus-dev zlib1g-dev qt6-base-dev qt6-multimedia-dev git squashfs-tools desktop-file-utils patchelf file >/dev/null && \
      export CC=/usr/bin/gcc CXX=/usr/bin/g++ && \
      rm -rf ${build_dir} && \
      cmake -S /src -B ${build_dir} -DCMAKE_BUILD_TYPE=Release >/dev/null && \
