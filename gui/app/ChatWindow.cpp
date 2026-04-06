@@ -11,15 +11,38 @@
 #include "views/ChatTheme.hpp"
 #include "rpc/RpcClient.hpp"
 
+#include <QFrame>
+#include <QScrollArea>
+#include <QSizePolicy>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QVBoxLayout>
+
+namespace {
+
+QWidget* wrapMessengerPage(QWidget* page, QWidget* parent) {
+    auto* scroll = new QScrollArea(parent);
+    scroll->setWidget(page);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scroll->setSizeAdjustPolicy(QAbstractScrollArea::AdjustToContentsOnFirstShow);
+    scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    scroll->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    page->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    scroll->setStyleSheet(QStringLiteral("QScrollArea { background: transparent; border: none; }"));
+    return scroll;
+}
+
+} // namespace
 
 ChatWindow::ChatWindow(QWidget* parent)
     : QDialog(parent) {
     setWindowTitle(QStringLiteral("P2P Messenger"));
     resize(980, 680);
     setMinimumSize(820, 560);
+    setSizeGripEnabled(true);
     chatui::applyCyberpunkTheme(this);
 
     auto* root = new QVBoxLayout(this);
@@ -29,6 +52,7 @@ ChatWindow::ChatWindow(QWidget* parent)
     tabs_ = new QTabWidget(this);
     tabs_->tabBar()->setDocumentMode(true);
     tabs_->tabBar()->setExpanding(false);
+    tabs_->tabBar()->setUsesScrollButtons(true);
     root->addWidget(tabs_);
 
     publicChatPage_ = new ChatPage(ChatPage::ViewMode::PublicOnly, tabs_);
@@ -71,7 +95,18 @@ ChatWindow::ChatWindow(QWidget* parent)
                 privateChatPage_->setPrivateRecipient(address, pubkey, peer, draft);
                 showSection(QStringLiteral("private"));
             });
+    connect(publicDirectoryPage_, &PublicDirectoryPage::messageRequested,
+            this, [this](const QString& address, const QString& pubkey, const QString& peer) {
+                composePrivateMessage(address, pubkey, peer, QString());
+            });
+    connect(publicDirectoryPage_, &PublicDirectoryPage::callRequested,
+            this, [this](const QString& address, const QString& pubkey, const QString& peer) {
+                voiceCallPage_->setCallTarget(address, pubkey, peer);
+                showSection(QStringLiteral("voice-call"));
+                voiceCallPage_->refresh();
+            });
     connect(tabs_, &QTabWidget::currentChanged, this, [this](int) {
+        refreshCurrentSection();
         emit sectionChanged(currentSection());
     });
 }
@@ -91,12 +126,18 @@ void ChatWindow::setRpcClient(RpcClient* client) {
 void ChatWindow::setSection(const QString& key, const QString& label, QWidget* page) {
     if (!tabs_ || !page) return;
     page->setParent(tabs_);
-    indices_.insert(key, tabs_->addTab(page, label));
+    indices_.insert(key, tabs_->addTab(wrapMessengerPage(page, tabs_), label));
 }
 
 void ChatWindow::showSection(const QString& key) {
+    bool changedTab = false;
     if (!key.isEmpty() && indices_.contains(key)) {
-        tabs_->setCurrentIndex(indices_.value(key));
+        const int targetIndex = indices_.value(key);
+        changedTab = tabs_->currentIndex() != targetIndex;
+        tabs_->setCurrentIndex(targetIndex);
+    }
+    if (!changedTab) {
+        refreshCurrentSection();
     }
     show();
     raise();

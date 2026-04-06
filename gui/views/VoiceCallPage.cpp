@@ -9,6 +9,7 @@
 #include <QAudioSource>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
 #include <QFrame>
 #include <QFormLayout>
@@ -24,8 +25,11 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -79,7 +83,8 @@ class VoiceWaveformView final : public QWidget {
 public:
     explicit VoiceWaveformView(QWidget* parent = nullptr)
         : QWidget(parent) {
-        setMinimumHeight(180);
+        setMinimumHeight(200);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     }
 
     void setOutgoingLevels(const QVector<float>& levels) {
@@ -383,6 +388,8 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     heroLayout->setContentsMargins(14, 14, 14, 14);
     heroLayout->setHorizontalSpacing(14);
     heroLayout->setVerticalSpacing(10);
+    heroLayout->setColumnStretch(1, 3);
+    heroLayout->setColumnStretch(2, 2);
 
     avatarLabel_ = new QLabel(hero);
     avatarLabel_->setPixmap(anonymousAvatarPixmap(QSize(120, 120)));
@@ -430,13 +437,27 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     lowerLayout->setSpacing(10);
 
     auto* configBox = new QGroupBox(QStringLiteral("Call Setup"), lowerPane);
+    configBox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     auto* configLayout = new QFormLayout(configBox);
     configLayout->setContentsMargins(12, 12, 12, 12);
     configLayout->setHorizontalSpacing(10);
     configLayout->setVerticalSpacing(8);
+    configLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    configLayout->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    configLayout->setFormAlignment(Qt::AlignTop);
+    configLayout->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
 
-    recipientEdit_ = new QLineEdit(lowerPane);
-    recipientEdit_->setPlaceholderText(QStringLiteral("Recipient blockchain address"));
+    recipientCombo_ = new QComboBox(lowerPane);
+    recipientCombo_->setEditable(true);
+    recipientCombo_->setInsertPolicy(QComboBox::NoInsert);
+    recipientCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
+    if (recipientCombo_->lineEdit()) {
+        recipientCombo_->lineEdit()->setPlaceholderText(QStringLiteral("Choose a saved contact or paste an address"));
+    }
+    recipientSummaryValue_ = new QLabel(QStringLiteral("Choose a saved contact or paste an address. Raw keys stay under manual overrides."), lowerPane);
+    recipientSummaryValue_->setObjectName(QStringLiteral("audioTranscriptStatus"));
+    recipientSummaryValue_->setWordWrap(true);
+    recipientSummaryValue_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     recipientPubkeyEdit_ = new QLineEdit(lowerPane);
     recipientPubkeyEdit_->setPlaceholderText(QStringLiteral("Recipient secp256k1 pubkey (Base64)"));
     peerEdit_ = new QLineEdit(lowerPane);
@@ -446,10 +467,28 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     obfuscateCheck_ = new QCheckBox(QStringLiteral("Apply live voice cloak before transmit"), lowerPane);
     obfuscateCheck_->setChecked(true);
 
-    configLayout->addRow(QStringLiteral("Recipient Address"), recipientEdit_);
-    configLayout->addRow(QStringLiteral("Recipient Pubkey"), recipientPubkeyEdit_);
-    configLayout->addRow(QStringLiteral("Direct Peer"), peerEdit_);
-    configLayout->addRow(QStringLiteral("From Address"), fromAddressEdit_);
+    overrideToggleButton_ = new QToolButton(lowerPane);
+    overrideToggleButton_->setCheckable(true);
+    overrideToggleButton_->setChecked(false);
+    overrideToggleButton_->setText(QStringLiteral("Show Manual Overrides"));
+    overrideToggleButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+
+    overridePanel_ = new QWidget(lowerPane);
+    overridePanel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    overrideLayout_ = new QFormLayout(overridePanel_);
+    overrideLayout_->setContentsMargins(0, 0, 0, 0);
+    overrideLayout_->setSpacing(6);
+    overrideLayout_->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    overrideLayout_->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    overrideLayout_->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+    overrideLayout_->addRow(QStringLiteral("Recipient Pubkey"), recipientPubkeyEdit_);
+    overrideLayout_->addRow(QStringLiteral("Direct Peer Override"), peerEdit_);
+    overrideLayout_->addRow(QStringLiteral("From Address"), fromAddressEdit_);
+
+    configLayout->addRow(QStringLiteral("Recipient / Contact"), recipientCombo_);
+    configLayout->addRow(QStringLiteral("Recipient Status"), recipientSummaryValue_);
+    configLayout->addRow(QString(), overrideToggleButton_);
+    configLayout->addRow(QString(), overridePanel_);
     configLayout->addRow(QStringLiteral("Transport"), new QLabel(QStringLiteral("Chat signaling -> ECDH session -> AES-GCM frames -> Opus")));
     configLayout->addRow(QString(), obfuscateCheck_);
     lowerLayout->addWidget(configBox);
@@ -478,6 +517,8 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     mainSplitter->addWidget(lowerPane);
     mainSplitter->setStretchFactor(0, 3);
     mainSplitter->setStretchFactor(1, 2);
+    mainSplitter->setOpaqueResize(true);
+    mainSplitter->setSizes({360, 320});
 
     stateTimer_ = new QTimer(this);
     stateTimer_->setInterval(1000);
@@ -489,6 +530,21 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     connect(stateTimer_, &QTimer::timeout, this, [this]() { pollState(); });
     connect(audioTimer_, &QTimer::timeout, this, [this]() { pollIncomingAudio(); });
     connect(clockTimer_, &QTimer::timeout, this, [this]() { updateLiveTimestamp(); });
+    connect(recipientCombo_, &QComboBox::currentTextChanged, this, [this](const QString&) {
+        clearResolvedRecipient();
+        updateRecipientSummary();
+    });
+    connect(recipientCombo_, qOverload<int>(&QComboBox::activated), this, [this](int) { resolveCurrentRecipient(false); });
+    if (recipientCombo_->lineEdit()) {
+        connect(recipientCombo_->lineEdit(), &QLineEdit::editingFinished, this, [this]() { resolveCurrentRecipient(false); });
+    }
+    connect(overrideToggleButton_, &QToolButton::toggled, this, [this](bool checked) {
+        overrideToggleButton_->setText(checked ? QStringLiteral("Hide Manual Overrides")
+                                               : QStringLiteral("Show Manual Overrides"));
+        overridePanel_->setVisible(checked);
+    });
+    connect(peerEdit_, &QLineEdit::textChanged, this, [this](const QString&) { updateRecipientSummary(); });
+    connect(recipientPubkeyEdit_, &QLineEdit::textChanged, this, [this](const QString&) { updateRecipientSummary(); });
     connect(startButton_, &QPushButton::clicked, this, [this]() { startCall(); });
     connect(acceptButton_, &QPushButton::clicked, this, [this]() { acceptCall(); });
     connect(declineButton_, &QPushButton::clicked, this, [this]() { declineCall(); });
@@ -498,27 +554,49 @@ VoiceCallPage::VoiceCallPage(QWidget* parent)
     stateTimer_->start();
     audioTimer_->start();
     clockTimer_->start();
+    overridePanel_->setVisible(false);
+    updateRecipientSummary();
     updateControls();
 }
 
 void VoiceCallPage::setRpcClient(RpcClient* client) {
     rpc_ = client;
-    refresh();
+    if (hasConfiguredRpcTarget()) {
+        refresh();
+    } else {
+        setStatus(QStringLiteral("Voice relay is waiting for the backend connection."));
+    }
 }
 
 void VoiceCallPage::setCallTarget(const QString& address,
                                   const QString& pubkeyB64,
                                   const QString& peer) {
-    recipientEdit_->setText(address.trimmed());
-    recipientPubkeyEdit_->setText(pubkeyB64.trimmed());
-    if (!peer.trimmed().isEmpty()) {
-        peerEdit_->setText(peer.trimmed());
+    recipientCombo_->setCurrentText(address.trimmed());
+    resolvedRecipientPubkey_ = pubkeyB64.trimmed();
+    resolvedPeerHint_ = peer.trimmed();
+    resolvedRecipientLabel_.clear();
+    resolvedRecipientSource_ = resolvedRecipientPubkey_.isEmpty() ? QString() : QStringLiteral("private-manager");
+    updateRecipientSummary();
+    if (resolvedRecipientPubkey_.isEmpty()) {
+        resolveCurrentRecipient(false);
     }
-    recipientEdit_->setFocus();
+    recipientCombo_->setFocus();
 }
 
 void VoiceCallPage::refresh() {
+    if (!hasConfiguredRpcTarget()) {
+        setStatus(QStringLiteral("Voice relay is waiting for the backend connection."));
+        return;
+    }
+    refreshKnownRecipients();
+    resolveCurrentRecipient(false);
     pollState();
+}
+
+bool VoiceCallPage::hasConfiguredRpcTarget() const {
+    return rpc_ &&
+           rpc_->settings().url.isValid() &&
+           !rpc_->settings().url.isEmpty();
 }
 
 void VoiceCallPage::setStatus(const QString& text, bool error) {
@@ -526,25 +604,160 @@ void VoiceCallPage::setStatus(const QString& text, bool error) {
     statusValue_->setStyleSheet(error ? chatui::errorColorStyle() : QString());
 }
 
+void VoiceCallPage::setOverrideRowVisible(QWidget* field, bool visible) {
+    if (!field) return;
+    field->setVisible(visible);
+    if (!overrideLayout_) return;
+    if (auto* label = overrideLayout_->labelForField(field)) {
+        label->setVisible(visible);
+    }
+}
+
+void VoiceCallPage::refreshKnownRecipients() {
+    if (!hasConfiguredRpcTarget() || !recipientCombo_) {
+        return;
+    }
+    const QString currentText = recipientCombo_->currentText();
+    rpc_->call(QStringLiteral("getchatprivatecontacts"), {}, this,
+               [this, currentText](const QJsonValue& result) {
+                   const auto rows = result.toArray();
+                   QSignalBlocker blocker(recipientCombo_);
+                   recipientCombo_->clear();
+                   for (const auto& value : rows) {
+                       const auto obj = value.toObject();
+                       const QString address = obj.value(QStringLiteral("address")).toString().trimmed();
+                       if (address.isEmpty()) {
+                           continue;
+                       }
+                       const QString label = obj.value(QStringLiteral("label")).toString().trimmed();
+                       const QString display = label.isEmpty()
+                           ? address
+                           : QStringLiteral("%1 — %2").arg(label, address);
+                       recipientCombo_->addItem(display, address);
+                   }
+                   recipientCombo_->setCurrentText(currentText);
+               },
+               [this](const QString& error) {
+                   setStatus(error, true);
+               });
+}
+
+QString VoiceCallPage::currentRecipientAddress() const {
+    if (!recipientCombo_) {
+        return QString();
+    }
+    const QString currentText = recipientCombo_->currentText().trimmed();
+    const int index = recipientCombo_->currentIndex();
+    if (index >= 0) {
+        const QString itemText = recipientCombo_->itemText(index).trimmed();
+        const QString itemAddress = recipientCombo_->itemData(index).toString().trimmed();
+        if (!itemAddress.isEmpty() && (currentText == itemText || currentText == itemAddress || currentText.endsWith(itemAddress))) {
+            return itemAddress;
+        }
+    }
+    return currentText;
+}
+
+QString VoiceCallPage::effectiveRecipientPubkey() const {
+    const auto manual = recipientPubkeyEdit_->text().trimmed();
+    return manual.isEmpty() ? resolvedRecipientPubkey_ : manual;
+}
+
+QString VoiceCallPage::effectivePeerOverride() const {
+    const auto manual = peerEdit_->text().trimmed();
+    return manual.isEmpty() ? resolvedPeerHint_ : manual;
+}
+
+void VoiceCallPage::clearResolvedRecipient() {
+    resolvedRecipientPubkey_.clear();
+    resolvedPeerHint_.clear();
+    resolvedRecipientLabel_.clear();
+    resolvedRecipientSource_.clear();
+}
+
+void VoiceCallPage::updateRecipientSummary() {
+    if (!recipientSummaryValue_) {
+        return;
+    }
+    const auto address = currentRecipientAddress();
+    if (address.isEmpty()) {
+        recipientSummaryValue_->setText(QStringLiteral("Choose a saved contact or paste an address. Raw keys stay under manual overrides."));
+        return;
+    }
+    QStringList details;
+    if (!resolvedRecipientLabel_.isEmpty()) {
+        details << QStringLiteral("Contact: %1").arg(resolvedRecipientLabel_);
+    }
+    if (!resolvedRecipientSource_.isEmpty()) {
+        details << QStringLiteral("Source: %1").arg(resolvedRecipientSource_);
+    }
+    if (!effectiveRecipientPubkey().isEmpty()) {
+        details << QStringLiteral("ECDH call key ready");
+    }
+    if (!effectivePeerOverride().isEmpty()) {
+        details << QStringLiteral("Peer hint: %1").arg(effectivePeerOverride());
+    }
+    if (details.isEmpty()) {
+        recipientSummaryValue_->setText(QStringLiteral("No stored call key is known for %1 yet. Manual overrides stay available if you need them.").arg(address));
+        return;
+    }
+    recipientSummaryValue_->setText(details.join(QStringLiteral(" | ")));
+}
+
+void VoiceCallPage::resolveCurrentRecipient(bool userVisible) {
+    if (!hasConfiguredRpcTarget()) {
+        if (userVisible) {
+            setStatus(QStringLiteral("Voice relay needs a configured backend RPC target before it can resolve contacts."), true);
+        }
+        return;
+    }
+    const auto address = currentRecipientAddress();
+    if (address.isEmpty()) {
+        clearResolvedRecipient();
+        updateRecipientSummary();
+        return;
+    }
+    rpc_->call(QStringLiteral("resolvechatrecipient"), QJsonArray{address}, this,
+               [this, userVisible](const QJsonValue& result) {
+                   const auto obj = result.toObject();
+                   resolvedRecipientPubkey_ = obj.value(QStringLiteral("pubkey_b64")).toString().trimmed();
+                   resolvedPeerHint_ = obj.value(QStringLiteral("peer")).toString().trimmed();
+                   resolvedRecipientLabel_ = obj.value(QStringLiteral("label")).toString().trimmed();
+                   resolvedRecipientSource_ = obj.value(QStringLiteral("source")).toString().trimmed();
+                   updateRecipientSummary();
+                   if (userVisible) {
+                       setStatus(obj.value(QStringLiteral("voice_ready")).toBool()
+                                     ? QStringLiteral("Voice call target resolved automatically.")
+                                     : QStringLiteral("No stored voice-call key was found. Manual overrides remain available."));
+                   }
+               },
+               [this, userVisible](const QString& error) {
+                   clearResolvedRecipient();
+                   updateRecipientSummary();
+                   if (userVisible) {
+                       setStatus(error, true);
+                   }
+               });
+}
+
 void VoiceCallPage::startCall() {
-    if (!rpc_) {
-        setStatus(QStringLiteral("RPC client not configured."), true);
+    if (!hasConfiguredRpcTarget()) {
+        setStatus(QStringLiteral("Backend RPC target is not configured. Open Settings, connect the backend, then start the call again."), true);
         return;
     }
-    if (recipientEdit_->text().trimmed().isEmpty()) {
+    const auto recipientAddress = currentRecipientAddress();
+    if (recipientAddress.isEmpty()) {
         setStatus(QStringLiteral("Recipient address is required to start a voice call."), true);
-        return;
-    }
-    if (recipientPubkeyEdit_->text().trimmed().isEmpty()) {
-        setStatus(QStringLiteral("Recipient pubkey is required for secure voice calls."), true);
         return;
     }
 
     QJsonObject request;
-    request.insert(QStringLiteral("recipient_address"), recipientEdit_->text().trimmed());
-    request.insert(QStringLiteral("recipient_pubkey_b64"), recipientPubkeyEdit_->text().trimmed());
-    if (!peerEdit_->text().trimmed().isEmpty()) {
-        request.insert(QStringLiteral("peer"), peerEdit_->text().trimmed());
+    request.insert(QStringLiteral("recipient_address"), recipientAddress);
+    if (!effectiveRecipientPubkey().isEmpty()) {
+        request.insert(QStringLiteral("recipient_pubkey_b64"), effectiveRecipientPubkey());
+    }
+    if (!effectivePeerOverride().isEmpty()) {
+        request.insert(QStringLiteral("peer"), effectivePeerOverride());
     }
     if (!fromAddressEdit_->text().trimmed().isEmpty()) {
         request.insert(QStringLiteral("from_address"), fromAddressEdit_->text().trimmed());
@@ -561,7 +774,10 @@ void VoiceCallPage::startCall() {
 }
 
 void VoiceCallPage::acceptCall() {
-    if (!rpc_) return;
+    if (!hasConfiguredRpcTarget()) {
+        setStatus(QStringLiteral("Backend RPC target is not configured. Open Settings and reconnect first."), true);
+        return;
+    }
     setStatus(QStringLiteral("Accepting voice call…"));
     rpc_->call(QStringLiteral("acceptvoicecall"), {}, this,
                [this](const QJsonValue& result) {
@@ -572,7 +788,10 @@ void VoiceCallPage::acceptCall() {
 }
 
 void VoiceCallPage::declineCall() {
-    if (!rpc_) return;
+    if (!hasConfiguredRpcTarget()) {
+        setStatus(QStringLiteral("Backend RPC target is not configured. Open Settings and reconnect first."), true);
+        return;
+    }
     rpc_->call(QStringLiteral("declinevoicecall"), {}, this,
                [this](const QJsonValue& result) {
                    updateUiFromState(result.toObject());
@@ -582,7 +801,10 @@ void VoiceCallPage::declineCall() {
 }
 
 void VoiceCallPage::endCall() {
-    if (!rpc_) return;
+    if (!hasConfiguredRpcTarget()) {
+        setStatus(QStringLiteral("Backend RPC target is not configured. Open Settings and reconnect first."), true);
+        return;
+    }
     rpc_->call(QStringLiteral("endvoicecall"), {}, this,
                [this](const QJsonValue& result) {
                    updateUiFromState(result.toObject());
@@ -592,7 +814,7 @@ void VoiceCallPage::endCall() {
 }
 
 void VoiceCallPage::pollState() {
-    if (!rpc_ || pollingState_) {
+    if (!hasConfiguredRpcTarget() || pollingState_) {
         return;
     }
     pollingState_ = true;
@@ -600,6 +822,9 @@ void VoiceCallPage::pollState() {
                [this](const QJsonValue& result) {
                    pollingState_ = false;
                    updateUiFromState(result.toObject());
+                   if (!state_.value(QStringLiteral("active")).toBool()) {
+                       setStatus(QStringLiteral("Voice relay ready."));
+                   }
                },
                [this](const QString& error) {
                    pollingState_ = false;
@@ -608,7 +833,7 @@ void VoiceCallPage::pollState() {
 }
 
 void VoiceCallPage::pollIncomingAudio() {
-    if (!rpc_ || pollingAudio_ || !state_.value(QStringLiteral("active")).toBool() || !state_.value(QStringLiteral("connected")).toBool()) {
+    if (!hasConfiguredRpcTarget() || pollingAudio_ || !state_.value(QStringLiteral("active")).toBool() || !state_.value(QStringLiteral("connected")).toBool()) {
         return;
     }
     pollingAudio_ = true;
@@ -691,11 +916,12 @@ void VoiceCallPage::updateControls() {
     const bool ringing = state_.value(QStringLiteral("ringing")).toBool();
     const bool connected = state_.value(QStringLiteral("connected")).toBool();
     const bool setupEditable = !active;
-    recipientEdit_->setEnabled(setupEditable);
+    recipientCombo_->setEnabled(setupEditable);
     recipientPubkeyEdit_->setEnabled(setupEditable);
     peerEdit_->setEnabled(setupEditable);
     fromAddressEdit_->setEnabled(setupEditable);
     obfuscateCheck_->setEnabled(setupEditable);
+    overrideToggleButton_->setEnabled(setupEditable);
 
     startButton_->setEnabled(rpc_ && !active);
     acceptButton_->setEnabled(rpc_ && active && incoming && ringing && !connected);

@@ -17,6 +17,7 @@ class TerminalPage;
 class NodeWindow;
 class ChatWindow;
 class WalletManagerWindow;
+class QAction;
 class QComboBox;
 class QCheckBox;
 class QLineEdit;
@@ -99,6 +100,8 @@ private:
     QString guessedDaemonPath() const;
     void setConnectionStatus(const QString& text, bool error = false);
     void refreshCheckpointManager();
+    void setAdvancedModeEnabled(bool enabled);
+    void applyAdvancedModeUi();
 
     RpcClient rpc_;
     DaemonController daemon_;
@@ -114,6 +117,7 @@ private:
     QLineEdit* rpcTlsCaPathEdit_{nullptr};
     QLineEdit* daemonPathEdit_{nullptr};
     QLineEdit* dataDirEdit_{nullptr};
+    QCheckBox* advancedModeCheck_{nullptr};
     QWidget* walletManagerPage_{nullptr};
     QLabel* walletRootValue_{nullptr};
     QLineEdit* walletNameEdit_{nullptr};
@@ -189,6 +193,9 @@ private:
     QToolButton* peerActivityButton_{nullptr};
     QToolButton* networkActivityButton_{nullptr};
     QToolButton* topRefreshButton_{nullptr};
+    QAction* openNodeAction_{nullptr};
+    QAction* openChatAction_{nullptr};
+    QAction* advancedModeAction_{nullptr};
     QPushButton* createWalletButton_{nullptr};
     QPushButton* openWalletButton_{nullptr};
     QPushButton* closeWalletButton_{nullptr};
@@ -217,6 +224,7 @@ private:
     int validatedPeerCount_{0};
     bool networkSyncing_{false};
     bool networkActive_{true};
+    bool advancedModeEnabled_{false};
     int connectedPeerCount_{0};
     int startupProgressPulseValue_{220};
     int startupProgressPulseDirection_{1};

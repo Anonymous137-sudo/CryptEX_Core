@@ -1657,6 +1657,14 @@ static void test_rpc_service() {
     assert(private_contacts_resp.find("Ops Relay") != std::string::npos);
     assert(private_contacts_resp.find(external_key.address) != std::string::npos);
 
+    auto resolve_private_contact_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":451,"method":"resolvechatrecipient","params":[")") +
+        external_key.address + R"("]})",
+        stop_requested);
+    assert(resolve_private_contact_resp.find("\"found\":true") != std::string::npos);
+    assert(resolve_private_contact_resp.find("\"voice_ready\":true") != std::string::npos);
+    assert(resolve_private_contact_resp.find(crypto::base64_encode(external_key.pub)) != std::string::npos);
+
     auto set_proxy_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":46,"method":"setchatproxyconfig","params":[{"enabled":true,"host":"127.0.0.1","port":9050,"remote_dns":true}]})",
         stop_requested);
@@ -1678,6 +1686,14 @@ static void test_rpc_service() {
     assert(send_private_resp.find("\"status\":\"no-peer\"") != std::string::npos);
     assert(send_private_resp.find("\"messageid\":\"") != std::string::npos);
     assert(send_private_resp.find("\"kdf\":\"scrypt\"") != std::string::npos);
+
+    auto send_private_resolved_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":521,"method":"sendchatprivate","params":[{"recipient_address":")") +
+        external_key.address +
+        R"(","message":"resolved quiet hello"}]})",
+        stop_requested);
+    assert(send_private_resolved_resp.find("\"status\":\"no-peer\"") != std::string::npos);
+    assert(send_private_resolved_resp.find("\"messageid\":\"") != std::string::npos);
 
     auto set_irc_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":48,"method":"setircconfig","params":[{"enabled":true,"server":"irc.example.net","port":6667,"nick":"cryptex-dev","username":"cryptex","realname":"CryptEX","channel":"#cryptex"}]})",

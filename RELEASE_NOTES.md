@@ -1,13 +1,18 @@
-# CryptEX v0.5.3 Release Notes
+# CryptEX v0.6.0 Release Notes
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 
-These notes describe the CryptEX v0.5.3 release as of April 2026. The project now spans the native chain, desktop GUI, wallet and RPC stack, networking and sync infrastructure, website, and the wrapped-asset EVM workspace.
+These notes describe the CryptEX v0.6.0 release as of April 2026. The project now spans the native chain, desktop GUI, wallet and RPC stack, networking and sync infrastructure, website, and the wrapped-asset EVM workspace.
 
 ## Featured Changes
 
 - Full **SHA3-512 proof of work** with **512-bit target math** and cumulative-work chain selection
 - Separate **Qt GUI** and **backend daemon** with a wallet-first desktop flow and a dedicated node window
+- New **Advanced Mode** toggle that keeps the default desktop flow simpler while unlocking the Node Window and P2P Messenger for power users
+- Major **P2P Messenger** overhaul with address-first recipient resolution, separate public/private/forum/voice sections, and responsive layouts
+- New **secure voice relay** path using chat signaling, capability exchange, ECDH-derived session keys, AES-GCM frame encryption, Opus audio, and optional voice cloaking
+- Public blockchain address directory actions for **Message**, **Call**, and **Save Contact**
+- New forum-style public feed, separate private history, and improved media workflows with dedicated composer windows
 - Hybrid adaptive difficulty controller combining **LWMA**, **EMA**, **real-time overdue easing**, and **emergency minimum-difficulty recovery**
 - Expanded wallet system with encrypted storage, HD support, recovery tooling, multiple address encodings, and wallet management RPCs
 - Stronger network stack with peer persistence, bans, DNS bootstrap, **LAN/WLAN auto-discovery**, peer activity controls, and sync-aware mining
@@ -110,12 +115,15 @@ Advanced functionality is moved into a separate **Node Window**, including:
 Desktop improvements include:
 
 - wallet-first layout inspired by Bitcoin Core structure
+- Advanced Mode toggle for expert tooling instead of exposing every operator surface by default
 - startup splash and sync-details behavior
 - bottom sync / peer / network activity indicators
 - explicit node controls separated from ordinary wallet use
 - address-format chooser dialogs
 - improved wallet table stability and reduced refresh churn
 - refresh-on-open behavior instead of heavy background refresh loops
+- more resilient RPC-startup handling so backend wiring states do not show up as false messenger/call errors
+- resizable messenger layouts with scroll-wrapped tabs, wrapped forms, and sane splitter defaults
 
 ## Networking and Synchronization
 
@@ -171,8 +179,30 @@ Current chat support includes:
 - encrypted private chat
 - inbox/history retrieval
 - peer-routed delivery
+- address-first recipient resolution from private contacts and the public directory
+- forum-style public feed with full-post drill-down and local deletion controls
+- separate private history view
+- public directory actions to message, call, or save known chain addresses
+- responsive media flows for image, video, and audio attachments through dedicated composer windows
 
 Private chat currently uses an ECDH-derived AES-256-GCM session flow bound to recipient key material.
+
+## Voice Relay
+
+`P2P Messenger` now includes a dedicated voice-call page for live, address-to-address encrypted relay calls.
+
+Current voice relay support includes:
+
+- chat-based signaling for call setup
+- capability exchange during negotiation
+- ECDH-derived shared session keys
+- AES-256-GCM encrypted audio frames
+- Opus audio transport
+- optional live voice cloaking before encryption
+- anonymous avatar / waveform UI
+- active-call-only state, with no call logs or recordings persisted
+
+The current implementation is designed around secure decentralized relay behavior first. It is functional, but still improving in latency-sensitive and NAT-hostile environments.
 
 ## Storage and Persistence
 
@@ -257,6 +287,7 @@ The current implementation is substantial, but a few areas are still improving:
 - side-branch persistence and archival completeness are improving relative to long-lived production networks
 - some wallet cryptography code paths still emit OpenSSL deprecation warnings on newer toolchains
 - RPC transport is authenticated HTTP, not TLS-secured remote transport
+- messenger and voice relay UX are now significantly stronger, but presence, transport latency, and richer thread semantics are still evolving
 - the EVM bridge stack is present and documented, but operational rollout still depends on reserve management and deployment policy
 - the project has broad regression coverage, but continued hardening and cleanup remain active engineering work
 

@@ -8,6 +8,9 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QCheckBox;
+class QComboBox;
+class QFormLayout;
+class QToolButton;
 class QTimer;
 class QAudioSource;
 class QAudioSink;
@@ -26,6 +29,7 @@ public:
                        const QString& peer = QString());
 
 private:
+    bool hasConfiguredRpcTarget() const;
     void setStatus(const QString& text, bool error = false);
     void startCall();
     void acceptCall();
@@ -42,10 +46,22 @@ private:
     void queueIncomingFrame(const QJsonObject& frame);
     void resetWaveforms();
     void updateQualityIndicators();
+    void refreshKnownRecipients();
+    void resolveCurrentRecipient(bool userVisible = false);
+    QString currentRecipientAddress() const;
+    QString effectiveRecipientPubkey() const;
+    QString effectivePeerOverride() const;
+    void clearResolvedRecipient();
+    void updateRecipientSummary();
+    void setOverrideRowVisible(QWidget* field, bool visible);
 
     RpcClient* rpc_{nullptr};
     QJsonObject state_;
     QString activeCallId_;
+    QString resolvedRecipientPubkey_;
+    QString resolvedPeerHint_;
+    QString resolvedRecipientLabel_;
+    QString resolvedRecipientSource_;
     bool pollingState_{false};
     bool pollingAudio_{false};
     int audioSendInFlight_{0};
@@ -66,7 +82,11 @@ private:
     QLabel* qualityValue_{nullptr};
     QWidget* waveformView_{nullptr};
 
-    QLineEdit* recipientEdit_{nullptr};
+    QComboBox* recipientCombo_{nullptr};
+    QLabel* recipientSummaryValue_{nullptr};
+    QFormLayout* overrideLayout_{nullptr};
+    QWidget* overridePanel_{nullptr};
+    QToolButton* overrideToggleButton_{nullptr};
     QLineEdit* recipientPubkeyEdit_{nullptr};
     QLineEdit* peerEdit_{nullptr};
     QLineEdit* fromAddressEdit_{nullptr};

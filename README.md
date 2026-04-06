@@ -1,6 +1,6 @@
 # CryptEX
 
-Current release: `v0.5.3`
+Current release: `v0.6.0`
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 
@@ -17,7 +17,9 @@ CryptEX is a C++ SHA3-512 cryptocurrency with full 512-bit proof-of-work math, a
 - Multi-threaded solo mining with sync-before-mining behavior and `--block-cycles`
 - P2P networking with peer exchange, DNS seeds, LAN/WLAN auto-discovery, headers-first sync, and cumulative-work chain selection
 - JSON-RPC for node, wallet, mining, chat, and operator functions
-- Secure public/private chat support
+- Address-first P2P messenger with public forum, private history, voice relay, and media composers
+- Secure public/private chat support with forum-style views and direct directory actions
+- Advanced Mode gating for Node Window and P2P Messenger
 - FastAPI website and Wrapped CryptEX EVM workspace
 - System datadir defaults so chain and wallet data survive binary deletion
 

@@ -38,6 +38,7 @@
 #include <QRegularExpression>
 #include <QResizeEvent>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QShowEvent>
 #include <QStatusBar>
@@ -344,10 +345,12 @@ void MainWindow::buildUi() {
     auto* windowMenu = menuBar()->addMenu(QStringLiteral("&Window"));
     auto* helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
 
-    auto* openNodeAction = windowMenu->addAction(QStringLiteral("Node Window"));
+    openNodeAction_ = windowMenu->addAction(QStringLiteral("Node Window"));
     auto* openWalletManagerAction = windowMenu->addAction(QStringLiteral("Wallet Manager"));
-    auto* openChatAction = windowMenu->addAction(QStringLiteral("P2P Messenger"));
+    openChatAction_ = windowMenu->addAction(QStringLiteral("P2P Messenger"));
     auto* refreshAction = fileMenu->addAction(QStringLiteral("Refresh"));
+    advancedModeAction_ = settingsMenu->addAction(QStringLiteral("Advanced Mode"));
+    advancedModeAction_->setCheckable(true);
     auto* syncAction = settingsMenu->addAction(QStringLiteral("Sync Details"));
     fileMenu->addSeparator();
     auto* quitAction = fileMenu->addAction(QStringLiteral("Quit"));
@@ -415,6 +418,7 @@ void MainWindow::buildUi() {
     rpcTlsCaPathEdit_ = new QLineEdit(settingsPage_);
     daemonPathEdit_ = new QLineEdit(guessedDaemonPath(), settingsPage_);
     dataDirEdit_ = new QLineEdit(settingsPage_);
+    advancedModeCheck_ = new QCheckBox(QStringLiteral("Enable Advanced Mode"), settingsPage_);
     walletNameEdit_ = new QLineEdit(walletManagerPage_);
     walletPathEdit_ = new QLineEdit(walletManagerPage_);
     walletPassEdit_ = new QLineEdit(walletManagerPage_);
@@ -451,6 +455,16 @@ void MainWindow::buildUi() {
     auto* settingsRoot = new QVBoxLayout(settingsPage_);
     settingsRoot->setContentsMargins(12, 12, 12, 12);
     settingsRoot->setSpacing(12);
+
+    auto* interfaceBox = new QGroupBox(QStringLiteral("Interface Mode"), settingsPage_);
+    auto* interfaceLayout = new QVBoxLayout(interfaceBox);
+    interfaceLayout->setContentsMargins(12, 12, 12, 12);
+    interfaceLayout->setSpacing(8);
+    auto* advancedHint = new QLabel(QStringLiteral("Advanced Mode unlocks expert tooling like the Node Window, P2P Messenger, and related network controls. Leave it off for the simplified wallet-first view."), interfaceBox);
+    advancedHint->setWordWrap(true);
+    interfaceLayout->addWidget(advancedModeCheck_);
+    interfaceLayout->addWidget(advancedHint);
+    settingsRoot->addWidget(interfaceBox);
 
     auto* connectionBox = new QGroupBox(QStringLiteral("Node / RPC Settings"), settingsPage_);
     auto* backendSettingsLayout = new QGridLayout(connectionBox);
@@ -866,10 +880,12 @@ void MainWindow::buildUi() {
     syncOverlayDismissed_ = false;
     updateSyncStatusBar(QStringLiteral("Synchronizing with network..."), true);
 
-    connect(openNodeAction, &QAction::triggered, this, [this]() { openNodeWindow(); });
+    connect(openNodeAction_, &QAction::triggered, this, [this]() { openNodeWindow(); });
     connect(openWalletManagerAction, &QAction::triggered, this, [this]() { openWalletManagerWindow(); });
-    connect(openChatAction, &QAction::triggered, this, [this]() { openChatWindow(); });
+    connect(openChatAction_, &QAction::triggered, this, [this]() { openChatWindow(); });
     connect(refreshAction, &QAction::triggered, this, [this]() { refreshAll(); });
+    connect(advancedModeAction_, &QAction::toggled, this, [this](bool enabled) { setAdvancedModeEnabled(enabled); });
+    connect(advancedModeCheck_, &QCheckBox::toggled, this, [this](bool enabled) { setAdvancedModeEnabled(enabled); });
     connect(syncAction, &QAction::triggered, this, [this]() { toggleSyncOverlay(); });
     connect(quitAction, &QAction::triggered, this, [this]() { close(); });
     connect(aboutAction, &QAction::triggered, this, [this]() {
@@ -977,6 +993,7 @@ void MainWindow::buildUi() {
         applyConfigBackedDefaults();
     });
 
+    applyAdvancedModeUi();
     updateResponsiveLayout();
 }
 
@@ -1969,6 +1986,7 @@ void MainWindow::loadSettings() {
     directPeersEdit_->setText(settings.value(QStringLiteral("network/direct_peers")).toString());
     seedPeersEdit_->setText(settings.value(QStringLiteral("network/seed_peers")).toString());
     networkCombo_->setCurrentText(settings.value(QStringLiteral("backend/network"), QStringLiteral("mainnet")).toString());
+    setAdvancedModeEnabled(settings.value(QStringLiteral("ui/advanced_mode"), false).toBool());
     applyAutomaticBackendDefaults();
     applyConfigBackedDefaults();
     syncWalletPathFromDataDir();
@@ -1992,6 +2010,7 @@ void MainWindow::saveSettings() {
     settings.setValue(QStringLiteral("backend/network"), networkCombo_->currentText());
     settings.setValue(QStringLiteral("network/direct_peers"), directPeersEdit_->text().trimmed());
     settings.setValue(QStringLiteral("network/seed_peers"), seedPeersEdit_->text().trimmed());
+    settings.setValue(QStringLiteral("ui/advanced_mode"), advancedModeEnabled_);
     setConnectionStatus(QStringLiteral("GUI settings saved."));
 }
 
@@ -2007,6 +2026,9 @@ void MainWindow::applyRpcSettings() {
     if (systemLogView_) {
         systemLogView_->appendPlainText(QStringLiteral("[gui] Applied RPC settings for %1 as %2")
             .arg(settings.url.toString(), settings.username.isEmpty() ? QStringLiteral("<anonymous>") : settings.username));
+    }
+    if (chatWindow_ && settings.url.isValid() && !settings.url.isEmpty()) {
+        chatWindow_->refreshCurrentSection();
     }
 }
 
@@ -2079,7 +2101,51 @@ void MainWindow::setBackendState(const QString& text, bool error) {
     }
 }
 
+void MainWindow::setAdvancedModeEnabled(bool enabled) {
+    advancedModeEnabled_ = enabled;
+    if (advancedModeAction_ && advancedModeAction_->isChecked() != enabled) {
+        const QSignalBlocker blocker(advancedModeAction_);
+        advancedModeAction_->setChecked(enabled);
+    }
+    if (advancedModeCheck_ && advancedModeCheck_->isChecked() != enabled) {
+        const QSignalBlocker blocker(advancedModeCheck_);
+        advancedModeCheck_->setChecked(enabled);
+    }
+    applyAdvancedModeUi();
+}
+
+void MainWindow::applyAdvancedModeUi() {
+    if (openNodeAction_) {
+        openNodeAction_->setVisible(advancedModeEnabled_);
+        openNodeAction_->setEnabled(advancedModeEnabled_);
+    }
+    if (openChatAction_) {
+        openChatAction_->setVisible(advancedModeEnabled_);
+        openChatAction_->setEnabled(advancedModeEnabled_);
+    }
+    if (nodeWindowButton_) {
+        nodeWindowButton_->setVisible(advancedModeEnabled_);
+    }
+    if (chatWindowButton_) {
+        chatWindowButton_->setVisible(advancedModeEnabled_);
+    }
+    if (peerActivityButton_) {
+        peerActivityButton_->setVisible(advancedModeEnabled_);
+    }
+    if (networkActivityButton_) {
+        networkActivityButton_->setVisible(advancedModeEnabled_);
+    }
+    if (!advancedModeEnabled_) {
+        if (nodeWindow_) nodeWindow_->hide();
+        if (chatWindow_) chatWindow_->hide();
+    }
+}
+
 void MainWindow::openNodeWindow(const QString& section) {
+    if (!advancedModeEnabled_) {
+        setConnectionStatus(QStringLiteral("Enable Advanced Mode to open the Node Window."));
+        return;
+    }
     if (!nodeWindow_) {
         return;
     }
@@ -2096,6 +2162,10 @@ void MainWindow::openWalletManagerWindow() {
 }
 
 void MainWindow::openChatWindow(const QString& section) {
+    if (!advancedModeEnabled_) {
+        setConnectionStatus(QStringLiteral("Enable Advanced Mode to open P2P Messenger."));
+        return;
+    }
     if (!chatWindow_) {
         return;
     }

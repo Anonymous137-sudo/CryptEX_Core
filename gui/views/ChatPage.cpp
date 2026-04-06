@@ -24,6 +24,9 @@
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QSizePolicy>
+#include <QToolButton>
 #include <QSplitter>
 #include <QSpinBox>
 #include <QTableWidget>
@@ -239,23 +242,39 @@ ChatPage::ChatPage(ViewMode viewMode, QWidget* parent)
     inboxTable_->verticalHeader()->setVisible(false);
     inboxTable_->setAlternatingRowColors(false);
     inboxTable_->setShowGrid(true);
+    inboxTable_->setMinimumHeight(240);
+    inboxTable_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     mainSplitter->addWidget(inboxTable_);
 
     auto* composeWidget = new QWidget(this);
+    composeWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     auto* composeRoot = new QVBoxLayout(composeWidget);
     composeRoot->setContentsMargins(0, 0, 0, 0);
     composeRoot->setSpacing(0);
     composeLayout_ = new QFormLayout();
+    composeLayout_->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    composeLayout_->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    composeLayout_->setFormAlignment(Qt::AlignTop);
+    composeLayout_->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
     limitSpin_ = new QSpinBox(this);
     limitSpin_->setRange(1, 500);
     limitSpin_->setValue(50);
     modeCombo_ = new QComboBox(this);
     modeCombo_->addItems({QStringLiteral("Public"), QStringLiteral("Private")});
     modeCombo_->setVisible(viewMode_ == ViewMode::Mixed);
+    recipientCombo_ = new QComboBox(this);
+    recipientCombo_->setEditable(true);
+    recipientCombo_->setInsertPolicy(QComboBox::NoInsert);
+    recipientCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
+    if (recipientCombo_->lineEdit()) {
+        recipientCombo_->lineEdit()->setPlaceholderText(QStringLiteral("Choose a saved contact or paste an address"));
+    }
+    recipientSummaryValue_ = new QLabel(QStringLiteral("Choose a saved contact or paste an address. Manual key fields are available only as overrides."), this);
+    recipientSummaryValue_->setWordWrap(true);
+    recipientSummaryValue_->setObjectName(QStringLiteral("audioTranscriptStatus"));
     peerEdit_ = new QLineEdit(this);
     peerEdit_->setPlaceholderText(QStringLiteral("Optional direct peer. Leave blank to use the connected network and seeds."));
     channelEdit_ = new QLineEdit(QStringLiteral("general"), this);
-    recipientEdit_ = new QLineEdit(this);
     recipientPubkeyEdit_ = new QLineEdit(this);
     recipientRsaPubkeyEdit_ = new QPlainTextEdit(this);
     recipientRsaPubkeyEdit_->setPlaceholderText(QStringLiteral("Optional RSA public key PEM for RSA-encrypted private chat"));
@@ -278,9 +297,13 @@ ChatPage::ChatPage(ViewMode viewMode, QWidget* parent)
     obfuscateAudioCheck_ = new QCheckBox(QStringLiteral("Deepen / obfuscate audio before send"), this);
     attachmentStatusValue_ = new QLabel(QStringLiteral("No attachment selected."), this);
     attachmentStatusValue_->setWordWrap(true);
+    attachmentStatusValue_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     audioPreview_ = new AudioPreviewWidget(this);
+    audioPreview_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     messageEdit_ = new QPlainTextEdit(this);
     messageEdit_->setPlaceholderText(QStringLiteral("Write a message..."));
+    messageEdit_->setMinimumHeight(160);
+    messageEdit_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     auto* attachButtons = new QWidget(this);
     auto* attachButtonsLayout = new QHBoxLayout(attachButtons);
     attachButtonsLayout->setContentsMargins(0, 0, 0, 0);
@@ -294,17 +317,35 @@ ChatPage::ChatPage(ViewMode viewMode, QWidget* parent)
     attachButtonsLayout->addStretch(1);
     sendButton_ = new QPushButton(QStringLiteral("Send"), this);
 
+    overrideToggleButton_ = new QToolButton(this);
+    overrideToggleButton_->setCheckable(true);
+    overrideToggleButton_->setChecked(false);
+    overrideToggleButton_->setText(QStringLiteral("Show Manual Overrides"));
+    overrideToggleButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+
+    overridePanel_ = new QWidget(this);
+    overridePanel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    overrideLayout_ = new QFormLayout(overridePanel_);
+    overrideLayout_->setContentsMargins(0, 0, 0, 0);
+    overrideLayout_->setSpacing(6);
+    overrideLayout_->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    overrideLayout_->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    overrideLayout_->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+    overrideLayout_->addRow(QStringLiteral("Direct Peer Override"), peerEdit_);
+    overrideLayout_->addRow(QStringLiteral("Recipient Pubkey"), recipientPubkeyEdit_);
+    overrideLayout_->addRow(QStringLiteral("Recipient RSA Key"), recipientRsaPubkeyEdit_);
+    overrideLayout_->addRow(QStringLiteral("Private Encryption"), privateEncryptionCombo_);
+    overrideLayout_->addRow(QStringLiteral("Private KDF"), privateKdfCombo_);
+
     composeLayout_->addRow(QStringLiteral("Inbox Limit"), limitSpin_);
     if (viewMode_ == ViewMode::Mixed) {
         composeLayout_->addRow(QStringLiteral("Mode"), modeCombo_);
     }
-    composeLayout_->addRow(QStringLiteral("Direct Peer Override"), peerEdit_);
     composeLayout_->addRow(QStringLiteral("Channel"), channelEdit_);
-    composeLayout_->addRow(QStringLiteral("Recipient Address"), recipientEdit_);
-    composeLayout_->addRow(QStringLiteral("Recipient Pubkey"), recipientPubkeyEdit_);
-    composeLayout_->addRow(QStringLiteral("Recipient RSA Key"), recipientRsaPubkeyEdit_);
-    composeLayout_->addRow(QStringLiteral("Private Encryption"), privateEncryptionCombo_);
-    composeLayout_->addRow(QStringLiteral("Private KDF"), privateKdfCombo_);
+    composeLayout_->addRow(QStringLiteral("Recipient / Contact"), recipientCombo_);
+    composeLayout_->addRow(QStringLiteral("Recipient Status"), recipientSummaryValue_);
+    composeLayout_->addRow(QString(), overrideToggleButton_);
+    composeLayout_->addRow(QString(), overridePanel_);
     composeLayout_->addRow(QStringLiteral("Attachment Path"), attachmentPathEdit_);
     composeLayout_->addRow(QStringLiteral("Media Type"), mediaTypeCombo_);
     composeLayout_->addRow(QString(), obfuscateAudioCheck_);
@@ -317,10 +358,27 @@ ChatPage::ChatPage(ViewMode viewMode, QWidget* parent)
     mainSplitter->addWidget(composeWidget);
     mainSplitter->setStretchFactor(0, 3);
     mainSplitter->setStretchFactor(1, 2);
+    mainSplitter->setOpaqueResize(true);
+    mainSplitter->setSizes({340, 420});
 
     connect(modeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) { updateModeUi(); });
     connect(sendButton_, &QPushButton::clicked, this, [this]() { sendMessage(); });
     connect(inboxTable_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) { openEntry(row); });
+    connect(recipientCombo_, &QComboBox::currentTextChanged, this, [this](const QString&) {
+        if (viewMode_ == ViewMode::PrivateOnly || (viewMode_ == ViewMode::Mixed && modeCombo_->currentIndex() == 1)) {
+            clearResolvedRecipient();
+            updateRecipientSummary();
+        }
+    });
+    connect(recipientCombo_, qOverload<int>(&QComboBox::activated), this, [this](int) { resolveCurrentRecipient(false); });
+    if (recipientCombo_->lineEdit()) {
+        connect(recipientCombo_->lineEdit(), &QLineEdit::editingFinished, this, [this]() { resolveCurrentRecipient(false); });
+    }
+    connect(overrideToggleButton_, &QToolButton::toggled, this, [this](bool checked) {
+        overrideToggleButton_->setText(checked ? QStringLiteral("Hide Manual Overrides")
+                                               : QStringLiteral("Show Manual Overrides"));
+        updateModeUi();
+    });
     connect(openMediaComposerButton_, &QPushButton::clicked, this, [this]() {
         chooseAttachment(mediaTypeCombo_->currentData().toString().trimmed().isEmpty()
                              ? QStringLiteral("image")
@@ -337,6 +395,9 @@ ChatPage::ChatPage(ViewMode viewMode, QWidget* parent)
     });
     connect(privateEncryptionCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) { updateModeUi(); });
     connect(obfuscateAudioCheck_, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState) { updateAudioPreview(); });
+    connect(peerEdit_, &QLineEdit::textChanged, this, [this](const QString&) { updateRecipientSummary(); });
+    connect(recipientPubkeyEdit_, &QLineEdit::textChanged, this, [this](const QString&) { updateRecipientSummary(); });
+    connect(recipientRsaPubkeyEdit_, &QPlainTextEdit::textChanged, this, [this]() { updateRecipientSummary(); });
     if (viewMode_ == ViewMode::PublicOnly) modeCombo_->setCurrentIndex(0);
     else if (viewMode_ == ViewMode::PrivateOnly) modeCombo_->setCurrentIndex(1);
     syncMediaSummary();
@@ -411,20 +472,34 @@ void ChatPage::setFormRowVisible(QWidget* field, bool visible) {
     }
 }
 
+void ChatPage::setOverrideRowVisible(QWidget* field, bool visible) {
+    if (!field) return;
+    field->setVisible(visible);
+    if (!overrideLayout_) return;
+    if (auto* label = overrideLayout_->labelForField(field)) {
+        label->setVisible(visible);
+    }
+}
+
 void ChatPage::updateModeUi() {
     const bool isPrivate = viewMode_ == ViewMode::PrivateOnly || modeCombo_->currentIndex() == 1;
     const bool rsaPrivate = isPrivate && privateEncryptionCombo_->currentData().toString() == QStringLiteral("rsa");
     setFormRowVisible(channelEdit_, !isPrivate);
-    setFormRowVisible(recipientEdit_, isPrivate);
-    setFormRowVisible(recipientPubkeyEdit_, isPrivate);
-    setFormRowVisible(recipientRsaPubkeyEdit_, isPrivate);
-    setFormRowVisible(privateEncryptionCombo_, isPrivate);
-    setFormRowVisible(privateKdfCombo_, isPrivate);
+    setFormRowVisible(recipientCombo_, isPrivate);
+    setFormRowVisible(recipientSummaryValue_, isPrivate);
+    setFormRowVisible(overrideToggleButton_, true);
+    setFormRowVisible(overridePanel_, overrideToggleButton_->isChecked());
+    setOverrideRowVisible(peerEdit_, true);
+    setOverrideRowVisible(recipientPubkeyEdit_, isPrivate);
+    setOverrideRowVisible(recipientRsaPubkeyEdit_, isPrivate);
+    setOverrideRowVisible(privateEncryptionCombo_, isPrivate);
+    setOverrideRowVisible(privateKdfCombo_, isPrivate);
     privateKdfCombo_->setEnabled(!rsaPrivate);
     setFormRowVisible(attachmentPathEdit_, false);
     setFormRowVisible(obfuscateAudioCheck_, false);
     setFormRowVisible(audioPreview_, false);
     syncMediaSummary();
+    updateRecipientSummary();
 }
 
 void ChatPage::setPublicDraft(const QString& channel, const QString& draft, const QString& peer) {
@@ -449,20 +524,163 @@ void ChatPage::setPrivateRecipient(const QString& address,
                                    const QString& peer,
                                    const QString& draft,
                                    const QString& rsaPubkeyPem) {
-    recipientEdit_->setText(address);
-    recipientPubkeyEdit_->setText(pubkeyB64);
-    recipientRsaPubkeyEdit_->setPlainText(rsaPubkeyPem);
-    if (!peer.trimmed().isEmpty()) {
-        peerEdit_->setText(peer.trimmed());
-    }
+    recipientCombo_->setCurrentText(address);
+    resolvedRecipientPubkey_ = pubkeyB64.trimmed();
+    resolvedRecipientRsaKey_ = rsaPubkeyPem.trimmed();
+    resolvedPeerHint_ = peer.trimmed();
+    resolvedRecipientLabel_.clear();
+    resolvedRecipientSource_ = resolvedRecipientPubkey_.isEmpty() && resolvedRecipientRsaKey_.isEmpty()
+        ? QString()
+        : QStringLiteral("private-manager");
     if (!draft.isEmpty()) {
         messageEdit_->setPlainText(draft);
     }
     if (viewMode_ == ViewMode::Mixed) {
         modeCombo_->setCurrentIndex(1);
     }
+    updateRecipientSummary();
+    if (resolvedRecipientPubkey_.isEmpty() && resolvedRecipientRsaKey_.isEmpty()) {
+        resolveCurrentRecipient(false);
+    }
     updateModeUi();
     messageEdit_->setFocus();
+}
+
+void ChatPage::refreshKnownRecipients() {
+    if (!rpc_ || !recipientCombo_) {
+        return;
+    }
+    const QString currentText = recipientCombo_->currentText();
+    rpc_->call(QStringLiteral("getchatprivatecontacts"), {}, this,
+        [this, currentText](const QJsonValue& result) {
+            const auto rows = result.toArray();
+            QSignalBlocker blocker(recipientCombo_);
+            recipientCombo_->clear();
+            for (const auto& value : rows) {
+                const auto obj = value.toObject();
+                const QString address = obj.value(QStringLiteral("address")).toString().trimmed();
+                if (address.isEmpty()) {
+                    continue;
+                }
+                const QString label = obj.value(QStringLiteral("label")).toString().trimmed();
+                const QString display = label.isEmpty()
+                    ? address
+                    : QStringLiteral("%1 — %2").arg(label, address);
+                recipientCombo_->addItem(display, address);
+            }
+            recipientCombo_->setCurrentText(currentText);
+        },
+        [this](const QString& error) {
+            if (viewMode_ == ViewMode::PrivateOnly) {
+                setStatus(error, true);
+            }
+        });
+}
+
+QString ChatPage::currentRecipientAddress() const {
+    if (!recipientCombo_) {
+        return QString();
+    }
+    const QString currentText = recipientCombo_->currentText().trimmed();
+    const int index = recipientCombo_->currentIndex();
+    if (index >= 0) {
+        const QString itemText = recipientCombo_->itemText(index).trimmed();
+        const QString itemAddress = recipientCombo_->itemData(index).toString().trimmed();
+        if (!itemAddress.isEmpty() && (currentText == itemText || currentText == itemAddress || currentText.endsWith(itemAddress))) {
+            return itemAddress;
+        }
+    }
+    return currentText;
+}
+
+QString ChatPage::effectivePeerOverride() const {
+    const auto manual = peerEdit_->text().trimmed();
+    return manual.isEmpty() ? resolvedPeerHint_ : manual;
+}
+
+QString ChatPage::effectiveRecipientPubkey() const {
+    const auto manual = recipientPubkeyEdit_->text().trimmed();
+    return manual.isEmpty() ? resolvedRecipientPubkey_ : manual;
+}
+
+QString ChatPage::effectiveRecipientRsaKey() const {
+    const auto manual = recipientRsaPubkeyEdit_->toPlainText().trimmed();
+    return manual.isEmpty() ? resolvedRecipientRsaKey_ : manual;
+}
+
+void ChatPage::clearResolvedRecipient() {
+    resolvedRecipientPubkey_.clear();
+    resolvedRecipientRsaKey_.clear();
+    resolvedPeerHint_.clear();
+    resolvedRecipientLabel_.clear();
+    resolvedRecipientSource_.clear();
+}
+
+void ChatPage::updateRecipientSummary() {
+    if (!recipientSummaryValue_) {
+        return;
+    }
+    const auto address = currentRecipientAddress();
+    if (address.isEmpty()) {
+        recipientSummaryValue_->setText(QStringLiteral("Choose a saved contact or paste an address. Manual key fields are available only as overrides."));
+        return;
+    }
+
+    QStringList details;
+    if (!resolvedRecipientLabel_.isEmpty()) {
+        details << QStringLiteral("Contact: %1").arg(resolvedRecipientLabel_);
+    }
+    if (!resolvedRecipientSource_.isEmpty()) {
+        details << QStringLiteral("Source: %1").arg(resolvedRecipientSource_);
+    }
+    if (!effectiveRecipientPubkey().isEmpty()) {
+        details << QStringLiteral("ECDH ready");
+    }
+    if (!effectiveRecipientRsaKey().isEmpty()) {
+        details << QStringLiteral("RSA ready");
+    }
+    if (!effectivePeerOverride().isEmpty()) {
+        details << QStringLiteral("Peer hint: %1").arg(effectivePeerOverride());
+    }
+    if (details.isEmpty()) {
+        recipientSummaryValue_->setText(QStringLiteral("No key material is known for %1 yet. You can still supply manual overrides if needed.").arg(address));
+        return;
+    }
+    recipientSummaryValue_->setText(details.join(QStringLiteral(" | ")));
+}
+
+void ChatPage::resolveCurrentRecipient(bool userVisible) {
+    if (!rpc_) {
+        return;
+    }
+    const auto address = currentRecipientAddress();
+    if (address.isEmpty()) {
+        clearResolvedRecipient();
+        updateRecipientSummary();
+        return;
+    }
+    rpc_->call(QStringLiteral("resolvechatrecipient"), QJsonArray{address}, this,
+        [this, userVisible](const QJsonValue& result) {
+            const auto obj = result.toObject();
+            resolvedRecipientPubkey_ = obj.value(QStringLiteral("pubkey_b64")).toString().trimmed();
+            resolvedRecipientRsaKey_ = obj.value(QStringLiteral("rsa_pubkey_pem")).toString().trimmed();
+            resolvedPeerHint_ = obj.value(QStringLiteral("peer")).toString().trimmed();
+            resolvedRecipientLabel_ = obj.value(QStringLiteral("label")).toString().trimmed();
+            resolvedRecipientSource_ = obj.value(QStringLiteral("source")).toString().trimmed();
+            updateRecipientSummary();
+            if (userVisible) {
+                setStatus(obj.value(QStringLiteral("found")).toBool()
+                              ? QStringLiteral("Recipient details resolved automatically.")
+                              : QStringLiteral("No stored key material was found. Manual overrides remain available."));
+            }
+        },
+        [this, userVisible](const QString& error) {
+            clearResolvedRecipient();
+            updateRecipientSummary();
+            if (userVisible) {
+                setStatus(error, true);
+            }
+        });
 }
 
 void ChatPage::chooseAttachment(const QString& mediaType) {
@@ -635,6 +853,11 @@ void ChatPage::refresh() {
         return;
     }
 
+    if (viewMode_ != ViewMode::PublicOnly) {
+        refreshKnownRecipients();
+        resolveCurrentRecipient(false);
+    }
+
     setStatus(QStringLiteral("Refreshing inbox..."));
     rpc_->call(QStringLiteral("getchatinfo"), {}, this,
         [this](const QJsonValue& result) {
@@ -755,23 +978,22 @@ void ChatPage::sendMessage() {
         request.insert(QStringLiteral("channel"), channelEdit_->text().trimmed());
         params.append(request);
     } else {
-        if (recipientEdit_->text().trimmed().isEmpty()) {
+        const auto recipientAddress = currentRecipientAddress();
+        if (recipientAddress.isEmpty()) {
             setStatus(QStringLiteral("Recipient address is required for private chat."), true);
             return;
         }
         const auto encryptionMode = privateEncryptionCombo_->currentData().toString();
-        const auto rsaPubkey = recipientRsaPubkeyEdit_->toPlainText().trimmed();
-        const auto secpPubkey = recipientPubkeyEdit_->text().trimmed();
+        const auto rsaPubkey = effectiveRecipientRsaKey();
+        const auto secpPubkey = effectiveRecipientPubkey();
         if (encryptionMode == QStringLiteral("rsa")) {
             if (rsaPubkey.isEmpty()) {
-                setStatus(QStringLiteral("Recipient RSA public key is required for RSA private chat."), true);
-                return;
+                resolveCurrentRecipient(true);
             }
         } else if (secpPubkey.isEmpty()) {
-            setStatus(QStringLiteral("Recipient pubkey is required for ECDH private chat."), true);
-            return;
+            resolveCurrentRecipient(true);
         }
-        request.insert(QStringLiteral("recipient_address"), recipientEdit_->text().trimmed());
+        request.insert(QStringLiteral("recipient_address"), recipientAddress);
         if (!secpPubkey.isEmpty()) {
             request.insert(QStringLiteral("recipient_pubkey_b64"), secpPubkey);
         }

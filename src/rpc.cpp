@@ -1594,9 +1594,8 @@ ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool p
                                       ? object.find("recipient_pubkey_b64")
                                       : object.find("recipient_pubkey");
             const auto* message = object.find("message");
-            if (!recipient || (!pubkey && !object.find("recipient_rsa_pubkey_pem") && !object.find("recipient_rsa_pubkey") && !object.find("recipient_rsa_pubkey_b64")) ||
-                (!message && request.attachment_path.empty())) {
-                throw RpcException(-32602, "sendchatprivate object expects {recipient_address, recipient_pubkey_b64?, recipient_rsa_pubkey_pem?, message?, attachment_path?, peer?, from_address?, kdf?, encryption?}");
+            if (!recipient || (!message && request.attachment_path.empty())) {
+                throw RpcException(-32602, "sendchatprivate object expects {recipient_address, message?, attachment_path?, recipient_pubkey_b64?, recipient_rsa_pubkey_pem?, peer?, from_address?, kdf?, encryption?}");
             }
             request.recipient_address = recipient->as_string();
             if (pubkey) request.recipient_pubkey_b64 = pubkey->as_string();
@@ -2011,6 +2010,72 @@ JsonValue public_directory_entry_to_json(const PublicDirectoryEntry& entry) {
     return row;
 }
 
+struct ResolvedChatRecipient {
+    std::string address;
+    std::string label;
+    std::string pubkey_b64;
+    std::string rsa_pubkey_pem;
+    std::string peer_label;
+    std::string source;
+    bool found{false};
+};
+
+ResolvedChatRecipient resolve_chat_recipient(const std::string& requested_address,
+                                             const Blockchain& chain,
+                                             net::NetworkNode* node,
+                                             const Wallet* wallet,
+                                             const std::filesystem::path& data_dir) {
+    ResolvedChatRecipient resolved;
+    resolved.address = normalize_directory_address(requested_address);
+    if (resolved.address.empty()) {
+        return resolved;
+    }
+
+    const auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+    auto contact_it = std::find_if(contacts.begin(), contacts.end(), [&](const chatstate::PrivateContact& contact) {
+        return crypto::addresses_equal(contact.address, resolved.address);
+    });
+    if (contact_it != contacts.end()) {
+        resolved.found = true;
+        resolved.label = contact_it->label;
+        resolved.pubkey_b64 = contact_it->pubkey_b64;
+        resolved.rsa_pubkey_pem = contact_it->rsa_pubkey_pem;
+        resolved.peer_label = contact_it->peer_label;
+        resolved.source = "private-contacts";
+    }
+
+    if (resolved.pubkey_b64.empty() || resolved.peer_label.empty()) {
+        const auto directory = scan_public_directory(chain, node, wallet, 0);
+        auto directory_it = std::find_if(directory.begin(), directory.end(), [&](const PublicDirectoryEntry& entry) {
+            return crypto::addresses_equal(entry.address, resolved.address);
+        });
+        if (directory_it != directory.end()) {
+            resolved.found = true;
+            if (resolved.pubkey_b64.empty()) resolved.pubkey_b64 = directory_it->public_key_b64;
+            if (resolved.peer_label.empty()) resolved.peer_label = directory_it->peer_label;
+            if (resolved.source.empty()) resolved.source = "public-directory";
+            else resolved.source += "+public-directory";
+        }
+    }
+
+    return resolved;
+}
+
+JsonValue resolved_chat_recipient_to_json(const ResolvedChatRecipient& resolved) {
+    JsonValue row = JsonValue::object();
+    add_address_formats(row, "address", resolved.address);
+    row.set("found", JsonValue(resolved.found));
+    row.set("label", JsonValue::string(resolved.label));
+    row.set("pubkey_b64", JsonValue::string(resolved.pubkey_b64));
+    row.set("rsa_pubkey_pem", JsonValue::string(resolved.rsa_pubkey_pem));
+    row.set("rsa_pubkey_b64", JsonValue::string(crypto::base64_encode(resolved.rsa_pubkey_pem)));
+    row.set("peer", JsonValue::string(resolved.peer_label));
+    row.set("source", JsonValue::string(resolved.source));
+    row.set("private_ready", JsonValue(!resolved.pubkey_b64.empty() || !resolved.rsa_pubkey_pem.empty()));
+    row.set("voice_ready", JsonValue(!resolved.pubkey_b64.empty()));
+    return row;
+}
+
 struct IrcSendResult {
     std::string status;
     std::vector<std::string> lines;
@@ -2202,7 +2267,7 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                      "getchatprivatecontacts", "upsertchatprivatecontact", "removechatprivatecontact",
                      "getchatproxyconfig", "setchatproxyconfig",
                      "getircconfig", "setircconfig", "getirclog", "sendircmessage",
-                     "getpublicaddressdirectory",
+                     "resolvechatrecipient", "getpublicaddressdirectory",
                      "getpeerinfo", "getpeergraph", "getnetworkinfo", "getportmappinginfo", "getmininginfo", "getmempoolinfo",
                      "getwalletinfo", "getbalance", "listunspent", "getwalletaddresses",
                      "getwalletaddressbook", "setaddresslabel", "setprimaryaddress",
@@ -2544,14 +2609,25 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 recipient_rsa_pubkey_pem.assign(decoded.begin(), decoded.end());
             }
 
+            auto wallet = load_session_wallet();
+            const auto resolved = resolve_chat_recipient(recipient->as_string(), chain_, node_, &wallet, chat_data_root());
             if (recipient_pubkey_b64.empty()) {
-                throw RpcException(-32602, "recipient_pubkey_b64 is required for secure voice calls");
+                recipient_pubkey_b64 = resolved.pubkey_b64;
+            }
+            if (recipient_rsa_pubkey_pem.empty()) {
+                recipient_rsa_pubkey_pem = resolved.rsa_pubkey_pem;
             }
 
-            const std::string peer = object.find("peer") ? object.find("peer")->as_string() : std::string();
+            if (recipient_pubkey_b64.empty()) {
+                throw RpcException(-32602, "recipient address could not be resolved to a secp256k1 pubkey; save the contact first or use manual overrides");
+            }
+
+            std::string peer = object.find("peer") ? object.find("peer")->as_string() : std::string();
+            if (peer.empty()) {
+                peer = resolved.peer_label;
+            }
             const std::string from_address = object.find("from_address") ? object.find("from_address")->as_string() : std::string();
             const bool obfuscate_audio = object.find("obfuscate_audio") ? object.find("obfuscate_audio")->as_bool() : false;
-            auto wallet = load_session_wallet();
             node_->set_chat_wallet(std::make_shared<const Wallet>(wallet));
             const bool started = node_->start_voice_call(recipient->as_string(),
                                                          recipient_pubkey_b64.empty() ? std::vector<uint8_t>{}
@@ -2659,6 +2735,16 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 rows.push_back(private_contact_to_json(contact));
             }
             result = std::move(rows);
+        } else if (method == "resolvechatrecipient") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "resolvechatrecipient expects [address]");
+            }
+            std::optional<Wallet> wallet;
+            if (has_wallet_session()) {
+                wallet = load_session_wallet();
+            }
+            result = resolved_chat_recipient_to_json(
+                resolve_chat_recipient(params[0].as_string(), chain_, node_, wallet ? &*wallet : nullptr, chat_data_root()));
         } else if (method == "upsertchatprivatecontact") {
             if (params.size() != 1) {
                 throw RpcException(-32602, "upsertchatprivatecontact expects [{address, pubkey_b64?, label?, peer?, notes?}]");
@@ -2676,6 +2762,7 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             } else {
                 if (!candidate.label.empty()) it->label = candidate.label;
                 if (!candidate.pubkey_b64.empty()) it->pubkey_b64 = candidate.pubkey_b64;
+                if (!candidate.rsa_pubkey_pem.empty()) it->rsa_pubkey_pem = candidate.rsa_pubkey_pem;
                 if (!candidate.peer_label.empty()) it->peer_label = candidate.peer_label;
                 if (!candidate.notes.empty() || params[0].find("notes")) it->notes = candidate.notes;
                 if (it->added_at == 0) it->added_at = now;
@@ -2815,9 +2902,25 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             if (!private_chat) {
                 payload = chat::make_signed_public_chat(wallet, request.from_address, request.route, content);
             } else {
+                const auto resolved = resolve_chat_recipient(request.recipient_address, chain_, node_, &wallet, chat_data_root());
+                if (request.recipient_pubkey_b64.empty()) {
+                    request.recipient_pubkey_b64 = resolved.pubkey_b64;
+                }
+                if (request.recipient_rsa_pubkey_pem.empty()) {
+                    request.recipient_rsa_pubkey_pem = resolved.rsa_pubkey_pem;
+                }
+                if (!request.peer_label && !resolved.peer_label.empty()) {
+                    request.peer_label = resolved.peer_label;
+                }
                 const auto mode = request.encryption_mode.value_or(
                     request.recipient_rsa_pubkey_pem.empty() ? chat::EncryptionMode::ECDH
                                                              : chat::EncryptionMode::RSA);
+                if (mode == chat::EncryptionMode::ECDH && request.recipient_pubkey_b64.empty()) {
+                    throw RpcException(-32602, "recipient address could not be resolved to a secp256k1 pubkey; save the contact first or use manual overrides");
+                }
+                if (mode == chat::EncryptionMode::RSA && request.recipient_rsa_pubkey_pem.empty()) {
+                    throw RpcException(-32602, "recipient address could not be resolved to an RSA public key; save the contact first or use manual overrides");
+                }
                 payload = chat::make_encrypted_private_chat(wallet,
                                                             request.from_address,
                                                             request.recipient_address,

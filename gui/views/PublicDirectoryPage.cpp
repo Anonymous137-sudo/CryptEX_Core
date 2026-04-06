@@ -33,8 +33,14 @@ PublicDirectoryPage::PublicDirectoryPage(QWidget* parent)
     toolbarLayout->setContentsMargins(0, 0, 0, 0);
     filterEdit_ = new QLineEdit(this);
     filterEdit_->setPlaceholderText(QStringLiteral("Filter by address, IP, peer, or pubkey"));
+    messageButton_ = new QPushButton(QStringLiteral("Message"), this);
+    callButton_ = new QPushButton(QStringLiteral("Call"), this);
+    saveContactButton_ = new QPushButton(QStringLiteral("Save Contact"), this);
     refreshButton_ = new QPushButton(QStringLiteral("Refresh Directory"), this);
     toolbarLayout->addWidget(filterEdit_, 1);
+    toolbarLayout->addWidget(messageButton_);
+    toolbarLayout->addWidget(callButton_);
+    toolbarLayout->addWidget(saveContactButton_);
     toolbarLayout->addWidget(refreshButton_);
     root->addWidget(toolbar);
 
@@ -60,6 +66,12 @@ PublicDirectoryPage::PublicDirectoryPage(QWidget* parent)
 
     connect(refreshButton_, &QPushButton::clicked, this, [this]() { refresh(); });
     connect(filterEdit_, &QLineEdit::textChanged, this, [this]() { applyFilter(); });
+    connect(table_, &QTableWidget::itemSelectionChanged, this, [this]() { updateActionState(); });
+    connect(table_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { messageSelectedAddress(); });
+    connect(messageButton_, &QPushButton::clicked, this, [this]() { messageSelectedAddress(); });
+    connect(callButton_, &QPushButton::clicked, this, [this]() { callSelectedAddress(); });
+    connect(saveContactButton_, &QPushButton::clicked, this, [this]() { saveSelectedAddress(); });
+    updateActionState();
 }
 
 void PublicDirectoryPage::setRpcClient(RpcClient* client) {
@@ -102,9 +114,12 @@ void PublicDirectoryPage::refresh() {
         rpc_->call(QStringLiteral("getpublicaddressdirectory"), QJsonArray{5000}, this,
             [this](const QJsonValue& result) {
             const auto rows = result.toArray();
+            entries_.clear();
+            entries_.reserve(rows.size());
             table_->setRowCount(rows.size());
             for (int i = 0; i < rows.size(); ++i) {
                 const auto obj = rows.at(i).toObject();
+                entries_.push_back(obj);
                 table_->setItem(i, 0, new QTableWidgetItem(obj.value(QStringLiteral("address")).toString()));
                 table_->setItem(i, 1, new QTableWidgetItem(formatCoins(obj.value(QStringLiteral("balance_sats")).toInteger())));
                 table_->setItem(i, 2, new QTableWidgetItem(QString::number(obj.value(QStringLiteral("tx_count")).toInteger())));
@@ -121,6 +136,7 @@ void PublicDirectoryPage::refresh() {
             }
             refreshStatusSummary(rows.size());
             applyFilter();
+            updateActionState();
             },
             [this](const QString& error) { setStatus(error, true); });
     };
@@ -151,4 +167,74 @@ void PublicDirectoryPage::applyFilter() {
         }
         table_->setRowHidden(row, !visible);
     }
+    updateActionState();
+}
+
+QJsonObject PublicDirectoryPage::selectedEntry() const {
+    const auto items = table_->selectedItems();
+    if (items.isEmpty()) {
+        return {};
+    }
+    const int row = items.first()->row();
+    if (row < 0 || row >= entries_.size()) {
+        return {};
+    }
+    return entries_.at(row);
+}
+
+void PublicDirectoryPage::updateActionState() {
+    const auto entry = selectedEntry();
+    const bool hasSelection = !entry.isEmpty();
+    if (messageButton_) messageButton_->setEnabled(hasSelection);
+    if (callButton_) callButton_->setEnabled(hasSelection);
+    if (saveContactButton_) saveContactButton_->setEnabled(hasSelection);
+}
+
+void PublicDirectoryPage::messageSelectedAddress() {
+    const auto entry = selectedEntry();
+    if (entry.isEmpty()) {
+        setStatus(QStringLiteral("Select an address from the public directory first."), true);
+        return;
+    }
+    emit messageRequested(entry.value(QStringLiteral("address")).toString().trimmed(),
+                          entry.value(QStringLiteral("pubkey_b64")).toString().trimmed(),
+                          entry.value(QStringLiteral("peer")).toString().trimmed());
+    setStatus(QStringLiteral("Loaded the selected address into the private composer."));
+}
+
+void PublicDirectoryPage::callSelectedAddress() {
+    const auto entry = selectedEntry();
+    if (entry.isEmpty()) {
+        setStatus(QStringLiteral("Select an address from the public directory first."), true);
+        return;
+    }
+    emit callRequested(entry.value(QStringLiteral("address")).toString().trimmed(),
+                       entry.value(QStringLiteral("pubkey_b64")).toString().trimmed(),
+                       entry.value(QStringLiteral("peer")).toString().trimmed());
+    setStatus(QStringLiteral("Loaded the selected address into the voice-call page."));
+}
+
+void PublicDirectoryPage::saveSelectedAddress() {
+    if (!rpc_) {
+        setStatus(QStringLiteral("RPC client not configured."), true);
+        return;
+    }
+    const auto entry = selectedEntry();
+    if (entry.isEmpty()) {
+        setStatus(QStringLiteral("Select an address from the public directory first."), true);
+        return;
+    }
+    QJsonObject contact;
+    contact.insert(QStringLiteral("address"), entry.value(QStringLiteral("address")).toString().trimmed());
+    contact.insert(QStringLiteral("pubkey_b64"), entry.value(QStringLiteral("pubkey_b64")).toString().trimmed());
+    contact.insert(QStringLiteral("peer"), entry.value(QStringLiteral("peer")).toString().trimmed());
+    contact.insert(QStringLiteral("label"), entry.value(QStringLiteral("peer")).toString().trimmed() == QStringLiteral("self")
+                                             ? QStringLiteral("Self")
+                                             : QStringLiteral("Directory Contact"));
+    contact.insert(QStringLiteral("notes"), QStringLiteral("Saved from the public blockchain address manager"));
+    rpc_->call(QStringLiteral("upsertchatprivatecontact"), QJsonArray{contact}, this,
+               [this](const QJsonValue&) {
+                   setStatus(QStringLiteral("Saved the selected address into Private Manager."));
+               },
+               [this](const QString& error) { setStatus(error, true); });
 }
