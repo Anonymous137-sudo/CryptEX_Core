@@ -16,6 +16,7 @@ enum class ContentType : uint8_t {
     Audio = 3,
     VoiceControl = 4,
     VoiceFrame = 5,
+    File = 6,
 };
 
 enum class AudioPrivacy : uint8_t {
@@ -24,11 +25,14 @@ enum class AudioPrivacy : uint8_t {
 };
 
 struct ContentEnvelope {
-    uint8_t version{2};
+    uint8_t version{4};
     ContentType type{ContentType::Text};
     AudioPrivacy audio_privacy{AudioPrivacy::None};
     std::string mime_type;
     std::string attachment_name;
+    std::string subject;
+    std::string mail_to;
+    std::string mail_cc;
     std::string text;
     std::string transcript;
     std::vector<uint8_t> attachment_bytes;
@@ -52,7 +56,8 @@ const char* audio_privacy_name(AudioPrivacy mode);
 std::string content_summary(const ContentEnvelope& content);
 std::filesystem::path persist_attachment(const ContentEnvelope& content,
                                          const std::filesystem::path& data_dir,
-                                         const std::string& message_id);
+                                         const std::string& message_id,
+                                         const std::string& media_subdir = "chat_media");
 
 } // namespace chat
 } // namespace cryptex

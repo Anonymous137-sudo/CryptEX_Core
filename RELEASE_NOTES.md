@@ -1,300 +1,59 @@
-# CryptEX v0.6.0 Release Notes
+# CryptEX v0.6.1 Release Notes
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 
-These notes describe the CryptEX v0.6.0 release as of April 2026. The project now spans the native chain, desktop GUI, wallet and RPC stack, networking and sync infrastructure, website, and the wrapped-asset EVM workspace.
-
-## Featured Changes
-
-- Full **SHA3-512 proof of work** with **512-bit target math** and cumulative-work chain selection
-- Separate **Qt GUI** and **backend daemon** with a wallet-first desktop flow and a dedicated node window
-- New **Advanced Mode** toggle that keeps the default desktop flow simpler while unlocking the Node Window and P2P Messenger for power users
-- Major **P2P Messenger** overhaul with address-first recipient resolution, separate public/private/forum/voice sections, and responsive layouts
-- New **secure voice relay** path using chat signaling, capability exchange, ECDH-derived session keys, AES-GCM frame encryption, Opus audio, and optional voice cloaking
-- Public blockchain address directory actions for **Message**, **Call**, and **Save Contact**
-- New forum-style public feed, separate private history, and improved media workflows with dedicated composer windows
-- Hybrid adaptive difficulty controller combining **LWMA**, **EMA**, **real-time overdue easing**, and **emergency minimum-difficulty recovery**
-- Expanded wallet system with encrypted storage, HD support, recovery tooling, multiple address encodings, and wallet management RPCs
-- Stronger network stack with peer persistence, bans, DNS bootstrap, **LAN/WLAN auto-discovery**, peer activity controls, and sync-aware mining
-- FastAPI-based website with live downloads, reserve-status surfacing, and deployment configs
-- EVM workspace for **Wrapped CryptEX (`wCRX`)** plus bridge automation and reserve reporting tooling
-
-## Core Protocol and Consensus
-
-- Native **mainnet**, **testnet**, and **regtest** profiles
-- Full-width SHA3-512 proof-of-work validation
-- 512-bit target expansion and chainwork accounting
-- Genesis baked into network parameters for deterministic startup
-- Cumulative-work chain selection rather than height-only chain choice
-- Conservative fork handling with local path reconstruction and revalidation before activation
-- Local approval and reorg-safety logic for stronger full-node behavior during sync and competing-chain observations
-
-## Difficulty and Liveness
-
-- Adaptive retargeting now uses a hybrid controller instead of a slow legacy-only retarget model
-- Current controller components:
-  - damped LWMA-style estimator
-  - EMA smoothing term
-  - real-time overdue easing
-  - emergency minimum-difficulty fallback after clear stall conditions
-- Timestamp sanity checks and bounded solve-time behavior help reduce timestamp-based retarget abuse
-- The chain is explicitly tuned to recover when a strong miner leaves and only low hash-rate miners remain
-
-## Wallets and Addresses
-
-- Encrypted `Wallet.dat` storage
-- BIP32 HD derivation
-- BIP39 mnemonic generation and restore
-- Safer wallet persistence through temp-file write and backup rotation
-- Recovery path from backup copies via wallet recovery tooling
-- Wallet manager support in the GUI
-- Wallet session handling decoupled from node-startup settings
-- Legacy root `Wallet.dat` discovery now works alongside managed wallet paths
-
-Supported address encodings now include:
-
-- Base64
-- Base58
-- `0x` + hex
-- Bech32
-
-The current implementation treats these as multiple encodings over the same underlying address payload while preserving native Base64 compatibility for existing CryptEX wallets.
-
-## Wallet RPC and Maintenance
-
-Current wallet-facing RPC coverage includes:
-
-- `getnewaddress`
-- `getunusedaddress`
-- `listwallets`
-- `createwallet`
-- `openwallet`
-- `closewallet`
-- `deletewallet`
-- `setwalletformat`
-- `dumpmnemonic`
-- `dumpprivkey`
-- `importprivkey`
-- `importmnemonic`
-- `backupwallet`
-- `recoverwallet`
-- `walletpassphrasechange`
-- `rescanwallet`
-
-Additional wallet behavior updates:
-
-- better immature / spendable / locked / total balance reporting
-- corrected coinbase maturity boundary handling
-- improved GUI balance and wallet-state refresh behavior
-- better wallet-password prompting and restart handling in the desktop client
-
-## GUI and Desktop Client
-
-The Qt client is now a serious desktop surface rather than a thin wrapper over CLI functionality.
-
-Main user tabs:
-
-- Overview
-- Send
-- Receive
-- Transactions
-
-Advanced functionality is moved into a separate **Node Window**, including:
-
-- information
-- wallet manager
-- wallet tools
-- console
-- system log
-- terminal
-- miner output
-- network tools
-- chat
-- settings
-
-Desktop improvements include:
-
-- wallet-first layout inspired by Bitcoin Core structure
-- Advanced Mode toggle for expert tooling instead of exposing every operator surface by default
-- startup splash and sync-details behavior
-- bottom sync / peer / network activity indicators
-- explicit node controls separated from ordinary wallet use
-- address-format chooser dialogs
-- improved wallet table stability and reduced refresh churn
-- refresh-on-open behavior instead of heavy background refresh loops
-- more resilient RPC-startup handling so backend wiring states do not show up as false messenger/call errors
-- resizable messenger layouts with scroll-wrapped tabs, wrapped forms, and sane splitter defaults
-
-## Networking and Synchronization
-
-- Boost.Asio-based TCP peer-to-peer transport
-- Peer persistence through `peers.dat`
-- Peer reputation and ban persistence through `peer_state.dat`
-- Headers-first synchronization with bounded parallel block downloads
-- DNS bootstrap support
-- Peer exchange through protocol messages
-- Direct peer connection support
-- LAN/WLAN auto-discovery for same-network nodes
-- Optional SOCKS5/Tor outbound proxy support
-- Optional external IP discovery and self-advertisement
-
-Additional sync/network changes:
-
-- better sync status reporting through RPC and GUI
-- explicit network activity enable/disable control
-- improved separation of backend-unreachable vs RPC-auth-failure states
-- safer async outbound connect behavior to reduce startup stalls
-- peer maintenance and reconnection logic hardened for long-running nodes
-
-## Mining
-
-- Multi-threaded CPU mining
-- Sync-before-mining behavior when peers are present
-- Continuous or bounded nonce-cycle mining
-- Chained multi-block mining via `--block-cycles`
-- `GETWORK` support
-- `getblocktemplate` support
-- Dedicated miner-output tooling in the GUI node window
-
-The current mining and retarget path is designed to preserve liveness under unstable network hash-rate rather than assuming a large, steady industrial mining base.
-
-## RPC and Operator Surface
-
-- JSON-RPC for blockchain, wallet, networking, mempool, mining, and chat operations
-- Strict JSON parsing and parameter type enforcement
-- Allowlist support
-- Request-size limits
-- Per-IP RPC rate limiting
-- `setnetworkactive` support for runtime network control
-- Better peer, sync, and approval telemetry through RPC
-- Structured logging and config-file support
-
-## Secure Chat
-
-CryptEX includes a non-consensus authenticated messaging layer between nodes.
-
-Current chat support includes:
-
-- signed public chat
-- encrypted private chat
-- inbox/history retrieval
-- peer-routed delivery
-- address-first recipient resolution from private contacts and the public directory
-- forum-style public feed with full-post drill-down and local deletion controls
-- separate private history view
-- public directory actions to message, call, or save known chain addresses
-- responsive media flows for image, video, and audio attachments through dedicated composer windows
+These notes describe the CryptEX v0.6.1 maintenance release as of April 2026. This release focuses on consensus hardening, miner/backend correctness, chain repair, and desktop startup stability after the broader v0.6.0 feature wave.
 
-Private chat currently uses an ECDH-derived AES-256-GCM session flow bound to recipient key material.
+## Highlights
 
-## Voice Relay
-
-`P2P Messenger` now includes a dedicated voice-call page for live, address-to-address encrypted relay calls.
-
-Current voice relay support includes:
-
-- chat-based signaling for call setup
-- capability exchange during negotiation
-- ECDH-derived shared session keys
-- AES-256-GCM encrypted audio frames
-- Opus audio transport
-- optional live voice cloaking before encryption
-- anonymous avatar / waveform UI
-- active-call-only state, with no call logs or recordings persisted
+- Hardened compact-target handling with canonical `bits` validation, overflow/sign-bit checks, and documented SHA3-512 target rules
+- Reduced difficulty oscillation by preventing emergency min-difficulty rescue blocks from poisoning later LWMA/EMA retarget history
+- Repaired invalid active-chain tails automatically on startup for both `bits` and `missing-block` failures
+- Tightened mining acceptance so PoW success is separated cleanly from consensus acceptance and stale replay blocks do not loop forever in the GUI
+- Improved desktop/backend startup behavior when ports are busy, checkpoints are stale, or RPC comes up before peer approval does
 
-The current implementation is designed around secure decentralized relay behavior first. It is functional, but still improving in latency-sensitive and NAT-hostile environments.
+## Consensus and Difficulty
 
-## Storage and Persistence
+- Added compact-target round-trip validation (`bits -> target -> bits`) and canonical encoding enforcement at consensus boundaries
+- Rejected malformed compact targets with sign-bit misuse, zero targets, or 512-bit overflow conditions
+- Documented proof-of-work header serialization, target expansion, and comparison rules in `docs/pow.md`
+- Adjusted the hybrid difficulty controller so emergency low-difficulty rescue blocks do not destabilize follow-on retargets
+- Restored post-recovery difficulty from the last stable non-emergency target rather than letting rescue blocks drag the network back toward `pow_limit`
 
-- Binary block storage by height
-- Header and block-index persistence
-- Chainstate snapshots
-- Hash-addressed known-block persistence improvements for side-branch continuity
-- Wallet backup rotation and recovery-aware save paths
-- System datadir defaults on macOS, Linux, and Windows so chain and wallet state survive binary replacement or deletion
+## Chain Repair and Datadir Recovery
 
-## Website and Release Infrastructure
+- Added automatic repair for stale checkpoints that pinned chains beyond the real valid tip
+- Broadened startup repair so invalid active tails caused by missing canonical blocks are truncated back to the last valid prefix
+- Pruned stale canonical height files after repair so broken tails do not silently reappear
+- Cleaned up rejected contextual candidates from hash-addressed storage instead of leaving them behind in by-hash caches
 
-The repository now includes a real web stack rather than a placeholder landing page.
+## Mining and Backend
 
-Current website features:
+- Confirmed the ARM64 assembly PoW worker against the C++ reference path and fixed the only mismatch found: bounded no-hit iteration accounting
+- Ensured the GUI bundle is refreshed with the current daemon and assembly worker during release builds so the app does not launch stale binaries
+- Prevented replayed stale mined blocks from being retried indefinitely after the backend rejects them
+- Exempted localhost RPC traffic from generic rate limiting so local mined-block reconciliation does not self-throttle
 
-- FastAPI backend
-- Jinja templates
-- home / downloads / technology / network / explorer / reserve / security / roadmap pages
-- deployment examples for Caddy, nginx, and systemd
-- release-directory surfacing on the downloads page
-- reserve-status JSON and public reserve page integration
+## Desktop and Wallet Behavior
 
-Release engineering additions include:
+- Reworked startup bootstrap handling so backend launch failures surface as failures instead of endless “starting” loops
+- Improved bind-conflict handling so the GUI stops retrying aggressively when another process already owns the RPC or P2P port
+- Preserved the distinction between “locally caught up” and approval-gated wallet state more consistently during recovery scenarios
+- Improved mining and backend log clarity around rejected candidates and repair reasons
 
-- cross-platform build matrix helpers
-- Linux AppImage packaging
-- Windows runtime packaging
-- whitepaper PDF generation tooling
+## Packaging and Release Infrastructure
 
-## EVM and Bridge Workspace
+- Updated release metadata to `v0.6.1` across the desktop app, docs, and packaging helpers
+- Refreshed macOS ARM64 release assets from the current source tree
+- Kept the release packaging scripts aligned with the dedicated assembly PoW worker binaries
 
-The repository now contains a dedicated `evm/` workspace for Wrapped CryptEX.
+## Known Notes
 
-Current EVM implementation includes:
+- Public IP autodetect may still emit warning noise on networks where the HTTPS lookup endpoints are blocked or truncated
+- Wallet balances remain approval-gated when the node has not established enough confidence in chain state; this release improves recovery behavior but does not remove the approval model
 
-- `WrappedCryptEX.sol`
-- `wCRX` deployment script
-- Foundry configuration and tests
-- operator runbooks
-- automated bridge daemon
-- reserve snapshot tooling
-- deployment helper scripts
+## Upgrade Guidance
 
-Bridge-related operational assets include:
-
-- reserve-status publication
-- deposit ID helper tooling
-- example macOS and Linux service definitions
-- mainnet deployment checklist and bridge operator runbook
-
-## Platform Outputs
-
-Current repository packaging targets include:
-
-- macOS ARM64
-- Linux x86_64
-- Linux ARM64
-- Windows x86_64
-
-Release artifacts in this flow include:
-
-- backend daemon binaries
-- GUI applications
-- test binaries
-- Linux AppImages
-- Windows runtime bundle
-- whitepaper PDF
-
-## Documentation
-
-Current top-level documentation surfaces:
-
-- Whitepaper PDF: `WHITEPAPER.pdf`
-- Whitepaper source: `archives/CryptEX_Whitepaper_Source_April_2026.md`
-- Release notes: `RELEASE_NOTES.md`
-
-## Known Boundaries and Active Work
-
-The current implementation is substantial, but a few areas are still improving:
-
-- side-branch persistence and archival completeness are improving relative to long-lived production networks
-- some wallet cryptography code paths still emit OpenSSL deprecation warnings on newer toolchains
-- RPC transport is authenticated HTTP, not TLS-secured remote transport
-- messenger and voice relay UX are now significantly stronger, but presence, transport latency, and richer thread semantics are still evolving
-- the EVM bridge stack is present and documented, but operational rollout still depends on reserve management and deployment policy
-- the project has broad regression coverage, but continued hardening and cleanup remain active engineering work
-
-## Suggested GitHub Release Title
-
-`CryptEX Current Release`
-
-## Suggested Short GitHub Release Summary
-
-Current CryptEX release with 512-bit SHA3 proof of work, hybrid adaptive difficulty control, separate GUI and daemon, expanded wallet and RPC tooling, LAN-aware networking, website and release infrastructure, and a full Wrapped CryptEX EVM workspace.
+- Replace older app bundles with the v0.6.1 binaries before starting the GUI miner
+- If you previously mined on a stale or partially corrupted local chain, allow the backend to complete its startup repair once before judging final chain height
+- If a very old mined-block backlog exists, v0.6.1 will reconcile and discard stale rejected entries instead of replaying them forever

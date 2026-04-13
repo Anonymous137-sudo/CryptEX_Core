@@ -90,14 +90,14 @@ bool DaemonController::isRunning() const {
     return process_.state() != QProcess::NotRunning;
 }
 
-void DaemonController::startNode(const LaunchConfig& config) {
+bool DaemonController::startNode(const LaunchConfig& config) {
     if (config.executablePath.isEmpty()) {
         emit errorLine(QStringLiteral("Backend binary path is empty."));
-        return;
+        return false;
     }
     if (!QFileInfo::exists(config.executablePath)) {
         emit errorLine(QStringLiteral("Backend binary was not found at: ") + config.executablePath);
-        return;
+        return false;
     }
 
     if (isRunning()) {
@@ -130,6 +130,7 @@ void DaemonController::startNode(const LaunchConfig& config) {
     if (config.debug) args << "--debug";
 
     process_.start(config.executablePath, args);
+    return true;
 }
 
 void DaemonController::stopNode(bool synchronous) {

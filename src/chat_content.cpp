@@ -89,6 +89,8 @@ std::string detect_mime_type(const std::filesystem::path& path, ContentType type
         return "application/x-cryptex-voice-signal";
     case ContentType::VoiceFrame:
         return "audio/x-cryptex-live-pcm";
+    case ContentType::File:
+        return "application/octet-stream";
     case ContentType::Text:
         break;
     }
@@ -232,7 +234,7 @@ ContentEnvelope load_attachment_content(const std::filesystem::path& path,
     }
     auto type = requested_type ? *requested_type : detect_content_type(path).value_or(ContentType::Text);
     if (type == ContentType::Text) {
-        throw std::runtime_error("attachment type must be image, video, or audio");
+        throw std::runtime_error("attachment type must be image, video, audio, or file");
     }
 
     ContentEnvelope content;
@@ -284,6 +286,15 @@ std::vector<uint8_t> serialize_content(const ContentEnvelope& content) {
                                reinterpret_cast<const uint8_t*>(content.attachment_name.data()),
                                content.attachment_name.size());
     serialization::write_bytes(out,
+                               reinterpret_cast<const uint8_t*>(content.subject.data()),
+                               content.subject.size());
+    serialization::write_bytes(out,
+                               reinterpret_cast<const uint8_t*>(content.mail_to.data()),
+                               content.mail_to.size());
+    serialization::write_bytes(out,
+                               reinterpret_cast<const uint8_t*>(content.mail_cc.data()),
+                               content.mail_cc.size());
+    serialization::write_bytes(out,
                                reinterpret_cast<const uint8_t*>(content.text.data()),
                                content.text.size());
     serialization::write_bytes(out,
@@ -307,6 +318,16 @@ ContentEnvelope deserialize_content(const std::vector<uint8_t>& data) {
     content.audio_privacy = static_cast<AudioPrivacy>(serialization::read_int<uint8_t>(ptr, remaining));
     auto mime = serialization::read_bytes(ptr, remaining);
     auto name = serialization::read_bytes(ptr, remaining);
+    std::vector<uint8_t> subject;
+    std::vector<uint8_t> mail_to;
+    std::vector<uint8_t> mail_cc;
+    if (content.version >= 3) {
+        subject = serialization::read_bytes(ptr, remaining);
+    }
+    if (content.version >= 4) {
+        mail_to = serialization::read_bytes(ptr, remaining);
+        mail_cc = serialization::read_bytes(ptr, remaining);
+    }
     auto text = serialization::read_bytes(ptr, remaining);
     std::vector<uint8_t> transcript;
     if (content.version >= 2) {
@@ -314,6 +335,9 @@ ContentEnvelope deserialize_content(const std::vector<uint8_t>& data) {
     }
     content.mime_type.assign(mime.begin(), mime.end());
     content.attachment_name.assign(name.begin(), name.end());
+    content.subject.assign(subject.begin(), subject.end());
+    content.mail_to.assign(mail_to.begin(), mail_to.end());
+    content.mail_cc.assign(mail_cc.begin(), mail_cc.end());
     content.text.assign(text.begin(), text.end());
     content.transcript.assign(transcript.begin(), transcript.end());
     content.attachment_bytes = serialization::read_bytes(ptr, remaining);
@@ -334,6 +358,8 @@ const char* content_type_name(ContentType type) {
         return "voice-control";
     case ContentType::VoiceFrame:
         return "voice-frame";
+    case ContentType::File:
+        return "file";
     }
     return "text";
 }
@@ -346,6 +372,7 @@ std::optional<ContentType> parse_content_type(const std::string& text) {
     if (normalized == "audio" || normalized == "voice") return ContentType::Audio;
     if (normalized == "voice-control" || normalized == "call-control") return ContentType::VoiceControl;
     if (normalized == "voice-frame" || normalized == "call-audio") return ContentType::VoiceFrame;
+    if (normalized == "file" || normalized == "attachment") return ContentType::File;
     return std::nullopt;
 }
 
@@ -387,7 +414,8 @@ std::string content_summary(const ContentEnvelope& content) {
 
 std::filesystem::path persist_attachment(const ContentEnvelope& content,
                                          const std::filesystem::path& data_dir,
-                                         const std::string& message_id) {
+                                         const std::string& message_id,
+                                         const std::string& media_subdir) {
     if (content.attachment_bytes.empty()) {
         return {};
     }
@@ -395,7 +423,7 @@ std::filesystem::path persist_attachment(const ContentEnvelope& content,
         return {};
     }
 
-    std::filesystem::path media_dir = data_dir / "chat_media";
+    std::filesystem::path media_dir = data_dir / media_subdir;
     std::error_code ec;
     std::filesystem::create_directories(media_dir, ec);
     if (ec) {

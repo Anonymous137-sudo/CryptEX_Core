@@ -19,6 +19,7 @@
 #include <boost/beast/version.hpp>
 #include <boost/asio/ip/network_v4.hpp>
 #include <filesystem>
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -902,6 +903,29 @@ std::string address_for_wallet_display(const Wallet& wallet, const std::string& 
     }
 }
 
+std::string canonicalize_address_if_possible(const std::string& value) {
+    try {
+        return crypto::canonicalize_address(value);
+    } catch (...) {
+        return value;
+    }
+}
+
+constexpr const char* kP2PMailDomain = "p2pmail.crx";
+
+std::string p2pmail_alias_for_address(const std::string& address,
+                                      const std::optional<std::string>& preferred_display = std::nullopt) {
+    if (address.empty()) return {};
+    try {
+        const auto local = preferred_display.value_or(crypto::address_to_base58(address));
+        return local + "@" + kP2PMailDomain;
+    } catch (...) {
+        return address + "@" + kP2PMailDomain;
+    }
+}
+
+std::string normalize_p2pmail_recipient(const std::string& value);
+
 void add_address_formats(JsonValue& object,
                          const std::string& key,
                          const std::string& address,
@@ -929,6 +953,7 @@ JsonValue wallet_address_to_json(const Wallet::AddressBookEntry& entry) {
     obj.set("address_base58", JsonValue::string(entry.address_base58));
     obj.set("address_hex", JsonValue::string(entry.address_hex));
     obj.set("address_bech32", JsonValue::string(entry.address_bech32));
+    obj.set("mail_address", JsonValue::string(p2pmail_alias_for_address(canonicalize_address_if_possible(entry.address_base64.empty() ? entry.address : entry.address_base64))));
     obj.set("label", JsonValue::string(entry.label));
     obj.set("pubkey_b64", JsonValue::string(entry.pubkey_b64));
     obj.set("primary", JsonValue(entry.primary));
@@ -1404,6 +1429,9 @@ JsonValue chat_entry_to_json(const chat::HistoryEntry& entry) {
     obj.set("recipient_pubkey", JsonValue::string(entry.recipient_pubkey));
     obj.set("channel", JsonValue::string(entry.channel));
     obj.set("message", JsonValue::string(entry.message));
+    obj.set("mail_to", JsonValue::string(entry.mail_to));
+    obj.set("mail_cc", JsonValue::string(entry.mail_cc));
+    obj.set("mail_bcc", JsonValue::string(entry.mail_bcc));
     obj.set("peer", JsonValue::string(entry.peer_label));
     obj.set("status", JsonValue::string(entry.status));
     obj.set("content_type", JsonValue::string(entry.content_type));
@@ -1414,6 +1442,7 @@ JsonValue chat_entry_to_json(const chat::HistoryEntry& entry) {
     obj.set("audio_privacy", JsonValue::string(entry.audio_privacy));
     obj.set("encryption_mode", JsonValue::string(entry.encryption_mode));
     obj.set("transcript", JsonValue::string(entry.transcript));
+    obj.set("subject", JsonValue::string(entry.subject));
     return obj;
 }
 
@@ -1497,6 +1526,29 @@ chat::HistoryQuery chat_query_from_params(const JsonValue::array_t& params) {
     return query;
 }
 
+chat::HistoryQuery mail_query_from_params(const JsonValue::array_t& params) {
+    auto query = chat_query_from_params(params);
+    const JsonValue* object = nullptr;
+    if (!params.empty()) {
+        if (params[0].is_object()) object = &params[0];
+        else if (params.size() > 1 && params[1].is_object()) object = &params[1];
+    }
+    if (object && object->is_object()) {
+        if (const auto* folder = object->find("folder")) {
+            auto normalized = folder->as_string();
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            if (normalized == "inbox") query.direction = "in";
+            else if (normalized == "sent" || normalized == "outbox") query.direction = "out";
+        }
+        if (const auto* address = object->find("address")) {
+            query.address = normalize_p2pmail_recipient(address->as_string());
+        }
+    }
+    return query;
+}
+
 chat::HistoryEntry build_outbound_chat_history(const net::ChatPayload& payload,
                                                const chat::ContentEnvelope& content,
                                                const std::string& peer_label) {
@@ -1506,7 +1558,7 @@ chat::HistoryEntry build_outbound_chat_history(const net::ChatPayload& payload,
     entry.authenticated = (payload.flags & chat::CHAT_FLAG_SIGNED) != 0;
     entry.encrypted = (payload.flags & chat::CHAT_FLAG_ENCRYPTED) != 0;
     entry.decrypted = true;
-    entry.is_private = payload.chat_type == 1;
+    entry.is_private = payload.chat_type != chat::CHAT_TYPE_PUBLIC;
     entry.timestamp = payload.timestamp;
     entry.nonce = payload.nonce;
     entry.message_id = chat::message_id(payload);
@@ -1515,6 +1567,9 @@ chat::HistoryEntry build_outbound_chat_history(const net::ChatPayload& payload,
     entry.recipient_address = payload.recipient;
     entry.recipient_pubkey = crypto::base64_encode(payload.recipient_pubkey);
     entry.channel = payload.channel;
+    entry.subject = content.subject;
+    entry.mail_to = content.mail_to;
+    entry.mail_cc = content.mail_cc;
     entry.message = chat::content_summary(content);
     entry.peer_label = peer_label;
     entry.status = "queued";
@@ -1545,10 +1600,14 @@ struct ChatSendRequest {
     std::optional<std::string> peer_label;
     std::string route;
     std::string recipient_address;
+    std::vector<std::string> cc_addresses;
+    std::vector<std::string> bcc_addresses;
     std::string recipient_pubkey_b64;
     std::string recipient_rsa_pubkey_pem;
+    std::string subject;
     std::string message;
     std::string from_address;
+    std::string totp_code;
     std::string attachment_path;
     std::string attachment_name;
     std::string mime_type;
@@ -1558,6 +1617,44 @@ struct ChatSendRequest {
     std::optional<chat::KeyDerivation> kdf;
     std::optional<chat::EncryptionMode> encryption_mode;
 };
+
+std::vector<std::string> parse_mail_recipient_list(const JsonValue& value) {
+    std::vector<std::string> out;
+    auto append = [&](const std::string& raw) {
+        std::stringstream ss(raw);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            item = trim_copy(item);
+            if (item.empty()) continue;
+            out.push_back(normalize_p2pmail_recipient(item));
+        }
+    };
+    if (value.is_string()) {
+        append(value.as_string());
+    } else if (value.is_array()) {
+        for (const auto& item : value.as_array()) {
+            if (item.is_string()) append(item.as_string());
+        }
+    }
+    std::vector<std::string> deduped;
+    for (const auto& address : out) {
+        if (address.empty()) continue;
+        const bool exists = std::any_of(deduped.begin(), deduped.end(), [&](const auto& existing) {
+            return crypto::addresses_equal(existing, address);
+        });
+        if (!exists) deduped.push_back(address);
+    }
+    return deduped;
+}
+
+std::string join_mail_aliases(const std::vector<std::string>& addresses) {
+    std::string out;
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        if (i != 0) out += ", ";
+        out += p2pmail_alias_for_address(addresses[i]);
+    }
+    return out;
+}
 
 ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool private_chat) {
     ChatSendRequest request;
@@ -1571,6 +1668,7 @@ ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool p
         if (const auto* name = object.find("attachment_name")) request.attachment_name = name->as_string();
         if (const auto* mime = object.find("mime_type")) request.mime_type = mime->as_string();
         if (const auto* transcript = object.find("attachment_transcript")) request.attachment_transcript = transcript->as_string();
+        if (const auto* subject = object.find("subject")) request.subject = subject->as_string();
         if (const auto* media = object.find("media_type")) {
             auto parsed_type = chat::parse_content_type(media->as_string());
             if (!parsed_type || *parsed_type == chat::ContentType::Text) {
@@ -1656,17 +1754,83 @@ ChatSendRequest parse_chat_send_request(const JsonValue::array_t& params, bool p
     return request;
 }
 
-chat::ContentEnvelope build_chat_content_from_request(const ChatSendRequest& request) {
-    if (!request.attachment_path.empty()) {
-        return chat::load_attachment_content(request.attachment_path,
-                                             request.content_type,
-                                             request.message,
-                                             request.obfuscate_audio,
-                                             request.mime_type.empty() ? std::nullopt : std::make_optional(request.mime_type),
-                                             request.attachment_name.empty() ? std::nullopt : std::make_optional(request.attachment_name),
-                                             request.attachment_transcript.empty() ? std::nullopt : std::make_optional(request.attachment_transcript));
+ChatSendRequest parse_mail_send_request(const JsonValue::array_t& params) {
+    ChatSendRequest request;
+    if (!params.empty() && params[0].is_object()) {
+        const auto& object = params[0];
+        if (const auto* peer = object.find("peer")) request.peer_label = peer->as_string();
+        if (const auto* from = object.find("from")) request.from_address = normalize_p2pmail_recipient(from->as_string());
+        else if (const auto* from = object.find("from_address")) request.from_address = normalize_p2pmail_recipient(from->as_string());
+        if (const auto* recipient = object.find("to")) request.recipient_address = normalize_p2pmail_recipient(recipient->as_string());
+        else if (const auto* recipient = object.find("recipient_address")) request.recipient_address = normalize_p2pmail_recipient(recipient->as_string());
+        if (const auto* cc = object.find("cc")) request.cc_addresses = parse_mail_recipient_list(*cc);
+        if (const auto* bcc = object.find("bcc")) request.bcc_addresses = parse_mail_recipient_list(*bcc);
+        if (const auto* pubkey = object.find("recipient_pubkey_b64")) request.recipient_pubkey_b64 = pubkey->as_string();
+        if (const auto* rsa = object.find("recipient_rsa_pubkey_pem")) request.recipient_rsa_pubkey_pem = rsa->as_string();
+        if (const auto* subject = object.find("subject")) request.subject = subject->as_string();
+        if (const auto* body = object.find("body")) request.message = body->as_string();
+        else if (const auto* body = object.find("message")) request.message = body->as_string();
+        if (const auto* attachment = object.find("attachment_path")) request.attachment_path = attachment->as_string();
+        if (const auto* name = object.find("attachment_name")) request.attachment_name = name->as_string();
+        if (const auto* mime = object.find("mime_type")) request.mime_type = mime->as_string();
+        if (const auto* transcript = object.find("attachment_transcript")) request.attachment_transcript = transcript->as_string();
+        if (const auto* totp = object.find("totp_code")) request.totp_code = totp->as_string();
+        if (const auto* privacy = object.find("obfuscate_audio")) request.obfuscate_audio = privacy->as_bool();
+        if (const auto* encryption = object.find("encryption")) {
+            auto parsed = chat::parse_encryption_mode(encryption->as_string());
+            if (!parsed) throw RpcException(-32602, "unknown mail encryption mode");
+            request.encryption_mode = *parsed;
+        }
+        if (const auto* kdf = object.find("kdf")) {
+            auto parsed = chat::parse_kdf(kdf->as_string());
+            if (!parsed) throw RpcException(-32602, "unknown mail kdf");
+            request.kdf = *parsed;
+        }
+        if (const auto* media = object.find("media_type")) {
+            auto parsed_type = chat::parse_content_type(media->as_string());
+            if (!parsed_type) throw RpcException(-32602, "unknown mail media_type");
+            request.content_type = *parsed_type;
+        } else if (!request.attachment_path.empty()) {
+            request.content_type = chat::ContentType::File;
+        }
+        if (request.recipient_address.empty() || (request.message.empty() && request.attachment_path.empty())) {
+            throw RpcException(-32602, "sendp2pmail expects {to, subject?, body?, attachment_path?, from?, peer?, encryption?, kdf?}");
+        }
+        return request;
     }
-    return chat::make_text_content(request.message);
+
+    if (params.size() < 3 || params.size() > 4) {
+        throw RpcException(-32602, "sendp2pmail expects [to, subject, body, from?] or [{...}]");
+    }
+    request.recipient_address = normalize_p2pmail_recipient(params[0].as_string());
+    request.subject = params[1].as_string();
+    request.message = params[2].as_string();
+    if (params.size() > 3) request.from_address = normalize_p2pmail_recipient(params[3].as_string());
+    if (request.recipient_address.empty()) {
+        throw RpcException(-32602, "mail recipient is required");
+    }
+    return request;
+}
+
+chat::ContentEnvelope build_chat_content_from_request(const ChatSendRequest& request) {
+    chat::ContentEnvelope content;
+    if (!request.attachment_path.empty()) {
+        content = chat::load_attachment_content(request.attachment_path,
+                                                request.content_type,
+                                                request.message,
+                                                request.obfuscate_audio,
+                                                request.mime_type.empty() ? std::nullopt : std::make_optional(request.mime_type),
+                                                request.attachment_name.empty() ? std::nullopt : std::make_optional(request.attachment_name),
+                                                request.attachment_transcript.empty() ? std::nullopt : std::make_optional(request.attachment_transcript));
+    } else {
+        content = chat::make_text_content(request.message);
+    }
+    content.subject = request.subject;
+    std::vector<std::string> visible_to;
+    if (!request.recipient_address.empty()) visible_to.push_back(request.recipient_address);
+    content.mail_to = join_mail_aliases(visible_to);
+    content.mail_cc = join_mail_aliases(request.cc_addresses);
+    return content;
 }
 
 std::filesystem::path runtime_data_dir(const net::NetworkNode* node,
@@ -1698,12 +1862,218 @@ std::filesystem::path proxy_config_path(const std::filesystem::path& data_dir) {
     return data_dir / "chat_proxy.conf";
 }
 
+std::filesystem::path mail_security_path(const std::filesystem::path& data_dir) {
+    return data_dir / "p2pmail_security.conf";
+}
+
+std::filesystem::path mail_policy_path(const std::filesystem::path& data_dir) {
+    return data_dir / "p2pmail_policy.conf";
+}
+
 std::filesystem::path irc_config_path(const std::filesystem::path& data_dir) {
     return data_dir / "irc.conf";
 }
 
 std::filesystem::path irc_log_path(const std::filesystem::path& data_dir) {
     return data_dir / "irc_history.dat";
+}
+
+std::string base32_encode_bytes(const std::vector<uint8_t>& bytes) {
+    static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    std::string out;
+    int buffer = 0;
+    int bits_left = 0;
+    for (uint8_t byte : bytes) {
+        buffer = (buffer << 8) | byte;
+        bits_left += 8;
+        while (bits_left >= 5) {
+            out.push_back(alphabet[(buffer >> (bits_left - 5)) & 0x1F]);
+            bits_left -= 5;
+        }
+    }
+    if (bits_left > 0) {
+        out.push_back(alphabet[(buffer << (5 - bits_left)) & 0x1F]);
+    }
+    return out;
+}
+
+std::vector<uint8_t> base32_decode_bytes(std::string text) {
+    auto decode_char = [](char ch) -> int {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a';
+        if (ch >= '2' && ch <= '7') return 26 + (ch - '2');
+        return -1;
+    };
+    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) || ch == '=';
+    }), text.end());
+
+    std::vector<uint8_t> out;
+    int buffer = 0;
+    int bits_left = 0;
+    for (char ch : text) {
+        const int value = decode_char(ch);
+        if (value < 0) continue;
+        buffer = (buffer << 5) | value;
+        bits_left += 5;
+        if (bits_left >= 8) {
+            out.push_back(static_cast<uint8_t>((buffer >> (bits_left - 8)) & 0xFF));
+            bits_left -= 8;
+        }
+    }
+    return out;
+}
+
+std::string generate_totp_secret_b32() {
+    std::vector<uint8_t> secret(20, 0);
+    if (RAND_bytes(secret.data(), static_cast<int>(secret.size())) != 1) {
+        throw RpcException(-32603, "failed to generate mail 2FA secret");
+    }
+    return base32_encode_bytes(secret);
+}
+
+uint32_t hotp_sha1(const std::vector<uint8_t>& secret, uint64_t counter) {
+    std::array<unsigned char, 20> digest{};
+    unsigned int digest_len = 0;
+    unsigned char msg[8];
+    for (int i = 7; i >= 0; --i) {
+        msg[i] = static_cast<unsigned char>(counter & 0xFF);
+        counter >>= 8;
+    }
+    if (!HMAC(EVP_sha1(),
+              secret.data(),
+              static_cast<int>(secret.size()),
+              msg,
+              sizeof(msg),
+              digest.data(),
+              &digest_len) || digest_len < 20) {
+        throw RpcException(-32603, "HMAC-SHA1 failed");
+    }
+    const int offset = digest[19] & 0x0F;
+    uint32_t bin_code = (static_cast<uint32_t>(digest[offset] & 0x7F) << 24) |
+                        (static_cast<uint32_t>(digest[offset + 1]) << 16) |
+                        (static_cast<uint32_t>(digest[offset + 2]) << 8) |
+                        static_cast<uint32_t>(digest[offset + 3]);
+    return bin_code % 1000000U;
+}
+
+bool verify_totp_code(const std::string& secret_b32, std::string code, uint64_t timestamp = 0) {
+    code.erase(std::remove_if(code.begin(), code.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), code.end());
+    if (secret_b32.empty() || code.empty()) return false;
+    const auto secret = base32_decode_bytes(secret_b32);
+    if (secret.empty()) return false;
+    const uint64_t now = timestamp != 0 ? timestamp : static_cast<uint64_t>(std::time(nullptr));
+    const uint64_t step = now / 30;
+    for (int drift = -1; drift <= 1; ++drift) {
+        const uint64_t counter = static_cast<uint64_t>(static_cast<int64_t>(step) + drift);
+        std::ostringstream expected;
+        expected << std::setw(6) << std::setfill('0') << hotp_sha1(secret, counter);
+        if (expected.str() == code) return true;
+    }
+    return false;
+}
+
+std::string mail_issuer_name(std::string issuer) {
+    if (issuer.empty()) issuer = "CryptEX P2P Mail";
+    return issuer;
+}
+
+JsonValue mail_security_to_json(const chatstate::MailSecurityConfig& config) {
+    JsonValue row = JsonValue::object();
+    const auto issuer = mail_issuer_name(config.issuer);
+    row.set("two_factor_enabled", JsonValue(config.two_factor_enabled));
+    row.set("totp_secret_b32", JsonValue::string(config.totp_secret_b32));
+    row.set("issuer", JsonValue::string(issuer));
+    row.set("otpauth_uri", JsonValue::string(std::string("otpauth://totp/") + issuer + "?secret=" + config.totp_secret_b32 + "&issuer=" + issuer));
+    return row;
+}
+
+JsonValue mail_policy_to_json(const chatstate::MailPolicyConfig& config) {
+    JsonValue row = JsonValue::object();
+    row.set("ttl_hours", JsonValue::number(static_cast<uint64_t>(config.ttl_hours)));
+    row.set("replica_target", JsonValue::number(static_cast<uint64_t>(config.replica_target)));
+    row.set("max_store_items", JsonValue::number(static_cast<uint64_t>(config.max_store_items)));
+    row.set("prune_imported", JsonValue(config.prune_imported));
+    row.set("prune_expired", JsonValue(config.prune_expired));
+    row.set("proof_of_storage", JsonValue(config.proof_of_storage));
+    row.set("challenge_interval_minutes", JsonValue::number(static_cast<uint64_t>(config.challenge_interval_minutes)));
+    row.set("minimum_bond_sats", JsonValue::number(config.minimum_bond_sats));
+    row.set("required_verified_replicas", JsonValue::number(static_cast<uint64_t>(config.required_verified_replicas)));
+    row.set("slash_on_failed_proof", JsonValue(config.slash_on_failed_proof));
+    row.set("slash_penalty_score", JsonValue::number(static_cast<uint64_t>(config.slash_penalty_score)));
+    row.set("nat_assist", JsonValue(config.nat_assist));
+    row.set("relay_fallback", JsonValue(config.relay_fallback));
+    JsonValue relay_peers = JsonValue::array({});
+    for (const auto& relay : config.relay_peers) {
+        relay_peers.push_back(JsonValue::string(relay));
+    }
+    row.set("relay_peers", std::move(relay_peers));
+    JsonValue stun_servers = JsonValue::array({});
+    for (const auto& server : config.stun_servers) {
+        stun_servers.push_back(JsonValue::string(server));
+    }
+    row.set("stun_servers", std::move(stun_servers));
+    row.set("stun_timeout_ms", JsonValue::number(static_cast<uint64_t>(config.stun_timeout_ms)));
+    return row;
+}
+
+chatstate::MailPolicyConfig mail_policy_from_json(const JsonValue& value, const chatstate::MailPolicyConfig& current) {
+    if (!value.is_object()) throw RpcException(-32602, "mail policy config must be an object");
+    chatstate::MailPolicyConfig config = current;
+    if (const auto* field = value.find("ttl_hours")) config.ttl_hours = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("replica_target")) config.replica_target = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("max_store_items")) config.max_store_items = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("prune_imported")) config.prune_imported = field->as_bool();
+    if (const auto* field = value.find("prune_expired")) config.prune_expired = field->as_bool();
+    if (const auto* field = value.find("proof_of_storage")) config.proof_of_storage = field->as_bool();
+    if (const auto* field = value.find("challenge_interval_minutes")) config.challenge_interval_minutes = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("minimum_bond_sats")) config.minimum_bond_sats = field->as_u64();
+    if (const auto* field = value.find("required_verified_replicas")) config.required_verified_replicas = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("slash_on_failed_proof")) config.slash_on_failed_proof = field->as_bool();
+    if (const auto* field = value.find("slash_penalty_score")) config.slash_penalty_score = static_cast<uint32_t>(field->as_u64());
+    if (const auto* field = value.find("nat_assist")) config.nat_assist = field->as_bool();
+    if (const auto* field = value.find("relay_fallback")) config.relay_fallback = field->as_bool();
+    if (const auto* field = value.find("relay_peers")) {
+        if (!field->is_array()) throw RpcException(-32602, "relay_peers must be an array");
+        config.relay_peers.clear();
+        for (const auto& item : field->as_array()) {
+            if (item.is_string()) config.relay_peers.push_back(item.as_string());
+        }
+    }
+    if (const auto* field = value.find("stun_servers")) {
+        if (!field->is_array()) throw RpcException(-32602, "stun_servers must be an array");
+        config.stun_servers.clear();
+        for (const auto& item : field->as_array()) {
+            if (item.is_string()) config.stun_servers.push_back(item.as_string());
+        }
+    }
+    if (const auto* field = value.find("stun_timeout_ms")) config.stun_timeout_ms = static_cast<uint32_t>(field->as_u64());
+    if (config.ttl_hours == 0) config.ttl_hours = 1;
+    if (config.replica_target == 0) config.replica_target = 1;
+    if (config.max_store_items == 0) config.max_store_items = 1;
+    if (config.challenge_interval_minutes == 0) config.challenge_interval_minutes = 1;
+    if (config.required_verified_replicas == 0) config.required_verified_replicas = 1;
+    if (config.slash_penalty_score == 0) config.slash_penalty_score = 1;
+    if (config.stun_timeout_ms == 0) config.stun_timeout_ms = 100;
+    return config;
+}
+
+chatstate::MailSecurityConfig mail_security_from_json(const JsonValue& value, const chatstate::MailSecurityConfig& current) {
+    if (!value.is_object()) throw RpcException(-32602, "mail security config must be an object");
+    chatstate::MailSecurityConfig config = current;
+    if (const auto* field = value.find("two_factor_enabled")) config.two_factor_enabled = field->as_bool();
+    if (const auto* field = value.find("issuer")) config.issuer = field->as_string();
+    if (const auto* field = value.find("totp_secret_b32")) config.totp_secret_b32 = field->as_string();
+    if (const auto* field = value.find("regenerate_secret")) {
+        if (field->as_bool()) config.totp_secret_b32 = generate_totp_secret_b32();
+    }
+    config.issuer = mail_issuer_name(config.issuer);
+    if (config.two_factor_enabled && config.totp_secret_b32.empty()) {
+        config.totp_secret_b32 = generate_totp_secret_b32();
+    }
+    return config;
 }
 
 std::string normalize_directory_address(const std::string& address) {
@@ -1717,6 +2087,92 @@ std::string normalize_directory_address(const std::string& address) {
 std::optional<std::string> try_directory_address(const std::string& address) {
     try {
         return crypto::canonicalize_address(address);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::string normalize_p2pmail_recipient(const std::string& value) {
+    auto trimmed = value;
+    trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+    trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), trimmed.end());
+    const auto at = trimmed.find('@');
+    if (at != std::string::npos) {
+        const auto local = trimmed.substr(0, at);
+        std::string domain = trimmed.substr(at + 1);
+        std::transform(domain.begin(), domain.end(), domain.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (domain == kP2PMailDomain) {
+            trimmed = local;
+        }
+    }
+    return normalize_directory_address(trimmed);
+}
+
+JsonValue mail_entry_to_json(const chat::HistoryEntry& entry) {
+    JsonValue obj = chat_entry_to_json(entry);
+    obj.set("folder", JsonValue::string(entry.direction == "out" ? "sent" : "inbox"));
+    obj.set("sender_mail_address", JsonValue::string(entry.sender_address.empty() ? std::string() : p2pmail_alias_for_address(entry.sender_address)));
+    obj.set("recipient_mail_address", JsonValue::string(entry.recipient_address.empty() ? std::string() : p2pmail_alias_for_address(entry.recipient_address)));
+    if (entry.mail_to.empty() && !entry.recipient_address.empty()) {
+        obj.set("mail_to", JsonValue::string(p2pmail_alias_for_address(entry.recipient_address)));
+    }
+    return obj;
+}
+
+bool wallet_owns_address(const Wallet& wallet, const std::string& address) {
+    return std::any_of(wallet.addresses.begin(), wallet.addresses.end(), [&](const auto& item) {
+        return crypto::addresses_equal(item, address);
+    });
+}
+
+std::optional<chat::HistoryEntry> distributed_mail_record_to_entry(const net::NetworkNode::DistributedMailRecord& record,
+                                                                   const Wallet& wallet,
+                                                                   const std::filesystem::path& data_dir) {
+    try {
+        auto payload = net::ChatPayload::deserialize(crypto::base64_decode(record.payload_b64));
+        if (payload.chat_type != chat::CHAT_TYPE_MAIL) return std::nullopt;
+        if (!record.recipient_address.empty() && !wallet_owns_address(wallet, record.recipient_address)) {
+            return std::nullopt;
+        }
+        auto parsed = chat::parse_chat_payload(payload, &wallet);
+        chat::HistoryEntry entry;
+        entry.direction = "in";
+        entry.legacy = parsed.legacy;
+        entry.authenticated = parsed.authenticated;
+        entry.encrypted = parsed.encrypted;
+        entry.decrypted = parsed.decrypted;
+        entry.is_private = true;
+        entry.timestamp = parsed.timestamp;
+        entry.nonce = parsed.nonce;
+        entry.message_id = parsed.message_id;
+        entry.sender_address = parsed.sender_address.empty() ? record.sender_address : parsed.sender_address;
+        entry.sender_pubkey = crypto::base64_encode(payload.sender_pubkey);
+        entry.recipient_address = parsed.recipient_address.empty() ? record.recipient_address : parsed.recipient_address;
+        entry.recipient_pubkey = crypto::base64_encode(payload.recipient_pubkey);
+        entry.channel = parsed.channel;
+        entry.subject = parsed.content.subject;
+        entry.mail_to = parsed.content.mail_to;
+        entry.mail_cc = parsed.content.mail_cc;
+        entry.message = parsed.message;
+        entry.peer_label = record.peer_label.empty() ? "distributed-store" : record.peer_label;
+        entry.status = parsed.decrypted ? "synced-from-distributed-store" : "received-opaque-store";
+        entry.content_type = chat::content_type_name(parsed.content.type);
+        entry.mime_type = parsed.content.mime_type;
+        entry.attachment_name = parsed.content.attachment_name;
+        entry.attachment_size = static_cast<uint64_t>(parsed.content.attachment_bytes.size());
+        entry.audio_privacy = chat::audio_privacy_name(parsed.content.audio_privacy);
+        entry.transcript = parsed.content.transcript;
+        entry.encryption_mode = chat::encryption_mode_name(parsed.encryption_mode);
+        if (!parsed.content.attachment_bytes.empty()) {
+            entry.attachment_path = chat::persist_attachment(parsed.content, data_dir, entry.message_id, "p2pmail_media").string();
+        }
+        return entry;
     } catch (...) {
         return std::nullopt;
     }
@@ -1996,6 +2452,7 @@ std::vector<PublicDirectoryEntry> scan_public_directory(const Blockchain& chain,
 JsonValue public_directory_entry_to_json(const PublicDirectoryEntry& entry) {
     JsonValue row = JsonValue::object();
     add_address_formats(row, "address", entry.address);
+    row.set("mail_address", JsonValue::string(p2pmail_alias_for_address(entry.address)));
     row.set("balance_sats", JsonValue::number(entry.balance_sats));
     row.set("received_sats", JsonValue::number(entry.received_sats));
     row.set("sent_sats", JsonValue::number(entry.sent_sats));
@@ -2026,9 +2483,23 @@ ResolvedChatRecipient resolve_chat_recipient(const std::string& requested_addres
                                              const Wallet* wallet,
                                              const std::filesystem::path& data_dir) {
     ResolvedChatRecipient resolved;
-    resolved.address = normalize_directory_address(requested_address);
+    resolved.address = normalize_p2pmail_recipient(requested_address);
     if (resolved.address.empty()) {
         return resolved;
+    }
+
+    if (wallet) {
+        const auto& addresses = wallet->addresses;
+        const auto& pubkeys = wallet->pubkeys;
+        for (size_t i = 0; i < addresses.size() && i < pubkeys.size(); ++i) {
+            if (!crypto::addresses_equal(addresses[i], resolved.address)) continue;
+            resolved.found = true;
+            resolved.pubkey_b64 = crypto::base64_encode(pubkeys[i]);
+            resolved.rsa_pubkey_pem = wallet->chat_rsa_public_key_pem;
+            resolved.peer_label = "self";
+            resolved.source = "wallet";
+            break;
+        }
     }
 
     const auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
@@ -2064,6 +2535,7 @@ ResolvedChatRecipient resolve_chat_recipient(const std::string& requested_addres
 JsonValue resolved_chat_recipient_to_json(const ResolvedChatRecipient& resolved) {
     JsonValue row = JsonValue::object();
     add_address_formats(row, "address", resolved.address);
+    row.set("mail_address", JsonValue::string(p2pmail_alias_for_address(resolved.address)));
     row.set("found", JsonValue(resolved.found));
     row.set("label", JsonValue::string(resolved.label));
     row.set("pubkey_b64", JsonValue::string(resolved.pubkey_b64));
@@ -2194,6 +2666,23 @@ RpcService::RpcService(Blockchain& chain,
         if (proxy.enabled && !proxy.host.empty() && proxy.port != 0) {
             node_->set_socks5_proxy(proxy.host, proxy.port, proxy.remote_dns);
         }
+        const auto mail_policy = chatstate::load_mail_policy_config(mail_policy_path(data_dir));
+        node_->set_mail_replication_policy({mail_policy.ttl_hours,
+                                            mail_policy.replica_target,
+                                            mail_policy.max_store_items,
+                                            mail_policy.prune_imported,
+                                            mail_policy.prune_expired,
+                                            mail_policy.proof_of_storage,
+                                            mail_policy.challenge_interval_minutes,
+                                            mail_policy.minimum_bond_sats,
+                                            mail_policy.required_verified_replicas,
+                                            mail_policy.slash_on_failed_proof,
+                                            mail_policy.slash_penalty_score,
+                                            mail_policy.nat_assist,
+                                            mail_policy.relay_fallback,
+                                            mail_policy.relay_peers,
+                                            mail_policy.stun_servers,
+                                            mail_policy.stun_timeout_ms});
         if (wallet_path_ && wallet_password_) {
             node_->set_chat_wallet(std::make_shared<Wallet>(Wallet::load(*wallet_password_, *wallet_path_)));
         }
@@ -2266,8 +2755,12 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                      "sendvoicecallaudio", "pullvoicecallaudio",
                      "getchatprivatecontacts", "upsertchatprivatecontact", "removechatprivatecontact",
                      "getchatproxyconfig", "setchatproxyconfig",
+                     "getp2pmailproxyconfig", "setp2pmailproxyconfig",
+                     "getp2pmailsecurity", "setp2pmailsecurity", "verifyp2pmail2fa",
+                     "getp2pmailpolicy", "setp2pmailpolicy",
                      "getircconfig", "setircconfig", "getirclog", "sendircmessage",
                      "resolvechatrecipient", "getpublicaddressdirectory",
+                     "getp2pmailaccounts", "resolvep2pmailrecipient", "getp2pmail", "sendp2pmail", "deletep2pmail",
                      "getpeerinfo", "getpeergraph", "getnetworkinfo", "getportmappinginfo", "getmininginfo", "getmempoolinfo",
                      "getwalletinfo", "getbalance", "listunspent", "getwalletaddresses",
                      "getwalletaddressbook", "setaddresslabel", "setprimaryaddress",
@@ -2745,6 +3238,28 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             }
             result = resolved_chat_recipient_to_json(
                 resolve_chat_recipient(params[0].as_string(), chain_, node_, wallet ? &*wallet : nullptr, chat_data_root()));
+        } else if (method == "getp2pmailaccounts") {
+            require_wallet_session();
+            auto wallet = load_session_wallet();
+            JsonValue rows = JsonValue::array({});
+            for (const auto& entry : wallet.address_book()) {
+                rows.push_back(wallet_address_to_json(entry));
+            }
+            result = std::move(rows);
+        } else if (method == "resolvep2pmailrecipient") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "resolvep2pmailrecipient expects [mail_address_or_wallet_address]");
+            }
+            std::optional<Wallet> wallet;
+            if (has_wallet_session()) {
+                wallet = load_session_wallet();
+            }
+            result = resolved_chat_recipient_to_json(
+                resolve_chat_recipient(normalize_p2pmail_recipient(params[0].as_string()),
+                                       chain_,
+                                       node_,
+                                       wallet ? &*wallet : nullptr,
+                                       chat_data_root()));
         } else if (method == "upsertchatprivatecontact") {
             if (params.size() != 1) {
                 throw RpcException(-32602, "upsertchatprivatecontact expects [{address, pubkey_b64?, label?, peer?, notes?}]");
@@ -2792,6 +3307,17 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 }
             }
             result = proxy_config_to_json(config);
+        } else if (method == "getp2pmailproxyconfig") {
+            auto config = chatstate::load_proxy_config(proxy_config_path(chat_data_root()));
+            if (node_) {
+                if (auto live = node_->proxy_settings()) {
+                    config.enabled = true;
+                    config.host = live->host;
+                    config.port = live->port;
+                    config.remote_dns = live->remote_dns;
+                }
+            }
+            result = proxy_config_to_json(config);
         } else if (method == "setchatproxyconfig") {
             if (params.size() != 1) {
                 throw RpcException(-32602, "setchatproxyconfig expects [{enabled, host, port, remote_dns}]");
@@ -2806,6 +3332,136 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 }
             }
             result = proxy_config_to_json(config);
+        } else if (method == "setp2pmailproxyconfig") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "setp2pmailproxyconfig expects [{enabled, host, port, remote_dns}]");
+            }
+            auto config = proxy_config_from_json(params[0]);
+            chatstate::save_proxy_config(proxy_config_path(chat_data_root()), config);
+            if (node_) {
+                if (config.enabled) {
+                    node_->set_socks5_proxy(config.host, config.port, config.remote_dns);
+                } else {
+                    node_->set_socks5_proxy("", 0, true);
+                }
+            }
+            result = proxy_config_to_json(config);
+        } else if (method == "getp2pmailsecurity") {
+            auto config = chatstate::load_mail_security_config(mail_security_path(chat_data_root()));
+            JsonValue info = mail_security_to_json(config);
+            if (node_) {
+                info.set("distributed_store_count", JsonValue::number(static_cast<uint64_t>(node_->distributed_mail_count())));
+                info.set("distributed_store_path", JsonValue::string(node_->distributed_mail_path().string()));
+                const auto dht = node_->dht_mailbox_status();
+                info.set("dht_enabled", JsonValue(dht.enabled));
+                info.set("dht_active_peers", JsonValue::number(static_cast<uint64_t>(dht.active_peers)));
+                info.set("dht_pending_queries", JsonValue::number(static_cast<uint64_t>(dht.pending_queries)));
+                info.set("dht_seen_queries", JsonValue::number(static_cast<uint64_t>(dht.seen_queries)));
+                info.set("dht_last_lookup_at", JsonValue::number(dht.last_lookup_at));
+                info.set("dht_last_results_at", JsonValue::number(dht.last_results_at));
+                info.set("dht_last_proof_at", JsonValue::number(dht.last_proof_at));
+                info.set("proof_receipts", JsonValue::number(static_cast<uint64_t>(dht.receipt_count)));
+                info.set("verified_receipts", JsonValue::number(static_cast<uint64_t>(dht.verified_receipts)));
+                info.set("bond_satisfied_receipts", JsonValue::number(static_cast<uint64_t>(dht.bond_satisfied_receipts)));
+                info.set("trusted_verified_receipts", JsonValue::number(static_cast<uint64_t>(dht.trusted_verified_receipts)));
+                info.set("slashed_receipts", JsonValue::number(static_cast<uint64_t>(dht.slashed_receipts)));
+                info.set("pending_proofs", JsonValue::number(static_cast<uint64_t>(dht.pending_proofs)));
+                info.set("minimum_bond_sats", JsonValue::number(dht.minimum_bond_sats));
+                info.set("required_verified_replicas", JsonValue::number(static_cast<uint64_t>(dht.required_verified_replicas)));
+                info.set("slash_on_failed_proof", JsonValue(dht.slash_on_failed_proof));
+                info.set("slash_penalty_score", JsonValue::number(static_cast<uint64_t>(dht.slash_penalty_score)));
+                info.set("nat_assist", JsonValue(dht.nat_assist));
+                info.set("relay_fallback", JsonValue(dht.relay_fallback));
+                info.set("port_mapping_active", JsonValue(dht.port_mapping_active));
+                info.set("advertised_endpoint", JsonValue::string(dht.advertised_endpoint));
+                info.set("reflexive_endpoint", JsonValue::string(dht.reflexive_endpoint));
+                info.set("candidate_count", JsonValue::number(static_cast<uint64_t>(dht.candidate_count)));
+                info.set("stun_server_count", JsonValue::number(static_cast<uint64_t>(dht.stun_server_count)));
+                info.set("relay_peer_count", JsonValue::number(static_cast<uint64_t>(dht.relay_peer_count)));
+                info.set("last_nat_intro_at", JsonValue::number(dht.last_nat_intro_at));
+                info.set("last_reverse_intro_at", JsonValue::number(dht.last_reverse_intro_at));
+                info.set("last_candidate_attempt_at", JsonValue::number(dht.last_candidate_attempt_at));
+                info.set("last_stun_probe_at", JsonValue::number(dht.last_stun_probe_at));
+                info.set("relay_attempts", JsonValue::number(static_cast<uint64_t>(dht.relay_attempts)));
+                info.set("relay_successes", JsonValue::number(static_cast<uint64_t>(dht.relay_successes)));
+            }
+            result = std::move(info);
+        } else if (method == "getp2pmailpolicy") {
+            auto config = chatstate::load_mail_policy_config(mail_policy_path(chat_data_root()));
+            JsonValue info = mail_policy_to_json(config);
+            if (node_) {
+                info.set("distributed_store_count", JsonValue::number(static_cast<uint64_t>(node_->distributed_mail_count())));
+                const auto dht = node_->dht_mailbox_status();
+                info.set("dht_active_peers", JsonValue::number(static_cast<uint64_t>(dht.active_peers)));
+                info.set("dht_pending_queries", JsonValue::number(static_cast<uint64_t>(dht.pending_queries)));
+                info.set("proof_receipts", JsonValue::number(static_cast<uint64_t>(dht.receipt_count)));
+                info.set("verified_receipts", JsonValue::number(static_cast<uint64_t>(dht.verified_receipts)));
+                info.set("bond_satisfied_receipts", JsonValue::number(static_cast<uint64_t>(dht.bond_satisfied_receipts)));
+                info.set("trusted_verified_receipts", JsonValue::number(static_cast<uint64_t>(dht.trusted_verified_receipts)));
+                info.set("slashed_receipts", JsonValue::number(static_cast<uint64_t>(dht.slashed_receipts)));
+                info.set("pending_proofs", JsonValue::number(static_cast<uint64_t>(dht.pending_proofs)));
+                info.set("port_mapping_active", JsonValue(dht.port_mapping_active));
+                info.set("advertised_endpoint", JsonValue::string(dht.advertised_endpoint));
+                info.set("reflexive_endpoint", JsonValue::string(dht.reflexive_endpoint));
+                info.set("candidate_count", JsonValue::number(static_cast<uint64_t>(dht.candidate_count)));
+                info.set("stun_server_count", JsonValue::number(static_cast<uint64_t>(dht.stun_server_count)));
+                info.set("relay_peer_count", JsonValue::number(static_cast<uint64_t>(dht.relay_peer_count)));
+            }
+            result = std::move(info);
+        } else if (method == "setp2pmailsecurity") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "setp2pmailsecurity expects [{two_factor_enabled?, regenerate_secret?, issuer?, totp_secret_b32?}]");
+            }
+            const auto path = mail_security_path(chat_data_root());
+            auto current = chatstate::load_mail_security_config(path);
+            auto config = mail_security_from_json(params[0], current);
+            chatstate::save_mail_security_config(path, config);
+            result = mail_security_to_json(config);
+        } else if (method == "setp2pmailpolicy") {
+            if (params.size() != 1) {
+                throw RpcException(-32602, "setp2pmailpolicy expects [{ttl_hours?, replica_target?, max_store_items?, prune_imported?, prune_expired?, proof_of_storage?, challenge_interval_minutes?, minimum_bond_sats?, required_verified_replicas?, slash_on_failed_proof?, slash_penalty_score?, nat_assist?, relay_fallback?, relay_peers?, stun_servers?, stun_timeout_ms?}]");
+            }
+            const auto path = mail_policy_path(chat_data_root());
+            auto current = chatstate::load_mail_policy_config(path);
+            auto config = mail_policy_from_json(params[0], current);
+            chatstate::save_mail_policy_config(path, config);
+            if (node_) {
+                node_->set_mail_replication_policy({config.ttl_hours,
+                                                    config.replica_target,
+                                                    config.max_store_items,
+                                                    config.prune_imported,
+                                                    config.prune_expired,
+                                                    config.proof_of_storage,
+                                                    config.challenge_interval_minutes,
+                                                    config.minimum_bond_sats,
+                                                    config.required_verified_replicas,
+                                                    config.slash_on_failed_proof,
+                                                    config.slash_penalty_score,
+                                                    config.nat_assist,
+                                                    config.relay_fallback,
+                                                    config.relay_peers,
+                                                    config.stun_servers,
+                                                    config.stun_timeout_ms});
+                JsonValue info = mail_policy_to_json(config);
+                info.set("pruned", JsonValue::number(static_cast<uint64_t>(node_->prune_distributed_mail_store())));
+                result = std::move(info);
+            } else {
+                result = mail_policy_to_json(config);
+            }
+        } else if (method == "verifyp2pmail2fa") {
+            std::string code;
+            if (params.size() == 1 && params[0].is_string()) {
+                code = params[0].as_string();
+            } else if (params.size() == 1 && params[0].is_object()) {
+                if (const auto* field = params[0].find("code")) code = field->as_string();
+            } else {
+                throw RpcException(-32602, "verifyp2pmail2fa expects [code] or [{code}]");
+            }
+            const auto config = chatstate::load_mail_security_config(mail_security_path(chat_data_root()));
+            JsonValue info = JsonValue::object();
+            info.set("enabled", JsonValue(config.two_factor_enabled));
+            info.set("verified", JsonValue(verify_totp_code(config.totp_secret_b32, code)));
+            result = std::move(info);
         } else if (method == "getircconfig") {
             result = irc_config_to_json(chatstate::load_irc_config(irc_config_path(chat_data_root())));
         } else if (method == "setircconfig") {
@@ -2876,6 +3532,63 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
                 rows.push_back(chat_entry_to_json(entry));
             }
             result = std::move(rows);
+        } else if (method == "getp2pmail") {
+            if (!node_) throw RpcException(-32603, "mail node unavailable");
+            auto query = mail_query_from_params(params);
+            const auto policy = chatstate::load_mail_policy_config(mail_policy_path(chat_data_root()));
+            if (has_wallet_session() && (!query.direction || *query.direction != "out")) {
+                auto wallet = load_session_wallet();
+                std::vector<std::string> lookup_addresses;
+                if (query.address && !query.address->empty()) {
+                    lookup_addresses.push_back(*query.address);
+                } else {
+                    for (const auto& address : wallet.addresses) {
+                        const auto normalized = normalize_directory_address(address);
+                        if (std::find_if(lookup_addresses.begin(), lookup_addresses.end(), [&](const auto& existing) {
+                                return crypto::addresses_equal(existing, normalized);
+                            }) == lookup_addresses.end()) {
+                            lookup_addresses.push_back(normalized);
+                        }
+                    }
+                }
+                for (const auto& address : lookup_addresses) {
+                    for (const auto& record : node_->dht_lookup_mail(address, 128, 250)) {
+                        node_->store_distributed_mail_record(record);
+                    }
+                }
+                chat::HistoryQuery all_query = query;
+                all_query.limit = 0;
+                std::unordered_set<std::string> seen_ids;
+                for (const auto& entry : node_->mail_history(all_query)) {
+                    seen_ids.insert(entry.message_id);
+                }
+                for (const auto& record : node_->distributed_mail_records(std::nullopt, 1000)) {
+                    if (seen_ids.count(record.message_id) != 0) continue;
+                    if (policy.proof_of_storage) {
+                        const auto receipts = node_->mail_storage_receipts(std::make_optional(record.message_id));
+                        if (!receipts.empty()) {
+                            const auto trusted = static_cast<uint32_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+                                return receipt.verified && receipt.bond_satisfied && !receipt.provider_signature_b64.empty() && !receipt.slashed;
+                            }));
+                            if (trusted < std::max<uint32_t>(policy.required_verified_replicas, 1)) {
+                                continue;
+                            }
+                        }
+                    }
+                    auto imported = distributed_mail_record_to_entry(record, wallet, chat_data_root());
+                    if (!imported) continue;
+                    node_->record_mail_history(*imported);
+                    if (policy.prune_imported) {
+                        node_->delete_distributed_mail(record.message_id);
+                    }
+                    seen_ids.insert(imported->message_id);
+                }
+            }
+            JsonValue rows = JsonValue::array({});
+            for (const auto& entry : node_->mail_history(query)) {
+                rows.push_back(mail_entry_to_json(entry));
+            }
+            result = std::move(rows);
         } else if (method == "deletechatmessage") {
             if (!node_) throw RpcException(-32603, "chat node unavailable");
             if (params.size() != 1) {
@@ -2889,6 +3602,35 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             info.set("messageid", JsonValue::string(message_id));
             info.set("deleted", JsonValue(node_->delete_chat_message(message_id)));
             info.set("historyfile", JsonValue::string(node_->chat_history_path().string()));
+            result = std::move(info);
+        } else if (method == "deletep2pmail") {
+            if (!node_) throw RpcException(-32603, "mail node unavailable");
+            std::string message_id;
+            std::string totp_code;
+            if (params.size() == 1 && params[0].is_string()) {
+                message_id = params[0].as_string();
+            } else if (params.size() == 2 && params[0].is_string() && params[1].is_string()) {
+                message_id = params[0].as_string();
+                totp_code = params[1].as_string();
+            } else if (params.size() == 1 && params[0].is_object()) {
+                if (const auto* field = params[0].find("messageid")) message_id = field->as_string();
+                if (const auto* field = params[0].find("totp_code")) totp_code = field->as_string();
+            } else {
+                throw RpcException(-32602, "deletep2pmail expects [messageid], [messageid, totp_code], or [{messageid, totp_code?}]");
+            }
+            if (message_id.empty()) {
+                throw RpcException(-32602, "messageid is required");
+            }
+            const auto security = chatstate::load_mail_security_config(mail_security_path(chat_data_root()));
+            if (security.two_factor_enabled && !verify_totp_code(security.totp_secret_b32, totp_code)) {
+                throw RpcException(-32602, "valid mail 2FA code required");
+            }
+            JsonValue info = JsonValue::object();
+            info.set("messageid", JsonValue::string(message_id));
+            info.set("deleted", JsonValue(node_->delete_mail_message(message_id)));
+            info.set("deleted_from_store", JsonValue(node_->delete_distributed_mail(message_id)));
+            info.set("historyfile", JsonValue::string(node_->mail_history_path().string()));
+            info.set("storefile", JsonValue::string(node_->distributed_mail_path().string()));
             result = std::move(info);
         } else if (method == "sendchatpublic" || method == "sendchatprivate") {
             if (!node_) throw RpcException(-32603, "chat node unavailable");
@@ -2944,8 +3686,10 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
 
             size_t peers = 0;
             if (request.peer_label) {
-                auto [host, port] = parse_hostport(*request.peer_label);
-                node_->connect(host, port);
+                if (looks_like_peer_label(*request.peer_label)) {
+                    auto [host, port] = parse_hostport(*request.peer_label);
+                    node_->connect(host, port);
+                }
                 peers = node_->send_to(*request.peer_label, msg) ? 1 : 0;
                 history.status = peers > 0 ? "sent" : "no-peer";
             } else {
@@ -3003,6 +3747,215 @@ std::string RpcService::handle_jsonrpc(const std::string& body, bool& stop_reque
             }
             if (private_chat) {
                 info.set("kdf", JsonValue::string(chat::kdf_name(request.kdf.value_or(chat::KeyDerivation::Argon2id))));
+            }
+            result = std::move(info);
+        } else if (method == "sendp2pmail") {
+            if (!node_) throw RpcException(-32603, "mail node unavailable");
+            require_wallet_session();
+            auto request = parse_mail_send_request(params);
+            Wallet wallet = load_session_wallet();
+            const auto security = chatstate::load_mail_security_config(mail_security_path(chat_data_root()));
+            const auto policy = chatstate::load_mail_policy_config(mail_policy_path(chat_data_root()));
+            if (security.two_factor_enabled && !verify_totp_code(security.totp_secret_b32, request.totp_code)) {
+                throw RpcException(-32602, "valid mail 2FA code required");
+            }
+            struct MailTarget {
+                std::string address;
+                bool primary{false};
+                bool cc{false};
+                bool bcc{false};
+            };
+
+            std::vector<MailTarget> targets;
+            auto add_target = [&](const std::string& address, bool primary, bool cc, bool bcc) {
+                if (address.empty()) return;
+                const auto normalized = normalize_p2pmail_recipient(address);
+                if (normalized.empty()) return;
+                auto it = std::find_if(targets.begin(), targets.end(), [&](const MailTarget& existing) {
+                    return crypto::addresses_equal(existing.address, normalized);
+                });
+                if (it == targets.end()) {
+                    targets.push_back(MailTarget{normalized, primary, cc, bcc});
+                } else {
+                    it->primary = it->primary || primary;
+                    it->cc = it->cc || cc;
+                    it->bcc = it->bcc || bcc;
+                }
+            };
+            add_target(request.recipient_address, true, false, false);
+            for (const auto& address : request.cc_addresses) add_target(address, false, true, false);
+            for (const auto& address : request.bcc_addresses) add_target(address, false, false, true);
+            if (targets.empty()) {
+                throw RpcException(-32602, "at least one mail recipient is required");
+            }
+
+            auto base_content = build_chat_content_from_request(request);
+            base_content.mail_to = join_mail_aliases({request.recipient_address});
+            base_content.mail_cc = join_mail_aliases(request.cc_addresses);
+
+            auto data_dir = chat_data_root();
+            auto contacts = chatstate::load_private_contacts(private_contacts_path(data_dir));
+            const auto now = static_cast<uint64_t>(std::time(nullptr));
+            JsonValue deliveries = JsonValue::array({});
+            std::vector<std::string> message_ids;
+            size_t total_peers = 0;
+            std::string aggregate_status = "no-peer";
+            std::string first_attachment_path;
+            uint64_t first_attachment_size = 0;
+
+            for (const auto& target : targets) {
+                auto resolved = resolve_chat_recipient(target.address, chain_, node_, &wallet, chat_data_root());
+                ChatSendRequest single = request;
+                single.recipient_address = target.address;
+                if (!target.primary) {
+                    single.recipient_pubkey_b64.clear();
+                    single.recipient_rsa_pubkey_pem.clear();
+                    single.peer_label.reset();
+                }
+                if (single.recipient_pubkey_b64.empty()) {
+                    single.recipient_pubkey_b64 = resolved.pubkey_b64;
+                }
+                if (single.recipient_rsa_pubkey_pem.empty()) {
+                    single.recipient_rsa_pubkey_pem = resolved.rsa_pubkey_pem;
+                }
+                if (!single.peer_label && !resolved.peer_label.empty()) {
+                    single.peer_label = resolved.peer_label;
+                }
+                const auto mode = single.encryption_mode.value_or(
+                    single.recipient_rsa_pubkey_pem.empty() ? chat::EncryptionMode::ECDH
+                                                            : chat::EncryptionMode::RSA);
+                if (mode == chat::EncryptionMode::ECDH && single.recipient_pubkey_b64.empty()) {
+                    throw RpcException(-32602, "mail recipient could not be resolved to a secp256k1 pubkey; save the contact first or use manual overrides");
+                }
+                if (mode == chat::EncryptionMode::RSA && single.recipient_rsa_pubkey_pem.empty()) {
+                    throw RpcException(-32602, "mail recipient could not be resolved to an RSA public key; save the contact first or use manual overrides");
+                }
+
+                auto content = base_content;
+                auto payload = chat::make_encrypted_private_chat(wallet,
+                                                                 single.from_address,
+                                                                 single.recipient_address,
+                                                                 single.recipient_pubkey_b64.empty()
+                                                                     ? std::vector<uint8_t>{}
+                                                                     : crypto::base64_decode(single.recipient_pubkey_b64),
+                                                                 content,
+                                                                 single.kdf.value_or(chat::KeyDerivation::Argon2id),
+                                                                 mode,
+                                                                 single.recipient_rsa_pubkey_pem,
+                                                                 chat::CHAT_TYPE_MAIL);
+
+                net::Message msg;
+                msg.type = net::MessageType::CHAT;
+                msg.payload = payload.serialize();
+                auto history = build_outbound_chat_history(payload, content, single.peer_label.value_or("network"));
+                history.mail_bcc = join_mail_aliases(request.bcc_addresses);
+                node_->remember_chat_message(history.message_id);
+                node_->record_distributed_mail(payload, single.peer_label.value_or("network"));
+                net::NetworkNode::DistributedMailRecord dht_record;
+                dht_record.version = 1;
+                dht_record.stored_at = static_cast<uint64_t>(std::time(nullptr));
+                dht_record.expires_at = dht_record.stored_at + (static_cast<uint64_t>(policy.ttl_hours) * 3600ULL);
+                dht_record.message_id = history.message_id;
+                dht_record.sender_address = payload.sender;
+                dht_record.recipient_address = payload.recipient;
+                dht_record.peer_label = single.peer_label.value_or("network");
+                dht_record.payload_b64 = crypto::base64_encode(payload.serialize());
+                node_->dht_store_mail(dht_record);
+                if (!content.attachment_bytes.empty()) {
+                    history.attachment_path = chat::persist_attachment(content,
+                                                                       chat_data_root(),
+                                                                       history.message_id,
+                                                                       "p2pmail_media").string();
+                }
+
+                size_t peers = 0;
+                if (single.peer_label) {
+                    if (looks_like_peer_label(*single.peer_label)) {
+                        auto [host, port] = parse_hostport(*single.peer_label);
+                        node_->connect(host, port);
+                    }
+                    peers = node_->send_to(*single.peer_label, msg) ? 1 : 0;
+                    history.status = peers > 0 ? "sent" : "no-peer";
+                } else {
+                    if (node_->active_peer_labels().empty()) {
+                        node_->bootstrap_chat_routing();
+                    }
+                    const auto labels = node_->active_peer_labels();
+                    const size_t fanout = std::min<size_t>(std::max<uint32_t>(policy.replica_target, 1), labels.size());
+                    for (size_t i = 0; i < fanout; ++i) {
+                        if (node_->send_to(labels[i], msg)) {
+                            ++peers;
+                        }
+                    }
+                    history.status = peers > 0 ? "replicated" : "no-peer";
+                }
+                node_->record_mail_history(history);
+                total_peers += peers;
+                if (aggregate_status == "no-peer" && peers > 0) {
+                    aggregate_status = history.status;
+                }
+                if (first_attachment_path.empty() && !history.attachment_path.empty()) {
+                    first_attachment_path = history.attachment_path;
+                    first_attachment_size = history.attachment_size;
+                }
+
+                const auto canonical_recipient = normalize_directory_address(single.recipient_address);
+                auto it = std::find_if(contacts.begin(), contacts.end(), [&](const chatstate::PrivateContact& existing) {
+                    return crypto::addresses_equal(existing.address, canonical_recipient);
+                });
+                if (it == contacts.end()) {
+                    chatstate::PrivateContact contact;
+                    contact.address = canonical_recipient;
+                    contact.pubkey_b64 = single.recipient_pubkey_b64;
+                    contact.rsa_pubkey_pem = single.recipient_rsa_pubkey_pem;
+                    contact.peer_label = single.peer_label.value_or("network");
+                    contact.added_at = now;
+                    contact.last_used_at = now;
+                    contacts.push_back(std::move(contact));
+                } else {
+                    if (!single.recipient_pubkey_b64.empty()) it->pubkey_b64 = single.recipient_pubkey_b64;
+                    if (!single.recipient_rsa_pubkey_pem.empty()) it->rsa_pubkey_pem = single.recipient_rsa_pubkey_pem;
+                    if (single.peer_label) it->peer_label = *single.peer_label;
+                    it->last_used_at = now;
+                }
+
+                message_ids.push_back(history.message_id);
+                JsonValue delivery = JsonValue::object();
+                delivery.set("messageid", JsonValue::string(history.message_id));
+                delivery.set("recipient", JsonValue::string(p2pmail_alias_for_address(single.recipient_address)));
+                delivery.set("status", JsonValue::string(history.status));
+                delivery.set("peers", JsonValue::number(static_cast<uint64_t>(peers)));
+                delivery.set("cc", JsonValue(target.cc));
+                delivery.set("bcc", JsonValue(target.bcc));
+                deliveries.push_back(std::move(delivery));
+            }
+            chatstate::save_private_contacts(private_contacts_path(data_dir), contacts);
+
+            JsonValue info = JsonValue::object();
+            if (!message_ids.empty()) {
+                info.set("messageid", JsonValue::string(message_ids.front()));
+            }
+            JsonValue ids = JsonValue::array({});
+            for (const auto& id : message_ids) ids.push_back(JsonValue::string(id));
+            info.set("messageids", std::move(ids));
+            info.set("deliveries", std::move(deliveries));
+            info.set("recipient_count", JsonValue::number(static_cast<uint64_t>(targets.size())));
+            info.set("cc_count", JsonValue::number(static_cast<uint64_t>(request.cc_addresses.size())));
+            info.set("bcc_count", JsonValue::number(static_cast<uint64_t>(request.bcc_addresses.size())));
+            info.set("status", JsonValue::string(aggregate_status));
+            info.set("peers", JsonValue::number(static_cast<uint64_t>(total_peers)));
+            info.set("peer", JsonValue::string(request.peer_label.value_or("network")));
+            info.set("historyfile", JsonValue::string(node_->mail_history_path().string()));
+            info.set("subject", JsonValue::string(base_content.subject));
+            info.set("from_mail_address", JsonValue::string(p2pmail_alias_for_address(request.from_address.empty() ? wallet.address : request.from_address)));
+            info.set("to_mail_address", JsonValue::string(p2pmail_alias_for_address(request.recipient_address)));
+            info.set("cc", JsonValue::string(join_mail_aliases(request.cc_addresses)));
+            info.set("bcc", JsonValue::string(join_mail_aliases(request.bcc_addresses)));
+            info.set("content_type", JsonValue::string(chat::content_type_name(base_content.type)));
+            info.set("replica_target", JsonValue::number(static_cast<uint64_t>(policy.replica_target)));
+            if (!first_attachment_path.empty()) {
+                info.set("attachment_path", JsonValue::string(first_attachment_path));
+                info.set("attachment_size", JsonValue::number(first_attachment_size));
             }
             result = std::move(info);
         } else if (method == "getcheckpointinfo") {
@@ -3892,6 +4845,9 @@ private:
     }
 
     bool allow_rate(const tcp::endpoint& remote) {
+        if (remote.address().is_loopback()) {
+            return true;
+        }
         if (config_.max_requests_per_window == 0 || config_.rate_limit_window_seconds == 0) {
             return true;
         }

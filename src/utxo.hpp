@@ -23,6 +23,10 @@ struct UTXOEntry {
 class UTXOSet {
 public:
     UTXOSet() = default;
+    UTXOSet(const UTXOSet& other);
+    UTXOSet& operator=(const UTXOSet& other);
+    UTXOSet(UTXOSet&& other) noexcept;
+    UTXOSet& operator=(UTXOSet&& other) noexcept;
     ~UTXOSet() = default;
 
     // Apply a transaction (remove spent outputs, add new ones)
@@ -61,6 +65,9 @@ public:
 
     // Swap contents from another UTXO set (used during chain reorg)
     void swap_in(UTXOSet&& other);
+
+    // Copy the active set for read-only validation flows like block template assembly.
+    UTXOSet snapshot() const;
 
     // List spendable UTXOs for an address at a given height
     std::vector<std::pair<OutPoint, UTXOEntry>> list_for_address(const std::string& address,

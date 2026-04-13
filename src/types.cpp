@@ -340,30 +340,58 @@ uint256_t compact_target::expand() const {
 }
 
 compact_target compact_target::from_target(const uint256_t& target) {
-    // Find the highest set byte
-    auto bytes = target.to_padded_bytes(64);
-    int idx = 0;
-    while (idx < 64 && bytes[idx] == 0) ++idx;
-    if (idx == 64) return {0}; // zero target (invalid for PoW)
-
-    int exp = 64 - idx; // number of bytes from the first non-zero to the end
-    // The mantissa should be the first 3 bytes of the compact representation
-    // We take the next 3 bytes (or fewer if exp < 3)
-    uint32_t mantissa = 0;
-    if (exp >= 3) {
-        mantissa = (bytes[idx] << 16) | (bytes[idx+1] << 8) | bytes[idx+2];
-        exp -= 3;
-    } else {
-        // When exponent < 3, the mantissa is taken from the first exp bytes, shifted left
-        for (int i = 0; i < exp; ++i) {
-            mantissa |= bytes[idx + i] << (8 * (2 - i)); // place in the top bytes
-        }
-        exp = 0;
+    const int size = BN_num_bytes(target.bn());
+    if (size < 0) {
+        throw std::runtime_error("BN_num_bytes failed");
     }
-    // The exponent is the number of bytes after the mantissa, plus 3
-    uint32_t exponent = exp + 3;
-    uint32_t bits = (exponent << 24) | (mantissa & 0x007fffff);
-    return {bits};
+    if (size == 0) return {0};
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    BN_bn2bin(target.bn(), bytes.data());
+
+    uint32_t mantissa = 0;
+    if (size <= 3) {
+        for (int i = 0; i < size; ++i) {
+            mantissa = (mantissa << 8) | bytes[static_cast<size_t>(i)];
+        }
+        mantissa <<= 8 * (3 - size);
+    } else {
+        mantissa = (static_cast<uint32_t>(bytes[0]) << 16) |
+                   (static_cast<uint32_t>(bytes[1]) << 8) |
+                   static_cast<uint32_t>(bytes[2]);
+    }
+
+    uint32_t exponent = static_cast<uint32_t>(size);
+    if (mantissa & 0x00800000) {
+        mantissa >>= 8;
+        ++exponent;
+    }
+
+    return {(exponent << 24) | (mantissa & 0x007fffff)};
+}
+
+bool compact_target::is_negative() const {
+    return (bits & 0x00800000u) != 0;
+}
+
+bool compact_target::is_zero() const {
+    return (bits & 0x007fffffu) == 0;
+}
+
+bool compact_target::overflows(size_t width_bytes) const {
+    const uint32_t exponent = bits >> 24;
+    const uint32_t mantissa = bits & 0x007fffffu;
+    if (mantissa == 0) return false;
+    return exponent > width_bytes + 2 ||
+           (mantissa > 0xffu && exponent > width_bytes + 1) ||
+           (mantissa > 0xffffu && exponent > width_bytes);
+}
+
+bool compact_target::is_canonical(size_t width_bytes) const {
+    if (is_negative()) return false;
+    if (overflows(width_bytes)) return false;
+    if (is_zero()) return bits == 0;
+    return from_target(expand()).bits == bits;
 }
 
 } // namespace cryptex

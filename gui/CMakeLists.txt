@@ -22,6 +22,7 @@ set(CRYPTEXQT_SOURCES
     app/MainWindow.cpp
     app/NodeWindow.cpp
     app/ChatWindow.cpp
+    app/MailWindow.cpp
     app/WalletManagerWindow.cpp
     app/DaemonController.cpp
     app/MinerController.cpp
@@ -38,6 +39,12 @@ set(CRYPTEXQT_SOURCES
     views/ChatPage.cpp
     views/ChatEntryDialog.cpp
     views/MediaComposerDialog.cpp
+    views/MailAccountCreatePage.cpp
+    views/MailComposePage.cpp
+    views/MailAccountsPage.cpp
+    views/MailEntryDialog.cpp
+    views/MailListPage.cpp
+    views/MailSecurityPage.cpp
     views/VoiceCallPage.cpp
     views/ForumPage.cpp
     views/PrivateContactsPage.cpp
@@ -118,13 +125,26 @@ endif()
 if(TARGET cryptexd)
     add_dependencies(cryptexqt cryptexd)
 endif()
+if(TARGET cryptex_powminer)
+    add_dependencies(cryptexqt cryptex_powminer)
+endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET cryptexd)
-    add_custom_command(TARGET cryptexqt POST_BUILD
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET cryptexd AND TARGET cryptex_powminer)
+    set(CRYPTEXQT_BUNDLE_SYNC_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cryptexqt_bundle_sync.stamp")
+    add_custom_command(
+        OUTPUT "${CRYPTEXQT_BUNDLE_SYNC_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_BUNDLE_CONTENT_DIR:cryptexqt>/MacOS
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:cryptexd>
             $<TARGET_BUNDLE_CONTENT_DIR:cryptexqt>/MacOS/$<TARGET_FILE_NAME:cryptexd>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:cryptex_powminer>
+            $<TARGET_BUNDLE_CONTENT_DIR:cryptexqt>/MacOS/$<TARGET_FILE_NAME:cryptex_powminer>
+        COMMAND ${CMAKE_COMMAND} -E touch "${CRYPTEXQT_BUNDLE_SYNC_STAMP}"
+        DEPENDS cryptexqt cryptexd cryptex_powminer
         VERBATIM)
+    add_custom_target(cryptexqt_bundle_sync ALL DEPENDS "${CRYPTEXQT_BUNDLE_SYNC_STAMP}")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")

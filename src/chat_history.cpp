@@ -87,7 +87,7 @@ bool matches_query(const HistoryEntry& entry, const HistoryQuery& query) {
 
 bool parse_history_entry(const std::string& line, HistoryEntry& entry) {
     auto fields = split_line(line);
-    if (fields.size() != 18 && fields.size() != 25 && fields.size() != 26) return false;
+    if (fields.size() != 18 && fields.size() != 25 && fields.size() != 26 && fields.size() != 27 && fields.size() != 30) return false;
     try {
         entry.version = static_cast<uint32_t>(std::stoul(fields[0]));
         entry.direction = fields[1];
@@ -104,19 +104,36 @@ bool parse_history_entry(const std::string& line, HistoryEntry& entry) {
         entry.recipient_address = decode_field(fields[12]);
         entry.recipient_pubkey = decode_field(fields[13]);
         entry.channel = decode_field(fields[14]);
-        entry.message = decode_field(fields[15]);
-        entry.peer_label = decode_field(fields[16]);
-        entry.status = decode_field(fields[17]);
+        if (fields.size() >= 27) {
+            entry.subject = decode_field(fields[15]);
+            if (fields.size() >= 30) {
+                entry.mail_to = decode_field(fields[16]);
+                entry.mail_cc = decode_field(fields[17]);
+                entry.mail_bcc = decode_field(fields[18]);
+                entry.message = decode_field(fields[19]);
+                entry.peer_label = decode_field(fields[20]);
+                entry.status = decode_field(fields[21]);
+            } else {
+                entry.message = decode_field(fields[16]);
+                entry.peer_label = decode_field(fields[17]);
+                entry.status = decode_field(fields[18]);
+            }
+        } else {
+            entry.message = decode_field(fields[15]);
+            entry.peer_label = decode_field(fields[16]);
+            entry.status = decode_field(fields[17]);
+        }
         if (fields.size() >= 25) {
-            entry.content_type = decode_field(fields[18]);
-            entry.mime_type = decode_field(fields[19]);
-            entry.attachment_name = decode_field(fields[20]);
-            entry.attachment_path = decode_field(fields[21]);
-            entry.attachment_size = std::stoull(fields[22]);
-            entry.audio_privacy = decode_field(fields[23]);
-            entry.encryption_mode = decode_field(fields[24]);
-            if (fields.size() >= 26) {
-                entry.transcript = decode_field(fields[25]);
+            const size_t offset = fields.size() >= 30 ? 4 : (fields.size() >= 27 ? 1 : 0);
+            entry.content_type = decode_field(fields[18 + offset]);
+            entry.mime_type = decode_field(fields[19 + offset]);
+            entry.attachment_name = decode_field(fields[20 + offset]);
+            entry.attachment_path = decode_field(fields[21 + offset]);
+            entry.attachment_size = std::stoull(fields[22 + offset]);
+            entry.audio_privacy = decode_field(fields[23 + offset]);
+            entry.encryption_mode = decode_field(fields[24 + offset]);
+            if (fields.size() >= 26 + offset) {
+                entry.transcript = decode_field(fields[25 + offset]);
             }
         }
         return true;
@@ -142,6 +159,10 @@ std::string serialize_history_entry(const HistoryEntry& entry) {
         << encode_field(entry.recipient_address) << '\t'
         << encode_field(entry.recipient_pubkey) << '\t'
         << encode_field(entry.channel) << '\t'
+        << encode_field(entry.subject) << '\t'
+        << encode_field(entry.mail_to) << '\t'
+        << encode_field(entry.mail_cc) << '\t'
+        << encode_field(entry.mail_bcc) << '\t'
         << encode_field(entry.message) << '\t'
         << encode_field(entry.peer_label) << '\t'
         << encode_field(entry.status) << '\t'
@@ -265,6 +286,9 @@ std::string describe_history_entry(const HistoryEntry& entry) {
     if (!entry.channel.empty()) out << " channel=" << entry.channel;
     if (!entry.sender_address.empty()) out << " from=" << entry.sender_address;
     if (!entry.recipient_address.empty()) out << " to=" << entry.recipient_address;
+    if (!entry.subject.empty()) out << " subject=\"" << sanitize_message(entry.subject) << "\"";
+    if (!entry.mail_cc.empty()) out << " cc=\"" << sanitize_message(entry.mail_cc) << "\"";
+    if (!entry.mail_bcc.empty()) out << " bcc=\"" << sanitize_message(entry.mail_bcc) << "\"";
     if (!entry.status.empty()) out << " status=" << entry.status;
     if (entry.authenticated) out << " auth=ok";
     if (entry.encrypted) out << (entry.decrypted ? " encrypted=decrypted" : " encrypted=opaque");

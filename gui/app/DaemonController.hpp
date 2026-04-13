@@ -29,7 +29,7 @@ public:
     ~DaemonController(); // Added
 
     bool isRunning() const;
-    void startNode(const LaunchConfig& config);
+    bool startNode(const LaunchConfig& config);
     void stopNode(bool synchronous = false);
 
 signals:

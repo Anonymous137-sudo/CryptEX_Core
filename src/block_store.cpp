@@ -19,6 +19,23 @@ bool BlockStore::store_by_hash(const uint256_t& hash, const Block& block) {
     return write_block_file(block_path_for_hash(hash), block);
 }
 
+void BlockStore::remove_height(uint64_t height) {
+    std::error_code ec;
+    std::filesystem::remove(block_path_for_height(height), ec);
+    std::filesystem::remove(legacy_block_path_for_height(height), ec);
+}
+
+void BlockStore::remove_by_hash(const uint256_t& hash) {
+    std::error_code ec;
+    std::filesystem::remove(block_path_for_hash(hash), ec);
+}
+
+void BlockStore::prune_height_files_after(uint64_t height) {
+    for (uint64_t cursor = height + 1; exists(cursor); ++cursor) {
+        remove_height(cursor);
+    }
+}
+
 std::optional<Block> BlockStore::load(uint64_t height) const {
     return load_block_file(block_path_for_height(height), legacy_block_path_for_height(height));
 }

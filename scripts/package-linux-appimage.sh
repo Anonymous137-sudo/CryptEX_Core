@@ -9,7 +9,7 @@ fi
 ARCH_INPUT="$1"
 ROOT_DIR="$2"
 BUILD_DIR="$3"
-RELEASE_VERSION="${CRYPTEX_RELEASE_VERSION:-0.6.0}"
+RELEASE_VERSION="${CRYPTEX_RELEASE_VERSION:-0.6.1}"
 
 case "${ARCH_INPUT}" in
   x86_64) ARCH_TAG="x86_64" ;;
@@ -52,6 +52,7 @@ mkdir -p "${APPDIR}/usr/bin" \
 
 cp "${BUILD_DIR}/cryptexqt_linux" "${APPDIR}/usr/bin/"
 cp "${BUILD_DIR}/cryptexd_linux" "${APPDIR}/usr/bin/"
+cp "${BUILD_DIR}/cryptex_powminer_linux" "${APPDIR}/usr/bin/"
 cp "${ROOT_DIR}/gui/resources/CryptEX.png" "${APPDIR}/usr/share/icons/hicolor/512x512/apps/CryptEX.png"
 cp "${ROOT_DIR}/gui/resources/CryptEX.png" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/CryptEX.png"
 cp "${ROOT_DIR}/gui/resources/CryptEX.png" "${APPDIR}/CryptEX.png"
@@ -114,10 +115,12 @@ copy_deps() {
 
 copy_deps "${APPDIR}/usr/bin/cryptexqt_linux"
 copy_deps "${APPDIR}/usr/bin/cryptexd_linux"
+copy_deps "${APPDIR}/usr/bin/cryptex_powminer_linux"
 copy_deps "${APPDIR}/usr/plugins/platforms/libqxcb.so"
 
 patchelf --set-rpath '$ORIGIN/../lib' "${APPDIR}/usr/bin/cryptexqt_linux"
 patchelf --set-rpath '$ORIGIN/../lib' "${APPDIR}/usr/bin/cryptexd_linux"
+patchelf --set-rpath '$ORIGIN/../lib' "${APPDIR}/usr/bin/cryptex_powminer_linux"
 patchelf --set-rpath '$ORIGIN/../../lib' "${APPDIR}/usr/plugins/platforms/libqxcb.so"
 
 rm -f "${BUILD_DIR}"/*.AppImage

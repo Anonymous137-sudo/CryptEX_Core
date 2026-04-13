@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <atomic>
@@ -48,7 +49,14 @@ enum class MessageType : uint8_t {
     SUBMITWORK = 13,
     INV = 14,
     GETTX = 15,
-    TX = 16
+    TX = 16,
+    DHT_MAIL_STORE = 17,
+    DHT_MAIL_FIND = 18,
+    DHT_MAIL_RESULTS = 19,
+    DHT_MAIL_RECEIPT = 20,
+    DHT_MAIL_CHALLENGE = 21,
+    DHT_MAIL_PROOF = 22,
+    DHT_MAIL_NAT_INTRO = 23
 };
 
 struct Message {
@@ -197,6 +205,120 @@ public:
         bool remote_dns{true};
     };
 
+    struct DistributedMailRecord {
+        uint32_t version{1};
+        uint64_t stored_at{0};
+        uint64_t expires_at{0};
+        std::string message_id;
+        std::string sender_address;
+        std::string recipient_address;
+        std::string peer_label;
+        std::string payload_b64;
+    };
+
+    struct MailReplicationPolicy {
+        uint32_t ttl_hours{168};
+        uint32_t replica_target{3};
+        uint32_t max_store_items{5000};
+        bool prune_imported{false};
+        bool prune_expired{true};
+        bool proof_of_storage{true};
+        uint32_t challenge_interval_minutes{30};
+        uint64_t minimum_bond_sats{0};
+        uint32_t required_verified_replicas{1};
+        bool slash_on_failed_proof{true};
+        uint32_t slash_penalty_score{25};
+        bool nat_assist{true};
+        bool relay_fallback{true};
+        std::vector<std::string> relay_peers{};
+        std::vector<std::string> stun_servers{};
+        uint32_t stun_timeout_ms{1200};
+    };
+
+    struct MailStorageReceipt {
+        uint32_t version{1};
+        std::string message_id;
+        std::string recipient_address;
+        std::string replica_label;
+        std::string storage_hash_hex;
+        std::string last_proof_hash_hex;
+        uint64_t stored_at{0};
+        uint64_t expires_at{0};
+        uint64_t receipt_at{0};
+        uint64_t verified_at{0};
+        uint64_t last_challenged_at{0};
+        std::string provider_address;
+        std::string provider_pubkey_b64;
+        std::string provider_signature_b64;
+        uint64_t bonded_balance_sats{0};
+        bool bond_satisfied{false};
+        bool verified{false};
+        bool slashed{false};
+        uint64_t slashed_at{0};
+        std::string slash_reason;
+        std::string slash_evidence_hash_hex;
+    };
+
+    struct NatCandidate {
+        uint8_t type{0}; // 0 host, 1 reflexive, 2 mapped
+        std::string label;
+        uint32_t priority{0};
+    };
+
+    struct NatTraversalStatus {
+        bool enabled{true};
+        bool relay_fallback{true};
+        bool port_mapping_active{false};
+        std::string advertised_endpoint;
+        std::string reflexive_endpoint;
+        size_t candidate_count{0};
+        size_t stun_server_count{0};
+        size_t relay_peer_count{0};
+        uint64_t last_intro_at{0};
+        uint64_t last_reverse_intro_at{0};
+        uint64_t last_candidate_attempt_at{0};
+        uint64_t last_stun_probe_at{0};
+        size_t relay_attempts{0};
+        size_t relay_successes{0};
+    };
+
+    struct DhtMailboxStatus {
+        bool enabled{true};
+        size_t local_store_records{0};
+        size_t pending_queries{0};
+        size_t seen_queries{0};
+        size_t active_peers{0};
+        uint64_t last_lookup_at{0};
+        uint64_t last_results_at{0};
+        uint64_t last_proof_at{0};
+        uint32_t replica_target{3};
+        size_t receipt_count{0};
+        size_t verified_receipts{0};
+        size_t bond_satisfied_receipts{0};
+        size_t trusted_verified_receipts{0};
+        size_t slashed_receipts{0};
+        size_t pending_proofs{0};
+        bool proof_of_storage{true};
+        uint64_t minimum_bond_sats{0};
+        uint32_t required_verified_replicas{1};
+        bool slash_on_failed_proof{true};
+        uint32_t slash_penalty_score{25};
+        bool nat_assist{true};
+        bool relay_fallback{true};
+        bool port_mapping_active{false};
+        std::string advertised_endpoint;
+        std::string reflexive_endpoint;
+        size_t candidate_count{0};
+        size_t stun_server_count{0};
+        size_t relay_peer_count{0};
+        uint64_t last_nat_intro_at{0};
+        uint64_t last_reverse_intro_at{0};
+        uint64_t last_candidate_attempt_at{0};
+        uint64_t last_stun_probe_at{0};
+        size_t relay_attempts{0};
+        size_t relay_successes{0};
+    };
+
     struct VoiceCallInfo {
         bool active{false};
         bool incoming{false};
@@ -245,9 +367,31 @@ public:
     std::vector<PeerInfo> peer_statuses();
     SyncStatus sync_status() const;
     std::vector<chat::HistoryEntry> chat_history(const chat::HistoryQuery& query = {}) const;
+    std::vector<chat::HistoryEntry> mail_history(const chat::HistoryQuery& query = {}) const;
+    std::vector<DistributedMailRecord> distributed_mail_records(const std::optional<std::string>& recipient_address = std::nullopt,
+                                                                size_t limit = 200) const;
     std::filesystem::path chat_history_path() const;
+    std::filesystem::path mail_history_path() const;
+    std::filesystem::path distributed_mail_path() const;
     void record_chat_history(const chat::HistoryEntry& entry);
+    void record_mail_history(const chat::HistoryEntry& entry);
+    void record_distributed_mail(const ChatPayload& payload, const std::string& peer_label = {});
+    void store_distributed_mail_record(const DistributedMailRecord& record);
     bool delete_chat_message(const std::string& message_id);
+    bool delete_mail_message(const std::string& message_id);
+    bool delete_distributed_mail(const std::string& message_id);
+    size_t distributed_mail_count() const;
+    void set_mail_replication_policy(const MailReplicationPolicy& policy);
+    MailReplicationPolicy mail_replication_policy() const;
+    size_t prune_distributed_mail_store();
+    std::vector<MailStorageReceipt> mail_storage_receipts(const std::optional<std::string>& message_id = std::nullopt) const;
+    size_t verified_mail_storage_receipt_count() const;
+    size_t dht_store_mail(const DistributedMailRecord& record);
+    std::vector<DistributedMailRecord> dht_lookup_mail(const std::string& recipient_address,
+                                                       size_t limit = 128,
+                                                       uint32_t timeout_ms = 800);
+    DhtMailboxStatus dht_mailbox_status() const;
+    NatTraversalStatus nat_traversal_status() const;
     void punish_label(const std::string& label, int score, const std::string& reason);
     void set_ban(const std::string& label, int duration_seconds = constants::BANNED_PEER_DURATION_SECONDS);
     void clear_bans();
@@ -400,7 +544,39 @@ private:
     std::shared_ptr<const Wallet> chat_wallet_;
     std::filesystem::path chat_inbox_file_;
     std::filesystem::path chat_history_file_;
+    std::filesystem::path mail_history_file_;
+    std::filesystem::path distributed_mail_file_;
+    std::filesystem::path mail_receipts_file_;
     mutable std::mutex chat_mutex_;
+    mutable std::mutex mail_mutex_;
+    mutable std::mutex distributed_mail_mutex_;
+    mutable std::mutex mail_receipts_mutex_;
+    MailReplicationPolicy mail_policy_;
+    mutable std::mutex dht_mutex_;
+    std::condition_variable dht_results_cv_;
+    std::unordered_set<std::string> dht_seen_queries_;
+    std::unordered_map<std::string, std::vector<DistributedMailRecord>> dht_pending_results_;
+    struct PendingMailProofChallenge {
+        std::string challenge_id;
+        std::string message_id;
+        std::string recipient_address;
+        std::string replica_label;
+        std::string nonce_b64;
+        uint64_t created_at{0};
+    };
+    std::unordered_map<std::string, PendingMailProofChallenge> pending_mail_challenges_;
+    uint64_t dht_last_lookup_at_{0};
+    uint64_t dht_last_results_at_{0};
+    uint64_t dht_last_proof_at_{0};
+    uint64_t dht_last_nat_intro_at_{0};
+    uint64_t dht_last_reverse_intro_at_{0};
+    uint64_t dht_last_candidate_attempt_at_{0};
+    size_t dht_relay_attempts_{0};
+    size_t dht_relay_successes_{0};
+    mutable std::mutex stun_probe_mutex_;
+    mutable std::vector<std::string> stun_reflexive_candidates_;
+    mutable std::string last_stun_server_;
+    mutable uint64_t dht_last_stun_probe_at_{0};
     std::unordered_map<std::string, int64_t> recent_chat_ids_;
     mutable std::mutex voice_call_mutex_;
     VoiceCallInfo voice_call_;
@@ -408,6 +584,17 @@ private:
     mutable std::mutex pending_connect_mutex_;
     std::unordered_set<std::string> pending_connects_;
     std::atomic<bool> network_active_{true};
+
+    bool send_to_or_relay_mail_peer(const std::string& label, const Message& msg, const std::string& purpose);
+    std::vector<NatCandidate> build_nat_candidates(const std::optional<std::string>& target_label = std::nullopt) const;
+    bool attempt_nat_candidates(const std::vector<NatCandidate>& candidates);
+    void upsert_mail_storage_receipt(const MailStorageReceipt& receipt);
+    void maybe_issue_mail_storage_challenge(const MailStorageReceipt& receipt);
+    void maintain_mail_storage_proofs();
+    void slash_mail_receipt(const MailStorageReceipt& receipt,
+                            const std::string& reason,
+                            const std::string& evidence_material = {},
+                            const std::string& peer_label = {});
 };
 
 ip_address detect_public_ip(boost::asio::io_context& ctx);

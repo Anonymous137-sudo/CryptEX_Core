@@ -12,6 +12,9 @@ public:
     std::filesystem::path base_dir() const { return dir_; }
     bool store(uint64_t height, const Block& block);
     bool store_by_hash(const uint256_t& hash, const Block& block);
+    void remove_height(uint64_t height);
+    void remove_by_hash(const uint256_t& hash);
+    void prune_height_files_after(uint64_t height);
     std::optional<Block> load(uint64_t height) const;
     std::optional<Block> load_by_hash(const uint256_t& hash) const;
     bool exists(uint64_t height) const;

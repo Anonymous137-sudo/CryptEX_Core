@@ -62,9 +62,10 @@ build_macos_arm64() {
   cmake -S "${ROOT_DIR}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="arm64" >/dev/null
-  cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
+  cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer cryptexqt -j4 >/dev/null
   cp "${build_dir}/cryptexd_osx" "${DIST_DIR}/cryptexd_macos_arm64"
   cp "${build_dir}/cryptex_tests" "${DIST_DIR}/cryptex_tests_macos_arm64"
+  cp "${build_dir}/cryptex_powminer_osx" "${DIST_DIR}/cryptex_powminer_macos_arm64"
   if [[ -d "${build_dir}/cryptexqt_osx.app" ]]; then
     rm -f "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_arm64"
     copy_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/cryptexqt_macos_arm64.app" || true
@@ -85,9 +86,10 @@ build_macos_universal() {
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
     -DOPENSSL_ROOT_DIR="${openssl_root}" >/dev/null
-  cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
+  cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer cryptexqt -j4 >/dev/null
   cp "${build_dir}/cryptexd_osx" "${DIST_DIR}/cryptexd_macos_universal"
   cp "${build_dir}/cryptex_tests" "${DIST_DIR}/cryptex_tests_macos_universal"
+  cp "${build_dir}/cryptex_powminer_osx" "${DIST_DIR}/cryptex_powminer_macos_universal"
   if [[ -d "${build_dir}/cryptexqt_osx.app" ]]; then
     rm -f "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_universal"
     copy_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/cryptexqt_macos_universal.app" || true
@@ -118,14 +120,18 @@ build_windows_x86_64() {
     -DOPENSSL_ROOT_DIR="${openssl_root}" \
     -DOPUS_ROOT_DIR="${opus_root}" >/dev/null
   if [[ -n "${qt_root}" ]]; then
-    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
+    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer cryptexqt -j4 >/dev/null
   else
-    cmake --build "${build_dir}" --target cryptexd cryptex_tests -j4 >/dev/null
+    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer -j4 >/dev/null
     record_skipped "windows-x86_64-gui" "set QT6_ROOT_WIN_X86_64 to a Qt6 mingw prefix"
   fi
   cp "${build_dir}/cryptexd_win32.exe" "${DIST_DIR}/cryptexd_windows_x86_64.exe"
   cp "${build_dir}/cryptex_tests.exe" "${DIST_DIR}/cryptex_tests_windows_x86_64.exe"
+  cp "${build_dir}/cryptex_powminer_win32.exe" "${DIST_DIR}/cryptex_powminer_windows_x86_64.exe"
   copy_if_exists "${build_dir}/cryptexqt_win32.exe" "${DIST_DIR}/cryptexqt_windows_x86_64.exe" || true
+  if [[ -n "${qt_root}" && -f "${build_dir}/cryptexqt_win32.exe" ]]; then
+    "${ROOT_DIR}/scripts/package-windows-runtime.sh" "${build_dir}" "${DIST_DIR}/CryptEX_windows_x86_64_bundle" >/dev/null
+  fi
   record_built "windows-x86_64"
 }
 
@@ -154,13 +160,14 @@ build_windows_arm64() {
     -DOPENSSL_ROOT_DIR="${openssl_root}" \
     -DOPUS_ROOT_DIR="${opus_root}" >/dev/null
   if [[ -n "${qt_root}" ]]; then
-    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null
+    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer cryptexqt -j4 >/dev/null
   else
-    cmake --build "${build_dir}" --target cryptexd cryptex_tests -j4 >/dev/null
+    cmake --build "${build_dir}" --target cryptexd cryptex_tests cryptex_powminer -j4 >/dev/null
     record_skipped "windows-arm64-gui" "set QT6_ROOT_WIN_ARM64 to a Qt6 ARM64 mingw prefix"
   fi
   cp "${build_dir}/cryptexd_win32.exe" "${DIST_DIR}/cryptexd_windows_arm64.exe"
   cp "${build_dir}/cryptex_tests.exe" "${DIST_DIR}/cryptex_tests_windows_arm64.exe"
+  cp "${build_dir}/cryptex_powminer_win32.exe" "${DIST_DIR}/cryptex_powminer_windows_arm64.exe"
   copy_if_exists "${build_dir}/cryptexqt_win32.exe" "${DIST_DIR}/cryptexqt_windows_arm64.exe" || true
   record_built "windows-arm64"
 }
@@ -186,10 +193,11 @@ build_linux_target() {
      export CC=/usr/bin/gcc CXX=/usr/bin/g++ && \
      rm -rf ${build_dir} && \
      cmake -S /src -B ${build_dir} -DCMAKE_BUILD_TYPE=Release >/dev/null && \
-     cmake --build ${build_dir} --target cryptexd cryptex_tests cryptexqt -j4 >/dev/null && \
+     cmake --build ${build_dir} --target cryptexd cryptex_tests cryptex_powminer cryptexqt -j4 >/dev/null && \
      /src/scripts/package-linux-appimage.sh ${arch} /src ${build_dir}"
   cp "${BUILD_ROOT}/linux-${arch}/cryptexd_linux" "${DIST_DIR}/cryptexd_linux_${arch}"
   cp "${BUILD_ROOT}/linux-${arch}/cryptex_tests" "${DIST_DIR}/cryptex_tests_linux_${arch}"
+  cp "${BUILD_ROOT}/linux-${arch}/cryptex_powminer_linux" "${DIST_DIR}/cryptex_powminer_linux_${arch}"
   copy_if_exists "${BUILD_ROOT}/linux-${arch}/cryptexqt_linux" "${DIST_DIR}/cryptexqt_linux_${arch}" || true
   record_built "linux-${arch}"
 }

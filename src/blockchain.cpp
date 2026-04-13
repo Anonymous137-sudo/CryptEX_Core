@@ -81,13 +81,26 @@ Blockchain::Blockchain(const std::filesystem::path& data_dir)
     rebuild_known_block_state();
     load_local_checkpoint();
     load_manual_checkpoint();
+    load_sync_approval();
+    if (!load_chainstate_snapshot()) {
+        rebuild_utxo_from_active_chain();
+        persist_chainstate();
+    }
+    const bool repaired_active_chain = repair_active_chain_if_needed();
+    const bool repaired_height_files = repair_height_files_from_active_index_if_needed();
+    if (!active_chain_matches_local_checkpoint() &&
+        (repaired_active_chain || clear_stale_local_checkpoint_if_needed())) {
+        refresh_local_checkpoint();
+    }
     if (!active_chain_matches_local_checkpoint()) {
         throw std::runtime_error("active chain violates local checkpoint");
     }
-    load_sync_approval();
     refresh_local_checkpoint();
     if (!load_chainstate_snapshot()) {
         rebuild_utxo_from_active_chain();
+        persist_chainstate();
+    }
+    if (repaired_height_files) {
         persist_chainstate();
     }
 }
@@ -198,7 +211,14 @@ bool Blockchain::connect_block(const Block& blk, bool skip_pow_check) {
 }
 
 uint256_t Blockchain::block_work(uint32_t bits) const {
-    uint256_t target = compact_target{bits}.expand();
+    compact_target compact{bits};
+    if (compact.is_negative() || compact.is_zero() ||
+        compact.overflows(constants::POW_HASH_BYTES) ||
+        !compact.is_canonical(constants::POW_HASH_BYTES)) {
+        return uint256_t();
+    }
+    uint256_t target = compact.expand();
+    if (target > compact_target{pow_limit_bits()}.expand()) return uint256_t();
     if (target == uint256_t()) return uint256_t();
     uint256_t one(1);
     uint256_t max = (one << 511);
@@ -239,46 +259,186 @@ uint32_t Blockchain::expected_bits_for(const std::map<uint64_t, uint256_t>& hmap
     return get_next_work_required(hmap, idx, prev_h, last_bits, candidate_timestamp);
 }
 
-bool Blockchain::validate_path(const std::vector<uint256_t>& path, UTXOSet& out_utxo, uint32_t& out_tip_bits, bool skip_pow_check) {
+size_t Blockchain::validated_prefix_length(const std::vector<uint256_t>& path,
+                                           UTXOSet& out_utxo,
+                                           uint32_t& out_tip_bits,
+                                           bool skip_pow_check,
+                                           bool log_failures,
+                                           std::string* failure_reason,
+                                           uint64_t* failure_height) const {
     std::map<uint64_t, uint256_t> hmap;
     std::unordered_map<uint256_t, BlockHeader> idx;
     out_utxo.clear();
+    out_tip_bits = tip_bits_;
+    if (failure_reason) failure_reason->clear();
+    if (failure_height) *failure_height = 0;
     for (size_t i = 0; i < path.size(); ++i) {
         uint64_t height = static_cast<uint64_t>(i);
         const auto& h = path[i];
         auto blk_opt = get_block_by_hash(h);
-        if (!blk_opt) return false;
+        if (!blk_opt) {
+            if (failure_reason) *failure_reason = "missing-block";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=missing-block height=" + std::to_string(height));
+            }
+            return i;
+        }
         const Block& blk = *blk_opt;
         hmap[height] = h;
         idx[h] = blk.header;
-        // FIX: store height for this block
-        block_height_[h] = height;
 
         // linkage
-        if (height > 0 && blk.header.prev_block_hash != idx.at(path[i-1]).hash()) return false;
+        if (height > 0 && blk.header.prev_block_hash != idx.at(path[i-1]).hash()) {
+            if (failure_reason) *failure_reason = "prev-link";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=prev-link height=" + std::to_string(height));
+            }
+            return i;
+        }
         const BlockHeader* parent_header = (height > 0) ? &idx.at(path[i - 1]) : nullptr;
-        if (!block_timestamp_valid(blk.header, parent_header)) return false;
+        if (!block_timestamp_valid(blk.header, parent_header)) {
+            if (failure_reason) *failure_reason = "timestamp";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=timestamp height=" + std::to_string(height) +
+                                  " candidate_ts=" + std::to_string(blk.header.timestamp) +
+                                  " parent_ts=" + std::to_string(parent_header ? parent_header->timestamp : 0));
+            }
+            return i;
+        }
         // PoW & merkle
-        if (height > 0 && !skip_pow_check && !blk.check_pow()) return false;
-        if (blk.compute_merkle_root() != blk.header.merkle_root) return false;
+        if (height > 0 && !skip_pow_check) {
+            compact_target compact{blk.header.bits};
+            if (!compact.is_canonical(constants::POW_HASH_BYTES)) {
+                if (failure_reason) *failure_reason = "bits-encoding";
+                if (failure_height) *failure_height = height;
+                if (log_failures) {
+                    log_warn("chain", "candidate invalid reason=bits-encoding height=" +
+                                      std::to_string(height) +
+                                      " bits=" + std::to_string(blk.header.bits));
+                }
+                return i;
+            }
+            if (!blk.check_pow()) {
+                if (failure_reason) *failure_reason = "pow";
+                if (failure_height) *failure_height = height;
+                if (log_failures) {
+                    log_warn("chain", "candidate invalid reason=pow height=" + std::to_string(height));
+                }
+                return i;
+            }
+        }
+        if (blk.compute_merkle_root() != blk.header.merkle_root) {
+            if (failure_reason) *failure_reason = "merkle";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=merkle height=" + std::to_string(height));
+            }
+            return i;
+        }
         // bits
         uint32_t exp_bits = expected_bits_for(hmap, idx, height, blk.header.timestamp);
-        if (blk.header.bits != exp_bits) return false;
+        if (blk.header.bits != exp_bits) {
+            if (failure_reason) *failure_reason = "bits";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=bits height=" + std::to_string(height) +
+                                  " have=" + std::to_string(blk.header.bits) +
+                                  " expected=" + std::to_string(exp_bits));
+            }
+            return i;
+        }
         // transaction validation
         int64_t total_fees = 0;
-        if (blk.transactions.empty() || !blk.transactions[0].is_coinbase()) return false;
+        if (blk.transactions.empty() || !blk.transactions[0].is_coinbase()) {
+            if (failure_reason) *failure_reason = "coinbase-missing";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=coinbase-missing height=" + std::to_string(height));
+            }
+            return i;
+        }
         for (size_t ti = 0; ti < blk.transactions.size(); ++ti) {
             const auto& tx = blk.transactions[ti];
             int64_t fee = 0;
-            if (!out_utxo.apply_transaction(tx, static_cast<uint32_t>(height), &fee)) return false;
+            if (!out_utxo.apply_transaction(tx, static_cast<uint32_t>(height), &fee)) {
+                if (failure_reason) *failure_reason = "tx-apply";
+                if (failure_height) *failure_height = height;
+                if (log_failures) {
+                    log_warn("chain", "candidate invalid reason=tx-apply height=" + std::to_string(height) +
+                                      " tx_index=" + std::to_string(ti));
+                }
+                return i;
+            }
             if (!tx.is_coinbase()) total_fees += fee;
         }
         int64_t expected_reward = Block::get_block_reward(height);
         int64_t coinbase_out = blk.transactions[0].total_output_value();
-        if (coinbase_out > expected_reward + total_fees) return false;
+        if (coinbase_out > expected_reward + total_fees) {
+            if (failure_reason) *failure_reason = "coinbase-overpay";
+            if (failure_height) *failure_height = height;
+            if (log_failures) {
+                log_warn("chain", "candidate invalid reason=coinbase-overpay height=" + std::to_string(height) +
+                                  " coinbase=" + std::to_string(coinbase_out) +
+                                  " allowed=" + std::to_string(expected_reward + total_fees));
+            }
+            return i;
+        }
+        out_tip_bits = blk.header.bits;
     }
-    out_tip_bits = path.empty() ? tip_bits_ : idx.at(path.back()).bits;
-    return true;
+    return path.size();
+}
+
+bool Blockchain::validate_path(const std::vector<uint256_t>& path, UTXOSet& out_utxo, uint32_t& out_tip_bits, bool skip_pow_check) {
+    return validated_prefix_length(path, out_utxo, out_tip_bits, skip_pow_check, true) == path.size();
+}
+
+void Blockchain::purge_cached_subtree(const uint256_t& root) {
+    std::vector<uint256_t> stack{root};
+    std::unordered_set<uint256_t> seen;
+    std::vector<uint256_t> purge_list;
+
+    while (!stack.empty()) {
+        const auto current = stack.back();
+        stack.pop_back();
+        if (!seen.insert(current).second) continue;
+
+        auto header_it = index_.find(current);
+        if (header_it != index_.end()) {
+            auto kids = children_.find(header_it->second.hash());
+            if (kids != children_.end()) {
+                for (const auto& child : kids->second) {
+                    stack.push_back(child);
+                }
+            }
+        }
+
+        purge_list.push_back(current);
+    }
+
+    bool mutated = false;
+    for (const auto& hash : purge_list) {
+        if (height_index_.count(hash)) continue;
+
+        auto header_it = index_.find(hash);
+        if (header_it != index_.end()) {
+            link_index_.erase(header_it->second.hash());
+            index_.erase(header_it);
+            mutated = true;
+        }
+        mutated = block_pool_.erase(hash) > 0 || mutated;
+        mutated = chain_work_.erase(hash) > 0 || mutated;
+        mutated = block_height_.erase(hash) > 0 || mutated;
+        mutated = height_index_.erase(hash) > 0 || mutated;
+        store_.remove_by_hash(hash);
+    }
+
+    if (!mutated) return;
+
+    rebuild_known_block_state();
+    persist_headers();
 }
 
 bool Blockchain::activate_path(const std::vector<uint256_t>& path, UTXOSet& new_utxo, uint32_t new_tip_bits) {
@@ -301,6 +461,7 @@ bool Blockchain::activate_path(const std::vector<uint256_t>& path, UTXOSet& new_
     best_height_ = path.empty() ? 0 : path.size() - 1;
     tip_hash_ = path.empty() ? tip_hash_ : path.back();
     tip_bits_ = new_tip_bits;
+    store_.prune_height_files_after(best_height_);
     utxo_.swap_in(std::move(new_utxo));
     mempool_.clear();
     refresh_local_checkpoint();
@@ -314,9 +475,16 @@ bool Blockchain::accept_block(const Block& blk, bool skip_pow_check) {
     uint256_t bh = blk.header.pow_hash();
 
     // Basic stateless checks (always run)
-    if (!skip_pow_check && blk.header.prev_block_hash != uint256_t() && !blk.check_pow()) {
-        log_warn("chain", "reject block bad PoW");
-        return false;
+    if (!skip_pow_check && blk.header.prev_block_hash != uint256_t()) {
+        compact_target compact{blk.header.bits};
+        if (!compact.is_canonical(constants::POW_HASH_BYTES)) {
+            log_warn("chain", "reject block non-canonical bits");
+            return false;
+        }
+        if (!blk.check_pow()) {
+            log_warn("chain", "reject block bad PoW");
+            return false;
+        }
     }
     if (blk.compute_merkle_root() != blk.header.merkle_root) {
         log_warn("chain", "reject block bad merkle");
@@ -365,28 +533,40 @@ bool Blockchain::accept_block(const Block& blk, bool skip_pow_check) {
         return true;
     }
 
-    // FIX: compute height using block_height_ map (or recursively compute)
     uint64_t height;
     if (parent_link == uint256_t()) {
         height = 0;
     } else {
-        // parent must have its height stored in block_height_
         auto it = block_height_.find(parent);
         if (it == block_height_.end()) {
-            // This should not happen if parent is known (has chain_work)
             log_warn("chain", "parent height not stored");
             return false;
         }
         height = it->second + 1;
     }
-    block_height_[bh] = height;
-    height_index_[bh] = height; // for active chain later
-    chain_work_[bh] = ((parent_link == uint256_t()) ? uint256_t() : chain_work_.at(parent)) + block_work(blk.header.bits);
+    const uint256_t candidate_work =
+        ((parent_link == uint256_t()) ? uint256_t() : chain_work_.at(parent)) + block_work(blk.header.bits);
+    const bool candidate_beats_tip =
+        !chain_work_.count(tip_hash_) || candidate_work > chain_work_[tip_hash_];
+
+    std::vector<uint256_t> path;
+    if (!build_path_to_genesis(bh, path)) return false;
+
+    UTXOSet new_utxo;
+    uint32_t new_tip_bits = blk.header.bits;
+    if (validated_prefix_length(path, new_utxo, new_tip_bits, skip_pow_check, true) != path.size()) {
+        purge_cached_subtree(bh);
+        log_warn("chain", "candidate chain invalid");
+        return false;
+    }
 
     // Determine best chain
-    if (!chain_work_.count(tip_hash_) || chain_work_[bh] > chain_work_[tip_hash_]) {
-        std::vector<uint256_t> path;
-        if (!build_path_to_genesis(bh, path)) return false;
+    if (candidate_beats_tip) {
+        if (!candidate_matches_local_checkpoint(path)) {
+            log_warn("chain", "reject checkpoint mismatch candidate=" +
+                              bh.to_hex_padded(constants::POW_HASH_BYTES));
+            return false;
+        }
         const uint64_t reorg_depth = reorg_depth_from_candidate(height_map_, best_height_, path);
         const uint64_t max_reorg_depth = runtime_max_reorg_depth();
         if (reorg_depth > max_reorg_depth && !allow_deep_reorg()) {
@@ -396,21 +576,12 @@ bool Blockchain::accept_block(const Block& blk, bool skip_pow_check) {
                               " candidate=" + bh.to_hex_padded(constants::POW_HASH_BYTES));
             return false;
         }
-        if (!candidate_matches_local_checkpoint(path)) {
-            log_warn("chain", "reject checkpoint mismatch candidate=" +
-                              bh.to_hex_padded(constants::POW_HASH_BYTES));
-            return false;
-        }
-        UTXOSet new_utxo;
-        uint32_t new_tip_bits = blk.header.bits;
-        if (!validate_path(path, new_utxo, new_tip_bits, skip_pow_check)) {
-            log_warn("chain", "candidate chain invalid");
-            return false;
-        }
         if (!activate_path(path, new_utxo, new_tip_bits)) return false;
         log_info("chain", "switched to new tip " + bh.to_hex_padded(constants::POW_HASH_BYTES) +
                           " height=" + std::to_string(best_height_));
-        tip_hash_ = bh;
+    } else {
+        block_height_[bh] = height;
+        chain_work_[bh] = candidate_work;
     }
 
     // Process any orphans that depended on this block
@@ -940,6 +1111,130 @@ void Blockchain::rebuild_utxo_from_active_chain() {
             utxo_.apply_transaction(tx, static_cast<uint32_t>(h));
         }
     }
+}
+
+bool Blockchain::clear_stale_local_checkpoint_if_needed() {
+    if (!local_checkpoint_) return false;
+    const auto [height, hash] = *local_checkpoint_;
+    (void)hash;
+    if (height <= best_height_) return false;
+
+    log_warn("chain", "clearing stale local checkpoint height=" + std::to_string(height) +
+                      " best_height=" + std::to_string(best_height_));
+    if (manual_checkpoint_pinned_) {
+        manual_checkpoint_pinned_ = false;
+        std::error_code ec;
+        std::filesystem::remove(manual_checkpoint_path(), ec);
+    }
+    local_checkpoint_.reset();
+
+    if (sync_approval_ && sync_approval_->height > best_height_) {
+        sync_approval_->approved = false;
+        sync_approval_->height = best_height_;
+        sync_approval_->tip = tip_hash_;
+        sync_approval_->network_height = std::max(sync_approval_->network_height, best_height_);
+        persist_sync_approval();
+    }
+
+    return true;
+}
+
+bool Blockchain::repair_active_chain_if_needed() {
+    if (height_map_.empty()) return false;
+
+    std::vector<uint256_t> active_path;
+    active_path.reserve(height_map_.size());
+    for (const auto& [height, hash] : height_map_) {
+        (void)height;
+        active_path.push_back(hash);
+    }
+
+    UTXOSet repaired_utxo;
+    uint32_t repaired_tip_bits = tip_bits_;
+    std::string failure_reason;
+    uint64_t failure_height = 0;
+    const size_t valid_prefix = validated_prefix_length(
+        active_path,
+        repaired_utxo,
+        repaired_tip_bits,
+        /*skip_pow_check=*/false,
+        /*log_failures=*/true,
+        &failure_reason,
+        &failure_height);
+    if (valid_prefix == active_path.size()) {
+        return false;
+    }
+    if (valid_prefix == 0) {
+        log_warn("chain", "active chain repair aborted: genesis prefix invalid reason=" +
+                          failure_reason +
+                          " height=" + std::to_string(failure_height));
+        return false;
+    }
+
+    for (size_t i = valid_prefix; i < active_path.size(); ++i) {
+        const auto& hash = active_path[i];
+        auto header_it = index_.find(hash);
+        if (header_it != index_.end()) {
+            link_index_.erase(header_it->second.hash());
+            index_.erase(header_it);
+        }
+        block_pool_.erase(hash);
+        chain_work_.erase(hash);
+        block_height_.erase(hash);
+        height_index_.erase(hash);
+        store_.remove_by_hash(hash);
+    }
+
+    const uint64_t old_height = best_height_;
+    std::vector<uint256_t> repaired_path(active_path.begin(), active_path.begin() + valid_prefix);
+    if (!activate_path(repaired_path, repaired_utxo, repaired_tip_bits)) {
+        return false;
+    }
+
+    rebuild_known_block_state();
+
+    if (sync_approval_ &&
+        (sync_approval_->height > best_height_ || sync_approval_->tip != tip_hash_)) {
+        sync_approval_->approved = false;
+        sync_approval_->height = best_height_;
+        sync_approval_->tip = tip_hash_;
+        sync_approval_->network_height = std::max(sync_approval_->network_height, best_height_);
+        persist_sync_approval();
+    }
+
+    log_warn("chain", "repaired invalid active chain reason=" + failure_reason +
+                      " failure_height=" + std::to_string(failure_height) +
+                      " old_height=" + std::to_string(old_height) +
+                      " new_height=" + std::to_string(best_height_));
+    return true;
+}
+
+bool Blockchain::repair_height_files_from_active_index_if_needed() {
+    if (height_map_.empty()) return false;
+
+    uint64_t repaired = 0;
+    for (const auto& [height, hash] : height_map_) {
+        if (store_.exists(height)) continue;
+        auto blk = store_.load_by_hash(hash);
+        if (!blk) {
+            log_warn("chain", "missing canonical height file and hash block for height=" +
+                              std::to_string(height));
+            continue;
+        }
+        if (!store_.store(height, *blk)) {
+            log_warn("chain", "failed to restore canonical height file for height=" +
+                              std::to_string(height));
+            continue;
+        }
+        ++repaired;
+    }
+
+    if (repaired == 0) return false;
+
+    store_.prune_height_files_after(best_height_);
+    log_warn("chain", "restored missing canonical height files count=" + std::to_string(repaired) +
+                      " tip_height=" + std::to_string(best_height_));
+    return true;
 }
 
 uint32_t Blockchain::expected_bits(uint64_t height, uint32_t candidate_timestamp) const {

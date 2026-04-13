@@ -68,8 +68,16 @@ private:
     void ensure_genesis();
     uint256_t block_work(uint32_t bits) const;
     bool build_path_to_genesis(const uint256_t& tip, std::vector<uint256_t>& out_path) const;
+    size_t validated_prefix_length(const std::vector<uint256_t>& path,
+                                   UTXOSet& out_utxo,
+                                   uint32_t& out_tip_bits,
+                                   bool skip_pow_check,
+                                   bool log_failures,
+                                   std::string* failure_reason = nullptr,
+                                   uint64_t* failure_height = nullptr) const;
     bool validate_path(const std::vector<uint256_t>& path, UTXOSet& out_utxo, uint32_t& out_tip_bits, bool skip_pow_check);
     bool activate_path(const std::vector<uint256_t>& path, UTXOSet& new_utxo, uint32_t new_tip_bits);
+    void purge_cached_subtree(const uint256_t& root);
     uint32_t expected_bits(uint64_t height, uint32_t candidate_timestamp) const;
     uint32_t expected_bits_for(const std::map<uint64_t, uint256_t>& hmap,
                                const std::unordered_map<uint256_t, BlockHeader>& idx,
@@ -92,6 +100,9 @@ private:
     void rebuild_from_blocks();
     void rebuild_utxo_from_active_chain();
     void rebuild_known_block_state();
+    bool repair_active_chain_if_needed();
+    bool repair_height_files_from_active_index_if_needed();
+    bool clear_stale_local_checkpoint_if_needed();
     void refresh_local_checkpoint();
     bool candidate_matches_local_checkpoint(const std::vector<uint256_t>& path) const;
     bool active_chain_matches_local_checkpoint() const;

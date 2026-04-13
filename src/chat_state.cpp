@@ -61,6 +61,32 @@ std::string trim_copy(std::string value) {
     return value;
 }
 
+std::vector<std::string> split_csv_values(const std::string& value) {
+    std::vector<std::string> out;
+    std::string current;
+    std::istringstream input(value);
+    while (std::getline(input, current, ',')) {
+        current = trim_copy(current);
+        if (!current.empty()) {
+            out.push_back(current);
+        }
+    }
+    return out;
+}
+
+std::string join_csv_values(const std::vector<std::string>& values) {
+    std::ostringstream out;
+    bool first = true;
+    for (const auto& value : values) {
+        const auto trimmed = trim_copy(value);
+        if (trimmed.empty()) continue;
+        if (!first) out << ',';
+        out << trimmed;
+        first = false;
+    }
+    return out.str();
+}
+
 std::vector<std::pair<std::string, std::string>> read_kv_file(const std::filesystem::path& path) {
     std::ifstream input(path);
     std::vector<std::pair<std::string, std::string>> rows;
@@ -233,6 +259,78 @@ void append_irc_log(const std::filesystem::path& path, const IrcLogEntry& entry)
            << encode_field(entry.nick) << '\t'
            << encode_field(entry.message) << '\t'
            << encode_field(entry.status) << '\n';
+}
+
+MailSecurityConfig load_mail_security_config(const std::filesystem::path& path) {
+    MailSecurityConfig config;
+    for (const auto& [key, value] : read_kv_file(path)) {
+        if (key == "two_factor_enabled") config.two_factor_enabled = parse_bool(value);
+        else if (key == "totp_secret_b32") config.totp_secret_b32 = value;
+        else if (key == "issuer") config.issuer = value;
+    }
+    if (config.totp_secret_b32.empty()) {
+        config.two_factor_enabled = false;
+    }
+    return config;
+}
+
+void save_mail_security_config(const std::filesystem::path& path, const MailSecurityConfig& config) {
+    write_kv_file(path, {
+        {"two_factor_enabled", bool_field(config.two_factor_enabled)},
+        {"totp_secret_b32", config.totp_secret_b32},
+        {"issuer", config.issuer},
+    });
+}
+
+MailPolicyConfig load_mail_policy_config(const std::filesystem::path& path) {
+    MailPolicyConfig config;
+    for (const auto& [key, value] : read_kv_file(path)) {
+        if (key == "ttl_hours") config.ttl_hours = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "replica_target") config.replica_target = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "max_store_items") config.max_store_items = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "prune_imported") config.prune_imported = parse_bool(value);
+        else if (key == "prune_expired") config.prune_expired = parse_bool(value);
+        else if (key == "proof_of_storage") config.proof_of_storage = parse_bool(value);
+        else if (key == "challenge_interval_minutes") config.challenge_interval_minutes = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "minimum_bond_sats") config.minimum_bond_sats = static_cast<uint64_t>(std::stoull(value));
+        else if (key == "required_verified_replicas") config.required_verified_replicas = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "slash_on_failed_proof") config.slash_on_failed_proof = parse_bool(value);
+        else if (key == "slash_penalty_score") config.slash_penalty_score = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "nat_assist") config.nat_assist = parse_bool(value);
+        else if (key == "relay_fallback") config.relay_fallback = parse_bool(value);
+        else if (key == "relay_peers") config.relay_peers = split_csv_values(value);
+        else if (key == "stun_servers") config.stun_servers = split_csv_values(value);
+        else if (key == "stun_timeout_ms") config.stun_timeout_ms = static_cast<uint32_t>(std::stoul(value));
+    }
+    if (config.ttl_hours == 0) config.ttl_hours = 168;
+    if (config.replica_target == 0) config.replica_target = 1;
+    if (config.max_store_items == 0) config.max_store_items = 5000;
+    if (config.challenge_interval_minutes == 0) config.challenge_interval_minutes = 30;
+    if (config.required_verified_replicas == 0) config.required_verified_replicas = 1;
+    if (config.slash_penalty_score == 0) config.slash_penalty_score = 25;
+    if (config.stun_timeout_ms == 0) config.stun_timeout_ms = 1200;
+    return config;
+}
+
+void save_mail_policy_config(const std::filesystem::path& path, const MailPolicyConfig& config) {
+    write_kv_file(path, {
+        {"ttl_hours", std::to_string(std::max<uint32_t>(config.ttl_hours, 1))},
+        {"replica_target", std::to_string(std::max<uint32_t>(config.replica_target, 1))},
+        {"max_store_items", std::to_string(std::max<uint32_t>(config.max_store_items, 1))},
+        {"prune_imported", bool_field(config.prune_imported)},
+        {"prune_expired", bool_field(config.prune_expired)},
+        {"proof_of_storage", bool_field(config.proof_of_storage)},
+        {"challenge_interval_minutes", std::to_string(std::max<uint32_t>(config.challenge_interval_minutes, 1))},
+        {"minimum_bond_sats", std::to_string(config.minimum_bond_sats)},
+        {"required_verified_replicas", std::to_string(std::max<uint32_t>(config.required_verified_replicas, 1))},
+        {"slash_on_failed_proof", bool_field(config.slash_on_failed_proof)},
+        {"slash_penalty_score", std::to_string(std::max<uint32_t>(config.slash_penalty_score, 1))},
+        {"nat_assist", bool_field(config.nat_assist)},
+        {"relay_fallback", bool_field(config.relay_fallback)},
+        {"relay_peers", join_csv_values(config.relay_peers)},
+        {"stun_servers", join_csv_values(config.stun_servers)},
+        {"stun_timeout_ms", std::to_string(std::max<uint32_t>(config.stun_timeout_ms, 100))},
+    });
 }
 
 } // namespace chatstate

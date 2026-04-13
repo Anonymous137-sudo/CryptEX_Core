@@ -4,7 +4,9 @@
 #include "chat_secure.hpp"
 #include "chainparams.hpp"
 #include "debug.hpp"
+#include "script.hpp"
 #include "serialization.hpp"
+#include "sha3_512.hpp"
 #ifdef _WIN32
 #include <winsock2.h>
 #else
@@ -39,6 +41,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace ssl = boost::asio::ssl;
 using tcp = boost::asio::ip::tcp;
+using udp = boost::asio::ip::udp;
 
 const char* mempool_status_name(Mempool::AcceptStatus status) {
     switch (status) {
@@ -76,6 +79,10 @@ std::optional<std::pair<std::string, uint16_t>> parse_host_port(const std::strin
     return std::make_pair(host, port);
 }
 
+bool looks_like_peer_label(const std::string& value) {
+    return parse_host_port(value, default_p2p_port()).has_value();
+}
+
 bool is_ipv4_literal(const std::string& host) {
     try {
         boost::asio::ip::make_address_v4(host);
@@ -88,6 +95,861 @@ bool is_ipv4_literal(const std::string& host) {
 uint64_t now_millis() {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t hash_key64(const std::string& value) {
+    const auto digest = crypto::sha3_512(value);
+    uint64_t out = 0;
+    for (size_t i = 0; i < sizeof(out) && i < digest.size(); ++i) {
+        out = (out << 8) | static_cast<uint64_t>(digest[i]);
+    }
+    return out;
+}
+
+uint64_t dht_distance64(const std::string& lhs, const std::string& rhs) {
+    return hash_key64(lhs) ^ hash_key64(rhs);
+}
+
+std::string encode_mail_store_field(const std::string& value) {
+    return crypto::base64_encode(value);
+}
+
+std::string decode_mail_store_field(const std::string& value) {
+    auto bytes = crypto::base64_decode(value);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+std::vector<std::string> split_mail_store_line(const std::string& line) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (true) {
+        auto pos = line.find('\t', start);
+        if (pos == std::string::npos) {
+            out.push_back(line.substr(start));
+            break;
+        }
+        out.push_back(line.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return out;
+}
+
+struct DhtMailStorePayload {
+    uint8_t version{1};
+    NetworkNode::DistributedMailRecord record;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_int<uint32_t>(out, record.version);
+        serialization::write_int<uint64_t>(out, record.stored_at);
+        serialization::write_int<uint64_t>(out, record.expires_at);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(record.message_id.data()), record.message_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(record.sender_address.data()), record.sender_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(record.recipient_address.data()), record.recipient_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(record.peer_label.data()), record.peer_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(record.payload_b64.data()), record.payload_b64.size());
+        return out;
+    }
+
+    static DhtMailStorePayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailStorePayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        payload.record.version = serialization::read_int<uint32_t>(ptr, remaining);
+        payload.record.stored_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.record.expires_at = serialization::read_int<uint64_t>(ptr, remaining);
+        auto message_id = serialization::read_bytes(ptr, remaining);
+        auto sender = serialization::read_bytes(ptr, remaining);
+        auto recipient = serialization::read_bytes(ptr, remaining);
+        auto peer = serialization::read_bytes(ptr, remaining);
+        auto payload_b64 = serialization::read_bytes(ptr, remaining);
+        payload.record.message_id.assign(message_id.begin(), message_id.end());
+        payload.record.sender_address.assign(sender.begin(), sender.end());
+        payload.record.recipient_address.assign(recipient.begin(), recipient.end());
+        payload.record.peer_label.assign(peer.begin(), peer.end());
+        payload.record.payload_b64.assign(payload_b64.begin(), payload_b64.end());
+        return payload;
+    }
+};
+
+struct DhtMailFindPayload {
+    uint8_t version{1};
+    std::string query_id;
+    std::string recipient_address;
+    std::string requester_label;
+    uint32_t limit{64};
+    uint8_t hops{1};
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(query_id.data()), query_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(recipient_address.data()), recipient_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(requester_label.data()), requester_label.size());
+        serialization::write_int<uint32_t>(out, limit);
+        serialization::write_int<uint8_t>(out, hops);
+        return out;
+    }
+
+    static DhtMailFindPayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailFindPayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        auto query_id = serialization::read_bytes(ptr, remaining);
+        auto recipient = serialization::read_bytes(ptr, remaining);
+        auto requester = serialization::read_bytes(ptr, remaining);
+        payload.limit = serialization::read_int<uint32_t>(ptr, remaining);
+        payload.hops = serialization::read_int<uint8_t>(ptr, remaining);
+        payload.query_id.assign(query_id.begin(), query_id.end());
+        payload.recipient_address.assign(recipient.begin(), recipient.end());
+        payload.requester_label.assign(requester.begin(), requester.end());
+        return payload;
+    }
+};
+
+struct DhtMailResultsPayload {
+    uint8_t version{1};
+    std::string query_id;
+    std::vector<NetworkNode::DistributedMailRecord> records;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(query_id.data()), query_id.size());
+        serialization::write_varint(out, records.size());
+        for (const auto& record : records) {
+            DhtMailStorePayload row;
+            row.record = record;
+            auto bytes = row.serialize();
+            serialization::write_bytes(out, bytes.data(), bytes.size());
+        }
+        return out;
+    }
+
+    static DhtMailResultsPayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailResultsPayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        auto query_id = serialization::read_bytes(ptr, remaining);
+        payload.query_id.assign(query_id.begin(), query_id.end());
+        const auto count = serialization::read_varint(ptr, remaining);
+        payload.records.reserve(static_cast<size_t>(count));
+        for (uint64_t i = 0; i < count; ++i) {
+            auto row = serialization::read_bytes(ptr, remaining);
+            payload.records.push_back(DhtMailStorePayload::deserialize(row).record);
+        }
+        return payload;
+    }
+};
+
+struct DhtMailReceiptPayload {
+    uint8_t version{2};
+    NetworkNode::MailStorageReceipt receipt;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_int<uint32_t>(out, receipt.version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.message_id.data()), receipt.message_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.recipient_address.data()), receipt.recipient_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.replica_label.data()), receipt.replica_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.storage_hash_hex.data()), receipt.storage_hash_hex.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.last_proof_hash_hex.data()), receipt.last_proof_hash_hex.size());
+        serialization::write_int<uint64_t>(out, receipt.stored_at);
+        serialization::write_int<uint64_t>(out, receipt.expires_at);
+        serialization::write_int<uint64_t>(out, receipt.receipt_at);
+        serialization::write_int<uint64_t>(out, receipt.verified_at);
+        serialization::write_int<uint64_t>(out, receipt.last_challenged_at);
+        serialization::write_int<uint8_t>(out, receipt.verified ? 1 : 0);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.provider_address.data()), receipt.provider_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.provider_pubkey_b64.data()), receipt.provider_pubkey_b64.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(receipt.provider_signature_b64.data()), receipt.provider_signature_b64.size());
+        serialization::write_int<uint64_t>(out, receipt.bonded_balance_sats);
+        serialization::write_int<uint8_t>(out, receipt.bond_satisfied ? 1 : 0);
+        return out;
+    }
+
+    static DhtMailReceiptPayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailReceiptPayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        payload.receipt.version = serialization::read_int<uint32_t>(ptr, remaining);
+        auto message_id = serialization::read_bytes(ptr, remaining);
+        auto recipient = serialization::read_bytes(ptr, remaining);
+        auto replica = serialization::read_bytes(ptr, remaining);
+        auto storage_hash = serialization::read_bytes(ptr, remaining);
+        auto last_proof_hash = serialization::read_bytes(ptr, remaining);
+        payload.receipt.stored_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.receipt.expires_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.receipt.receipt_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.receipt.verified_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.receipt.last_challenged_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.receipt.verified = serialization::read_int<uint8_t>(ptr, remaining) != 0;
+        if (payload.version >= 2 && remaining > 0) {
+            auto provider_address = serialization::read_bytes(ptr, remaining);
+            auto provider_pubkey = serialization::read_bytes(ptr, remaining);
+            auto provider_signature = serialization::read_bytes(ptr, remaining);
+            payload.receipt.bonded_balance_sats = serialization::read_int<uint64_t>(ptr, remaining);
+            payload.receipt.bond_satisfied = serialization::read_int<uint8_t>(ptr, remaining) != 0;
+            payload.receipt.provider_address.assign(provider_address.begin(), provider_address.end());
+            payload.receipt.provider_pubkey_b64.assign(provider_pubkey.begin(), provider_pubkey.end());
+            payload.receipt.provider_signature_b64.assign(provider_signature.begin(), provider_signature.end());
+        }
+        payload.receipt.message_id.assign(message_id.begin(), message_id.end());
+        payload.receipt.recipient_address.assign(recipient.begin(), recipient.end());
+        payload.receipt.replica_label.assign(replica.begin(), replica.end());
+        payload.receipt.storage_hash_hex.assign(storage_hash.begin(), storage_hash.end());
+        payload.receipt.last_proof_hash_hex.assign(last_proof_hash.begin(), last_proof_hash.end());
+        return payload;
+    }
+};
+
+struct DhtMailChallengePayload {
+    uint8_t version{1};
+    std::string challenge_id;
+    std::string message_id;
+    std::string recipient_address;
+    std::string requester_label;
+    std::string nonce_b64;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(challenge_id.data()), challenge_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(message_id.data()), message_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(recipient_address.data()), recipient_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(requester_label.data()), requester_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(nonce_b64.data()), nonce_b64.size());
+        return out;
+    }
+
+    static DhtMailChallengePayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailChallengePayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        auto challenge = serialization::read_bytes(ptr, remaining);
+        auto message_id = serialization::read_bytes(ptr, remaining);
+        auto recipient = serialization::read_bytes(ptr, remaining);
+        auto requester = serialization::read_bytes(ptr, remaining);
+        auto nonce = serialization::read_bytes(ptr, remaining);
+        payload.challenge_id.assign(challenge.begin(), challenge.end());
+        payload.message_id.assign(message_id.begin(), message_id.end());
+        payload.recipient_address.assign(recipient.begin(), recipient.end());
+        payload.requester_label.assign(requester.begin(), requester.end());
+        payload.nonce_b64.assign(nonce.begin(), nonce.end());
+        return payload;
+    }
+};
+
+struct DhtMailProofPayload {
+    uint8_t version{1};
+    std::string challenge_id;
+    std::string message_id;
+    std::string recipient_address;
+    std::string replica_label;
+    std::string proof_hash_hex;
+    uint64_t responded_at{0};
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(challenge_id.data()), challenge_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(message_id.data()), message_id.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(recipient_address.data()), recipient_address.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(replica_label.data()), replica_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(proof_hash_hex.data()), proof_hash_hex.size());
+        serialization::write_int<uint64_t>(out, responded_at);
+        return out;
+    }
+
+    static DhtMailProofPayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailProofPayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        auto challenge = serialization::read_bytes(ptr, remaining);
+        auto message_id = serialization::read_bytes(ptr, remaining);
+        auto recipient = serialization::read_bytes(ptr, remaining);
+        auto replica = serialization::read_bytes(ptr, remaining);
+        auto proof = serialization::read_bytes(ptr, remaining);
+        payload.responded_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.challenge_id.assign(challenge.begin(), challenge.end());
+        payload.message_id.assign(message_id.begin(), message_id.end());
+        payload.recipient_address.assign(recipient.begin(), recipient.end());
+        payload.replica_label.assign(replica.begin(), replica.end());
+        payload.proof_hash_hex.assign(proof.begin(), proof.end());
+        return payload;
+    }
+};
+
+struct DhtMailNatIntroPayload {
+    uint8_t version{2};
+    std::string initiator_label;
+    std::string target_label;
+    std::string purpose;
+    uint64_t sent_at{0};
+    uint8_t hops{2};
+    bool request_reverse{true};
+    bool reverse_response{false};
+    std::vector<NetworkNode::NatCandidate> initiator_candidates;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        serialization::write_int<uint8_t>(out, version);
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(initiator_label.data()), initiator_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(target_label.data()), target_label.size());
+        serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(purpose.data()), purpose.size());
+        serialization::write_int<uint64_t>(out, sent_at);
+        serialization::write_int<uint8_t>(out, hops);
+        serialization::write_int<uint8_t>(out, request_reverse ? 1 : 0);
+        serialization::write_int<uint8_t>(out, reverse_response ? 1 : 0);
+        serialization::write_varint(out, initiator_candidates.size());
+        for (const auto& candidate : initiator_candidates) {
+            serialization::write_int<uint8_t>(out, candidate.type);
+            serialization::write_bytes(out, reinterpret_cast<const uint8_t*>(candidate.label.data()), candidate.label.size());
+            serialization::write_int<uint32_t>(out, candidate.priority);
+        }
+        return out;
+    }
+
+    static DhtMailNatIntroPayload deserialize(const std::vector<uint8_t>& data) {
+        const uint8_t* ptr = data.data();
+        size_t remaining = data.size();
+        DhtMailNatIntroPayload payload;
+        payload.version = serialization::read_int<uint8_t>(ptr, remaining);
+        auto initiator = serialization::read_bytes(ptr, remaining);
+        auto target = serialization::read_bytes(ptr, remaining);
+        auto purpose = serialization::read_bytes(ptr, remaining);
+        payload.sent_at = serialization::read_int<uint64_t>(ptr, remaining);
+        payload.hops = serialization::read_int<uint8_t>(ptr, remaining);
+        if (payload.version >= 2 && remaining > 0) {
+            payload.request_reverse = serialization::read_int<uint8_t>(ptr, remaining) != 0;
+            payload.reverse_response = serialization::read_int<uint8_t>(ptr, remaining) != 0;
+            const auto count = serialization::read_varint(ptr, remaining);
+            payload.initiator_candidates.reserve(static_cast<size_t>(count));
+            for (uint64_t i = 0; i < count; ++i) {
+                NetworkNode::NatCandidate candidate;
+                candidate.type = serialization::read_int<uint8_t>(ptr, remaining);
+                auto label = serialization::read_bytes(ptr, remaining);
+                candidate.priority = serialization::read_int<uint32_t>(ptr, remaining);
+                candidate.label.assign(label.begin(), label.end());
+                payload.initiator_candidates.push_back(std::move(candidate));
+            }
+        }
+        payload.initiator_label.assign(initiator.begin(), initiator.end());
+        payload.target_label.assign(target.begin(), target.end());
+        payload.purpose.assign(purpose.begin(), purpose.end());
+        return payload;
+    }
+};
+
+std::string mail_storage_hash_hex(const NetworkNode::DistributedMailRecord& record) {
+    const std::string material = record.payload_b64 + "\n" + record.message_id + "\n" + record.recipient_address;
+    const auto digest = crypto::sha3_512(material);
+    return crypto::hex_encode(digest.data(), digest.size());
+}
+
+std::string mail_storage_proof_hash_hex(const NetworkNode::DistributedMailRecord& record, const std::string& nonce_b64) {
+    const std::string material = record.payload_b64 + "\n" + nonce_b64 + "\n" + record.message_id + "\n" + record.recipient_address;
+    const auto digest = crypto::sha3_512(material);
+    return crypto::hex_encode(digest.data(), digest.size());
+}
+
+std::array<uint8_t, 32> digest32_from_string(const std::string& text) {
+    const auto digest = crypto::sha3_512(text);
+    std::array<uint8_t, 32> out{};
+    std::memcpy(out.data(), digest.data(), out.size());
+    return out;
+}
+
+std::string mail_receipt_signing_material(const NetworkNode::MailStorageReceipt& receipt) {
+    std::ostringstream out;
+    out << receipt.version << '\n'
+        << receipt.message_id << '\n'
+        << receipt.recipient_address << '\n'
+        << receipt.replica_label << '\n'
+        << receipt.storage_hash_hex << '\n'
+        << receipt.stored_at << '\n'
+        << receipt.expires_at << '\n'
+        << receipt.receipt_at << '\n'
+        << receipt.provider_address << '\n'
+        << receipt.provider_pubkey_b64;
+    return out.str();
+}
+
+bool verify_mail_receipt_signature(const NetworkNode::MailStorageReceipt& receipt) {
+    if (receipt.provider_address.empty() || receipt.provider_pubkey_b64.empty() || receipt.provider_signature_b64.empty()) {
+        return false;
+    }
+    try {
+        const auto pubkey = crypto::base64_decode(receipt.provider_pubkey_b64);
+        const auto signature = crypto::base64_decode(receipt.provider_signature_b64);
+        if (!script::check_address(receipt.provider_address, pubkey)) {
+            return false;
+        }
+        return script::verify_signature(uint256_t(digest32_from_string(mail_receipt_signing_material(receipt))),
+                                        signature,
+                                        pubkey);
+    } catch (...) {
+        return false;
+    }
+}
+
+void refresh_mail_receipt_bond(NetworkNode::MailStorageReceipt& receipt,
+                               const Blockchain* chain,
+                               uint64_t minimum_bond_sats) {
+    if (!chain || receipt.provider_address.empty()) {
+        receipt.bonded_balance_sats = 0;
+        receipt.bond_satisfied = minimum_bond_sats == 0 && !receipt.provider_signature_b64.empty();
+        return;
+    }
+    try {
+        receipt.bonded_balance_sats = static_cast<uint64_t>(std::max<int64_t>(0, chain->utxo().get_balance(receipt.provider_address)));
+    } catch (...) {
+        receipt.bonded_balance_sats = 0;
+    }
+    receipt.bond_satisfied = receipt.bonded_balance_sats >= minimum_bond_sats;
+}
+
+void sign_mail_receipt(NetworkNode::MailStorageReceipt& receipt,
+                       const Wallet* wallet) {
+    if (!wallet || wallet->addresses.empty() || wallet->pubkeys.empty() || wallet->privkeys.empty()) {
+        return;
+    }
+    size_t index = 0;
+    if (auto it = std::find(wallet->addresses.begin(), wallet->addresses.end(), wallet->address);
+        it != wallet->addresses.end()) {
+        index = static_cast<size_t>(std::distance(wallet->addresses.begin(), it));
+    }
+    if (index >= wallet->pubkeys.size() || index >= wallet->privkeys.size()) {
+        index = 0;
+    }
+    receipt.provider_address = wallet->addresses[index];
+    receipt.provider_pubkey_b64 = crypto::base64_encode(wallet->pubkeys[index]);
+    const auto signature = script::sign_hash(uint256_t(digest32_from_string(mail_receipt_signing_material(receipt))),
+                                             wallet->privkeys[index]);
+    receipt.provider_signature_b64 = crypto::base64_encode(signature);
+}
+
+void append_unique_candidate(std::vector<NetworkNode::NatCandidate>& candidates,
+                             std::unordered_set<std::string>& seen,
+                             uint8_t type,
+                             const std::string& label,
+                             uint32_t priority) {
+    if (label.empty() || !seen.insert(label).second) {
+        return;
+    }
+    candidates.push_back(NetworkNode::NatCandidate{type, label, priority});
+}
+
+std::vector<std::string> discover_local_ipv4_candidate_labels(uint16_t port) {
+    std::vector<std::string> labels;
+    if (port == 0) return labels;
+    try {
+        boost::asio::io_context ctx;
+        tcp::resolver resolver(ctx);
+        const auto results = resolver.resolve(boost::asio::ip::host_name(), "");
+        std::unordered_set<std::string> seen;
+        for (const auto& entry : results) {
+            const auto endpoint = entry.endpoint();
+            if (!endpoint.address().is_v4() || endpoint.address().is_loopback()) continue;
+            const auto label = endpoint.address().to_string() + ":" + std::to_string(port);
+            if (seen.insert(label).second) {
+                labels.push_back(label);
+            }
+        }
+    } catch (...) {
+    }
+    return labels;
+}
+
+std::optional<std::string> parse_stun_mapped_ipv4(const std::vector<uint8_t>& response) {
+    if (response.size() < 20) return std::nullopt;
+    const uint16_t type = static_cast<uint16_t>((response[0] << 8) | response[1]);
+    if (type != 0x0101) return std::nullopt;
+    const std::array<uint8_t, 4> cookie{{0x21, 0x12, 0xA4, 0x42}};
+    size_t offset = 20;
+    while (offset + 4 <= response.size()) {
+        const uint16_t attr_type = static_cast<uint16_t>((response[offset] << 8) | response[offset + 1]);
+        const uint16_t attr_len = static_cast<uint16_t>((response[offset + 2] << 8) | response[offset + 3]);
+        offset += 4;
+        if (offset + attr_len > response.size()) break;
+        const uint8_t* attr = response.data() + offset;
+        if ((attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8 && attr[1] == 0x01) {
+            std::array<uint8_t, 4> ip_bytes{{attr[4], attr[5], attr[6], attr[7]}};
+            if (attr_type == 0x0020) {
+                for (size_t i = 0; i < ip_bytes.size(); ++i) {
+                    ip_bytes[i] ^= cookie[i];
+                }
+            }
+            boost::system::error_code ec;
+            auto address = boost::asio::ip::address_v4(ip_bytes);
+            if (!ec) return address.to_string();
+        }
+        offset += attr_len;
+        if (attr_len % 4 != 0) {
+            offset += 4 - (attr_len % 4);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> stun_probe_public_ip(const std::string& server,
+                                                uint16_t announced_port,
+                                                uint32_t timeout_ms) {
+    if (server.empty()) return std::nullopt;
+    const auto parsed = parse_host_port(server, 3478);
+    if (!parsed) return std::nullopt;
+    try {
+        boost::asio::io_context ctx;
+        udp::resolver resolver(ctx);
+        udp::socket socket(ctx);
+        socket.open(udp::v4());
+        const auto endpoints = resolver.resolve(udp::v4(), parsed->first, std::to_string(parsed->second));
+        auto endpoint_it = endpoints.begin();
+        if (endpoint_it == endpoints.end()) return std::nullopt;
+        std::array<uint8_t, 20> request{};
+        request[0] = 0x00;
+        request[1] = 0x01;
+        request[2] = 0x00;
+        request[3] = 0x00;
+        request[4] = 0x21;
+        request[5] = 0x12;
+        request[6] = 0xA4;
+        request[7] = 0x42;
+        std::random_device rd;
+        for (size_t i = 8; i < request.size(); ++i) {
+            request[i] = static_cast<uint8_t>(rd());
+        }
+        socket.send_to(boost::asio::buffer(request), endpoint_it->endpoint());
+        socket.non_blocking(true);
+        std::array<uint8_t, 512> response{};
+        udp::endpoint sender;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<uint32_t>(timeout_ms, 100));
+        while (std::chrono::steady_clock::now() < deadline) {
+            boost::system::error_code ec;
+            const size_t received = socket.receive_from(boost::asio::buffer(response), sender, 0, ec);
+            if (!ec && received >= 20) {
+                auto ip = parse_stun_mapped_ipv4(std::vector<uint8_t>(response.begin(), response.begin() + static_cast<std::ptrdiff_t>(received)));
+                if (ip && !ip->empty()) {
+                    return *ip + ":" + std::to_string(announced_port);
+                }
+                return std::nullopt;
+            }
+            if (ec != boost::asio::error::would_block && ec != boost::asio::error::try_again) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+std::string random_nonce_b64(size_t bytes = 16) {
+    std::vector<uint8_t> buffer(bytes);
+    std::random_device rd;
+    for (auto& byte : buffer) {
+        byte = static_cast<uint8_t>(rd());
+    }
+    return crypto::base64_encode(buffer.data(), buffer.size());
+}
+
+bool parse_distributed_mail_record_line(const std::string& line, NetworkNode::DistributedMailRecord& record) {
+    auto fields = split_mail_store_line(line);
+    if (fields.size() != 8) return false;
+    try {
+        record.version = static_cast<uint32_t>(std::stoul(fields[0]));
+        record.stored_at = std::stoull(fields[1]);
+        record.expires_at = std::stoull(fields[2]);
+        record.message_id = decode_mail_store_field(fields[3]);
+        record.sender_address = decode_mail_store_field(fields[4]);
+        record.recipient_address = decode_mail_store_field(fields[5]);
+        record.peer_label = decode_mail_store_field(fields[6]);
+        record.payload_b64 = decode_mail_store_field(fields[7]);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parse_mail_storage_receipt_line(const std::string& line, NetworkNode::MailStorageReceipt& receipt) {
+    auto fields = split_mail_store_line(line);
+    if (fields.size() != 11 && fields.size() != 16 && fields.size() != 20) return false;
+    try {
+        receipt.version = static_cast<uint32_t>(std::stoul(fields[0]));
+        receipt.message_id = decode_mail_store_field(fields[1]);
+        receipt.recipient_address = decode_mail_store_field(fields[2]);
+        receipt.replica_label = decode_mail_store_field(fields[3]);
+        receipt.storage_hash_hex = decode_mail_store_field(fields[4]);
+        receipt.last_proof_hash_hex = decode_mail_store_field(fields[5]);
+        receipt.stored_at = std::stoull(fields[6]);
+        receipt.expires_at = std::stoull(fields[7]);
+        receipt.receipt_at = std::stoull(fields[8]);
+        receipt.verified_at = std::stoull(fields[9]);
+        receipt.last_challenged_at = std::stoull(fields[10]);
+        if (fields.size() >= 16) {
+            receipt.provider_address = decode_mail_store_field(fields[11]);
+            receipt.provider_pubkey_b64 = decode_mail_store_field(fields[12]);
+            receipt.provider_signature_b64 = decode_mail_store_field(fields[13]);
+            receipt.bonded_balance_sats = std::stoull(fields[14]);
+            receipt.bond_satisfied = fields[15] == "1";
+        } else {
+            receipt.provider_address.clear();
+            receipt.provider_pubkey_b64.clear();
+            receipt.provider_signature_b64.clear();
+            receipt.bonded_balance_sats = 0;
+            receipt.bond_satisfied = false;
+        }
+        if (fields.size() >= 20) {
+            receipt.slashed = fields[16] == "1";
+            receipt.slashed_at = std::stoull(fields[17]);
+            receipt.slash_reason = decode_mail_store_field(fields[18]);
+            receipt.slash_evidence_hash_hex = decode_mail_store_field(fields[19]);
+        } else {
+            receipt.slashed = false;
+            receipt.slashed_at = 0;
+            receipt.slash_reason.clear();
+            receipt.slash_evidence_hash_hex.clear();
+        }
+        receipt.verified = receipt.verified_at != 0;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string serialize_mail_storage_receipt_line(const NetworkNode::MailStorageReceipt& receipt) {
+    std::ostringstream out;
+    out << receipt.version << '\t'
+        << encode_mail_store_field(receipt.message_id) << '\t'
+        << encode_mail_store_field(receipt.recipient_address) << '\t'
+        << encode_mail_store_field(receipt.replica_label) << '\t'
+        << encode_mail_store_field(receipt.storage_hash_hex) << '\t'
+        << encode_mail_store_field(receipt.last_proof_hash_hex) << '\t'
+        << receipt.stored_at << '\t'
+        << receipt.expires_at << '\t'
+        << receipt.receipt_at << '\t'
+        << receipt.verified_at << '\t'
+        << receipt.last_challenged_at << '\t'
+        << encode_mail_store_field(receipt.provider_address) << '\t'
+        << encode_mail_store_field(receipt.provider_pubkey_b64) << '\t'
+        << encode_mail_store_field(receipt.provider_signature_b64) << '\t'
+        << receipt.bonded_balance_sats << '\t'
+        << (receipt.bond_satisfied ? 1 : 0) << '\t'
+        << (receipt.slashed ? 1 : 0) << '\t'
+        << receipt.slashed_at << '\t'
+        << encode_mail_store_field(receipt.slash_reason) << '\t'
+        << encode_mail_store_field(receipt.slash_evidence_hash_hex);
+    return out.str();
+}
+
+std::vector<NetworkNode::MailStorageReceipt> load_mail_storage_receipts_file(const std::filesystem::path& path,
+                                                                             const std::optional<std::string>& message_id = std::nullopt) {
+    std::ifstream input(path);
+    if (!input) return {};
+
+    std::vector<NetworkNode::MailStorageReceipt> out;
+    std::string line;
+    while (std::getline(input, line)) {
+        NetworkNode::MailStorageReceipt receipt;
+        if (!parse_mail_storage_receipt_line(line, receipt)) continue;
+        if (message_id && !message_id->empty() && receipt.message_id != *message_id) continue;
+        out.push_back(std::move(receipt));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if (a.message_id != b.message_id) return a.message_id < b.message_id;
+        return a.replica_label < b.replica_label;
+    });
+    return out;
+}
+
+void save_mail_storage_receipts_file(const std::filesystem::path& path,
+                                     const std::vector<NetworkNode::MailStorageReceipt>& receipts) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("failed to rewrite mail storage receipts");
+    }
+    for (const auto& receipt : receipts) {
+        output << serialize_mail_storage_receipt_line(receipt) << '\n';
+    }
+}
+
+std::string serialize_distributed_mail_record_line(const NetworkNode::DistributedMailRecord& record) {
+    std::ostringstream out;
+    out << record.version << '\t'
+        << record.stored_at << '\t'
+        << record.expires_at << '\t'
+        << encode_mail_store_field(record.message_id) << '\t'
+        << encode_mail_store_field(record.sender_address) << '\t'
+        << encode_mail_store_field(record.recipient_address) << '\t'
+        << encode_mail_store_field(record.peer_label) << '\t'
+        << encode_mail_store_field(record.payload_b64);
+    return out.str();
+}
+
+std::vector<NetworkNode::DistributedMailRecord> load_distributed_mail_records_file(const std::filesystem::path& path,
+                                                                                   const std::optional<std::string>& recipient_address = std::nullopt,
+                                                                                   size_t limit = 0) {
+    std::ifstream input(path);
+    if (!input) return {};
+
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    std::vector<NetworkNode::DistributedMailRecord> out;
+    std::string line;
+    while (std::getline(input, line)) {
+        NetworkNode::DistributedMailRecord record;
+        if (!parse_distributed_mail_record_line(line, record)) continue;
+        if (record.expires_at != 0 && record.expires_at < now) continue;
+        if (recipient_address && !recipient_address->empty() &&
+            !crypto::addresses_equal(*recipient_address, record.recipient_address)) {
+            continue;
+        }
+        out.push_back(std::move(record));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if (a.stored_at != b.stored_at) return a.stored_at < b.stored_at;
+        return a.message_id < b.message_id;
+    });
+    if (limit > 0 && out.size() > limit) {
+        out.erase(out.begin(), out.end() - static_cast<std::ptrdiff_t>(limit));
+    }
+    return out;
+}
+
+bool append_distributed_mail_record_file(const std::filesystem::path& path,
+                                         const NetworkNode::DistributedMailRecord& record) {
+    auto existing = load_distributed_mail_records_file(path, std::nullopt, 0);
+    if (std::any_of(existing.begin(), existing.end(), [&](const auto& item) {
+            return item.message_id == record.message_id;
+        })) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output(path, std::ios::app);
+    if (!output) {
+        throw std::runtime_error("failed to append distributed mail store");
+    }
+    output << serialize_distributed_mail_record_line(record) << '\n';
+    return true;
+}
+
+void save_distributed_mail_records_file(const std::filesystem::path& path,
+                                        const std::vector<NetworkNode::DistributedMailRecord>& records) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("failed to rewrite distributed mail store");
+    }
+    for (const auto& record : records) {
+        output << serialize_distributed_mail_record_line(record) << '\n';
+    }
+}
+
+bool delete_distributed_mail_record_file(const std::filesystem::path& path, const std::string& message_id) {
+    if (message_id.empty()) return false;
+    std::ifstream input(path);
+    if (!input) return false;
+
+    std::vector<std::string> kept;
+    kept.reserve(64);
+    bool removed = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        NetworkNode::DistributedMailRecord record;
+        if (parse_distributed_mail_record_line(line, record) && record.message_id == message_id) {
+            removed = true;
+            continue;
+        }
+        kept.push_back(line);
+    }
+    if (!removed) return false;
+
+    const auto tmp = path.string() + ".tmp";
+    std::ofstream output(tmp, std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("failed to rewrite distributed mail store");
+    }
+    for (const auto& item : kept) {
+        output << item << '\n';
+    }
+    output.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            throw std::runtime_error("failed to replace distributed mail store: " + ec.message());
+        }
+    }
+    return true;
+}
+
+size_t distributed_mail_record_count_file(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) return 0;
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    size_t count = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        NetworkNode::DistributedMailRecord record;
+        if (!parse_distributed_mail_record_line(line, record)) continue;
+        if (record.expires_at != 0 && record.expires_at < now) continue;
+        ++count;
+    }
+    return count;
+}
+
+NetworkNode::DistributedMailRecord make_distributed_mail_record(const ChatPayload& payload,
+                                                                const std::string& peer_label,
+                                                                uint32_t ttl_hours) {
+    NetworkNode::DistributedMailRecord record;
+    record.version = 1;
+    record.stored_at = static_cast<uint64_t>(std::time(nullptr));
+    record.expires_at = record.stored_at + static_cast<uint64_t>(std::max<uint32_t>(ttl_hours, 1)) * 60ULL * 60ULL;
+    record.message_id = chat::message_id(payload);
+    record.sender_address = payload.sender;
+    record.recipient_address = payload.recipient;
+    record.peer_label = peer_label;
+    record.payload_b64 = crypto::base64_encode(payload.serialize());
+    return record;
+}
+
+std::vector<std::string> select_nearest_mail_peers(const std::vector<std::string>& labels,
+                                                   const std::string& recipient_address,
+                                                   size_t target,
+                                                   const std::optional<std::string>& exclude_one = std::nullopt,
+                                                   const std::optional<std::string>& exclude_two = std::nullopt) {
+    std::vector<std::pair<uint64_t, std::string>> ranked;
+    ranked.reserve(labels.size());
+    for (const auto& label : labels) {
+        if (exclude_one && *exclude_one == label) continue;
+        if (exclude_two && *exclude_two == label) continue;
+        ranked.emplace_back(dht_distance64(label, recipient_address), label);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    });
+    if (target > 0 && ranked.size() > target) {
+        ranked.resize(target);
+    }
+    std::vector<std::string> out;
+    out.reserve(ranked.size());
+    for (const auto& item : ranked) out.push_back(item.second);
+    return out;
 }
 
 std::optional<size_t> wallet_index_for_address(const Wallet& wallet, const std::string& address) {
@@ -699,7 +1561,10 @@ NetworkNode::NetworkNode(boost::asio::io_context& ctx, uint16_t port, std::files
       peers_file_(data_dir / "peers.dat"),
       peer_state_file_(data_dir / "peer_state.dat"),
       chat_inbox_file_(data_dir / "chat_inbox.log"),
-      chat_history_file_(data_dir / "chat_history.dat") {
+      chat_history_file_(data_dir / "chat_history.dat"),
+      mail_history_file_(data_dir / "p2pmail_history.dat"),
+      distributed_mail_file_(data_dir / "p2pmail_store.dat"),
+      mail_receipts_file_(data_dir / "p2pmail_receipts.dat") {
     load_peers();
     load_peer_state();
     register_default_handlers();
@@ -1023,7 +1888,6 @@ NetworkNode::SyncStatus NetworkNode::sync_status() const {
 void NetworkNode::update_chain_approval_state() {
     if (!chain_) return;
     auto status = sync_status();
-    auto existing = chain_->sync_approval_state();
     const bool saw_network = status.validated_peers > 0 || status.best_peer_height > 0;
     bool approved = true;
     uint64_t peer_count = static_cast<uint64_t>(status.validated_peers);
@@ -1031,14 +1895,9 @@ void NetworkNode::update_chain_approval_state() {
 
     if (saw_network) {
         approved = !status.syncing && status.local_height >= status.best_peer_height;
-    } else if (existing) {
-        approved = chain_->wallet_state_approved();
-        peer_count = existing->peer_count;
-        network_height = existing->network_height;
     } else {
-        // Fresh genesis-only nodes should wait for either real history or peer
-        // evidence before reporting the chain as approved.
         approved = status.local_height > 0;
+        peer_count = 0;
         network_height = approved ? status.local_height : (status.local_height + 1);
     }
 
@@ -1076,9 +1935,13 @@ void NetworkNode::schedule_peer_maintenance() {
             return;
         }
         if (network_active()) {
+            if (mail_policy_.nat_assist) {
+                discover_public_endpoint();
+            }
             resolve_seed_endpoints();
             save_peers();
             connect_known_peers(std::min<size_t>(4, constants::MAX_PEER_CONNECTIONS));
+            maintain_mail_storage_proofs();
         }
         update_chain_approval_state();
         schedule_peer_maintenance();
@@ -1190,8 +2053,27 @@ std::vector<chat::HistoryEntry> NetworkNode::chat_history(const chat::HistoryQue
     return chat::load_history(chat_history_file_, query);
 }
 
+std::vector<chat::HistoryEntry> NetworkNode::mail_history(const chat::HistoryQuery& query) const {
+    std::lock_guard<std::mutex> lock(mail_mutex_);
+    return chat::load_history(mail_history_file_, query);
+}
+
+std::vector<NetworkNode::DistributedMailRecord> NetworkNode::distributed_mail_records(const std::optional<std::string>& recipient_address,
+                                                                                      size_t limit) const {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    return load_distributed_mail_records_file(distributed_mail_file_, recipient_address, limit);
+}
+
 std::filesystem::path NetworkNode::chat_history_path() const {
     return chat_history_file_;
+}
+
+std::filesystem::path NetworkNode::mail_history_path() const {
+    return mail_history_file_;
+}
+
+std::filesystem::path NetworkNode::distributed_mail_path() const {
+    return distributed_mail_file_;
 }
 
 void NetworkNode::record_chat_history(const chat::HistoryEntry& entry) {
@@ -1199,9 +2081,583 @@ void NetworkNode::record_chat_history(const chat::HistoryEntry& entry) {
     chat::append_history_entry(chat_history_file_, entry);
 }
 
+void NetworkNode::record_mail_history(const chat::HistoryEntry& entry) {
+    std::lock_guard<std::mutex> lock(mail_mutex_);
+    chat::append_history_entry(mail_history_file_, entry);
+}
+
+void NetworkNode::record_distributed_mail(const ChatPayload& payload, const std::string& peer_label) {
+    if (payload.chat_type != chat::CHAT_TYPE_MAIL || payload.recipient.empty()) {
+        return;
+    }
+    store_distributed_mail_record(make_distributed_mail_record(payload, peer_label, mail_policy_.ttl_hours));
+}
+
+void NetworkNode::store_distributed_mail_record(const DistributedMailRecord& record) {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    (void)append_distributed_mail_record_file(distributed_mail_file_, record);
+    if (mail_policy_.prune_expired || distributed_mail_record_count_file(distributed_mail_file_) > mail_policy_.max_store_items) {
+        auto records = load_distributed_mail_records_file(distributed_mail_file_, std::nullopt, 0);
+        if (records.size() > mail_policy_.max_store_items) {
+            records.erase(records.begin(),
+                          records.end() - static_cast<std::ptrdiff_t>(mail_policy_.max_store_items));
+        }
+        save_distributed_mail_records_file(distributed_mail_file_, records);
+    }
+}
+
+bool NetworkNode::send_to_or_relay_mail_peer(const std::string& label, const Message& msg, const std::string& purpose) {
+    if (label.empty()) return false;
+    if (send_to(label, msg)) {
+        return true;
+    }
+
+    if (looks_like_peer_label(label)) {
+        auto parsed = parse_host_port(label, listen_port_ ? listen_port_ : default_p2p_port());
+        if (parsed) {
+            connect(parsed->first, parsed->second);
+            if (send_to(label, msg)) {
+                return true;
+            }
+        }
+    }
+
+    if (!mail_policy_.nat_assist && !mail_policy_.relay_fallback) {
+        return false;
+    }
+
+    ++dht_relay_attempts_;
+    const auto self = advertised_endpoint();
+    if (mail_policy_.nat_assist && self && looks_like_peer_label(label)) {
+        const auto candidates = build_nat_candidates(std::make_optional(label));
+        auto peers = active_peer_labels();
+        if (!mail_policy_.relay_peers.empty()) {
+            std::vector<std::string> preferred;
+            preferred.reserve(mail_policy_.relay_peers.size());
+            for (const auto& relay : mail_policy_.relay_peers) {
+                if (std::find(peers.begin(), peers.end(), relay) != peers.end()) {
+                    preferred.push_back(relay);
+                }
+            }
+            if (!preferred.empty()) {
+                peers = std::move(preferred);
+            }
+        }
+        const auto relays = select_nearest_mail_peers(peers,
+                                                      label,
+                                                      std::min<size_t>(2, peers.size()),
+                                                      label,
+                                                      self);
+        if (!relays.empty()) {
+            Message intro;
+            intro.type = MessageType::DHT_MAIL_NAT_INTRO;
+            intro.payload = DhtMailNatIntroPayload{2,
+                                                   *self,
+                                                   label,
+                                                   purpose,
+                                                   static_cast<uint64_t>(std::time(nullptr)),
+                                                   2,
+                                                   true,
+                                                   false,
+                                                   candidates}.serialize();
+            for (const auto& relay : relays) {
+                (void)send_to(relay, intro);
+            }
+            dht_last_nat_intro_at_ = static_cast<uint64_t>(std::time(nullptr));
+        }
+    }
+
+    if (!mail_policy_.relay_fallback) {
+        return false;
+    }
+
+    const bool relay_safe =
+        msg.type == MessageType::DHT_MAIL_STORE ||
+        msg.type == MessageType::DHT_MAIL_FIND ||
+        msg.type == MessageType::DHT_MAIL_RESULTS ||
+        msg.type == MessageType::DHT_MAIL_RECEIPT ||
+        msg.type == MessageType::DHT_MAIL_CHALLENGE ||
+        msg.type == MessageType::DHT_MAIL_PROOF ||
+        msg.type == MessageType::DHT_MAIL_NAT_INTRO;
+    if (!relay_safe) {
+        return false;
+    }
+
+    auto relays = active_peer_labels();
+    if (!mail_policy_.relay_peers.empty()) {
+        std::vector<std::string> preferred;
+        preferred.reserve(mail_policy_.relay_peers.size());
+        for (const auto& relay : mail_policy_.relay_peers) {
+            if (relay.empty() || relay == label) continue;
+            if (looks_like_peer_label(relay)) {
+                auto parsed = parse_host_port(relay, listen_port_ ? listen_port_ : default_p2p_port());
+                if (parsed) {
+                    connect(parsed->first, parsed->second);
+                }
+            }
+            if (std::find(relays.begin(), relays.end(), relay) != relays.end()) {
+                preferred.push_back(relay);
+            }
+        }
+        if (!preferred.empty()) {
+            relays = std::move(preferred);
+        }
+    }
+    relays.erase(std::remove(relays.begin(), relays.end(), label), relays.end());
+    if (relays.empty()) {
+        return false;
+    }
+    const size_t fanout = std::min<size_t>(std::max<uint32_t>(mail_policy_.replica_target, 1), relays.size());
+    size_t sent = 0;
+    for (size_t i = 0; i < fanout; ++i) {
+        if (send_to(relays[i], msg)) {
+            ++sent;
+        }
+    }
+    if (sent > 0) {
+        dht_relay_successes_ += sent;
+    }
+    return sent > 0;
+}
+
+std::vector<NetworkNode::NatCandidate> NetworkNode::build_nat_candidates(const std::optional<std::string>& target_label) const {
+    std::vector<NatCandidate> candidates;
+    std::unordered_set<std::string> seen;
+
+    for (const auto& label : discover_local_ipv4_candidate_labels(listen_port_ ? listen_port_ : default_p2p_port())) {
+        append_unique_candidate(candidates, seen, 0, label, 300);
+    }
+    if (const auto advertised = advertised_endpoint()) {
+        append_unique_candidate(candidates, seen, 1, *advertised, 900);
+    }
+    const auto mapping = port_mapping_status();
+    if (!mapping.external_endpoint.empty() && looks_like_peer_label(mapping.external_endpoint)) {
+        append_unique_candidate(candidates, seen, 2, mapping.external_endpoint, 1000);
+    }
+    if (mail_policy_.nat_assist && !mail_policy_.stun_servers.empty()) {
+        std::lock_guard<std::mutex> lock(stun_probe_mutex_);
+        const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+        if (stun_reflexive_candidates_.empty() ||
+            dht_last_stun_probe_at_ == 0 ||
+            now > dht_last_stun_probe_at_ + 60) {
+            stun_reflexive_candidates_.clear();
+            const uint16_t announced_port = listen_port_ ? listen_port_ : default_p2p_port();
+            for (const auto& server : mail_policy_.stun_servers) {
+                if (auto reflexive = stun_probe_public_ip(server,
+                                                          announced_port,
+                                                          std::max<uint32_t>(mail_policy_.stun_timeout_ms, 100))) {
+                    if (std::find(stun_reflexive_candidates_.begin(),
+                                  stun_reflexive_candidates_.end(),
+                                  *reflexive) == stun_reflexive_candidates_.end()) {
+                        stun_reflexive_candidates_.push_back(*reflexive);
+                    }
+                    last_stun_server_ = server;
+                }
+            }
+            dht_last_stun_probe_at_ = now;
+        }
+        for (const auto& candidate : stun_reflexive_candidates_) {
+            append_unique_candidate(candidates, seen, 1, candidate, 950);
+        }
+    }
+    (void)target_label;
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        if (a.priority != b.priority) return a.priority > b.priority;
+        if (a.type != b.type) return a.type < b.type;
+        return a.label < b.label;
+    });
+    return candidates;
+}
+
+bool NetworkNode::attempt_nat_candidates(const std::vector<NatCandidate>& candidates) {
+    bool attempted = false;
+    if (candidates.empty()) return false;
+    dht_last_candidate_attempt_at_ = static_cast<uint64_t>(std::time(nullptr));
+    for (const auto& candidate : candidates) {
+        if (candidate.label.empty() || !looks_like_peer_label(candidate.label) || is_self_label(candidate.label)) {
+            continue;
+        }
+        auto parsed = parse_host_port(candidate.label, listen_port_ ? listen_port_ : default_p2p_port());
+        if (!parsed) continue;
+        connect(parsed->first, parsed->second);
+        attempted = true;
+    }
+    return attempted;
+}
+
+void NetworkNode::slash_mail_receipt(const MailStorageReceipt& receipt,
+                                     const std::string& reason,
+                                     const std::string& evidence_material,
+                                     const std::string& peer_label) {
+    auto updated = receipt;
+    updated.verified = false;
+    updated.bond_satisfied = false;
+    updated.slashed = true;
+    updated.slashed_at = static_cast<uint64_t>(std::time(nullptr));
+    updated.slash_reason = reason;
+    const std::string evidence = updated.message_id + "\n" + updated.replica_label + "\n" + reason + "\n" + evidence_material;
+    const auto digest = crypto::sha3_512(evidence);
+    updated.slash_evidence_hash_hex = crypto::hex_encode(digest.data(), digest.size());
+    upsert_mail_storage_receipt(updated);
+    if (mail_policy_.slash_on_failed_proof) {
+        punish_label(peer_label.empty() ? updated.replica_label : peer_label,
+                     static_cast<int>(std::max<uint32_t>(mail_policy_.slash_penalty_score, 1)),
+                     "mail storage proof failure: " + reason);
+    }
+}
+
+void NetworkNode::upsert_mail_storage_receipt(const MailStorageReceipt& receipt) {
+    std::lock_guard<std::mutex> lock(mail_receipts_mutex_);
+    auto receipts = load_mail_storage_receipts_file(mail_receipts_file_);
+    auto it = std::find_if(receipts.begin(), receipts.end(), [&](const auto& existing) {
+        return existing.message_id == receipt.message_id && existing.replica_label == receipt.replica_label;
+    });
+    if (it == receipts.end()) {
+        receipts.push_back(receipt);
+    } else {
+        *it = receipt;
+    }
+    save_mail_storage_receipts_file(mail_receipts_file_, receipts);
+}
+
+std::vector<NetworkNode::MailStorageReceipt> NetworkNode::mail_storage_receipts(const std::optional<std::string>& message_id) const {
+    std::lock_guard<std::mutex> lock(mail_receipts_mutex_);
+    return load_mail_storage_receipts_file(mail_receipts_file_, message_id);
+}
+
+size_t NetworkNode::verified_mail_storage_receipt_count() const {
+    std::lock_guard<std::mutex> lock(mail_receipts_mutex_);
+    const auto receipts = load_mail_storage_receipts_file(mail_receipts_file_);
+    return static_cast<size_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+        return receipt.verified;
+    }));
+}
+
+void NetworkNode::maybe_issue_mail_storage_challenge(const MailStorageReceipt& receipt) {
+    if (!mail_policy_.proof_of_storage || receipt.message_id.empty() || receipt.replica_label.empty() || receipt.slashed) {
+        return;
+    }
+    auto trusted = receipt;
+    const bool signature_valid = verify_mail_receipt_signature(trusted);
+    refresh_mail_receipt_bond(trusted, chain_, mail_policy_.minimum_bond_sats);
+    if (!signature_valid) {
+        trusted.bond_satisfied = false;
+        slash_mail_receipt(trusted, "invalid receipt signature", trusted.provider_signature_b64, trusted.replica_label);
+        return;
+    }
+    if (!signature_valid || !trusted.bond_satisfied) {
+        upsert_mail_storage_receipt(trusted);
+        return;
+    }
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    if (trusted.last_challenged_at != 0 &&
+        now < trusted.last_challenged_at + static_cast<uint64_t>(std::max<uint32_t>(mail_policy_.challenge_interval_minutes, 1)) * 60ULL) {
+        return;
+    }
+
+    PendingMailProofChallenge pending;
+    pending.challenge_id = lan_discovery_node_id_ + ":proof:" + std::to_string(now_millis()) + ":" + std::to_string(hash_key64(trusted.message_id + trusted.replica_label));
+    pending.message_id = trusted.message_id;
+    pending.recipient_address = trusted.recipient_address;
+    pending.replica_label = trusted.replica_label;
+    pending.nonce_b64 = random_nonce_b64();
+    pending.created_at = now;
+    {
+        std::lock_guard<std::mutex> lock(dht_mutex_);
+        pending_mail_challenges_[pending.challenge_id] = pending;
+    }
+
+    auto updated = trusted;
+    updated.last_challenged_at = now;
+    upsert_mail_storage_receipt(updated);
+
+    Message msg;
+    msg.type = MessageType::DHT_MAIL_CHALLENGE;
+    msg.payload = DhtMailChallengePayload{1,
+                                          pending.challenge_id,
+                                          pending.message_id,
+                                          pending.recipient_address,
+                                          advertised_endpoint().value_or(""),
+                                          pending.nonce_b64}.serialize();
+    (void)send_to_or_relay_mail_peer(receipt.replica_label, msg, "mail-proof");
+}
+
+void NetworkNode::maintain_mail_storage_proofs() {
+    if (!mail_policy_.proof_of_storage) return;
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    std::vector<PendingMailProofChallenge> expired;
+    {
+        std::lock_guard<std::mutex> lock(dht_mutex_);
+        for (auto it = pending_mail_challenges_.begin(); it != pending_mail_challenges_.end();) {
+            const uint64_t timeout_seconds =
+                static_cast<uint64_t>(std::max<uint32_t>(mail_policy_.challenge_interval_minutes, 1)) * 120ULL;
+            if (it->second.created_at != 0 && now > it->second.created_at + timeout_seconds) {
+                expired.push_back(it->second);
+                it = pending_mail_challenges_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto& pending : expired) {
+        auto receipts = mail_storage_receipts(std::make_optional(pending.message_id));
+        auto receipt_it = std::find_if(receipts.begin(), receipts.end(), [&](const auto& receipt) {
+            return receipt.replica_label == pending.replica_label;
+        });
+        if (receipt_it != receipts.end()) {
+            slash_mail_receipt(*receipt_it, "proof challenge timed out", pending.challenge_id, pending.replica_label);
+        }
+    }
+    auto receipts = mail_storage_receipts();
+    for (const auto& receipt : receipts) {
+        if (receipt.slashed) continue;
+        if (receipt.expires_at != 0 && receipt.expires_at < now) {
+            continue;
+        }
+        maybe_issue_mail_storage_challenge(receipt);
+    }
+}
+
+size_t NetworkNode::dht_store_mail(const DistributedMailRecord& record) {
+    if (record.recipient_address.empty()) return 0;
+    auto labels = active_peer_labels();
+    if (labels.empty()) return 0;
+    const auto policy = mail_replication_policy();
+    const size_t target = std::min<size_t>(std::max<uint32_t>(policy.replica_target, 1), labels.size());
+    const auto nearest = select_nearest_mail_peers(labels, record.recipient_address, target);
+    if (nearest.empty()) return 0;
+
+    Message msg;
+    msg.type = MessageType::DHT_MAIL_STORE;
+    msg.payload = DhtMailStorePayload{1, record}.serialize();
+    size_t sent = 0;
+    for (const auto& label : nearest) {
+        if (send_to_or_relay_mail_peer(label, msg, "mail-store")) ++sent;
+    }
+    return sent;
+}
+
+std::vector<NetworkNode::DistributedMailRecord> NetworkNode::dht_lookup_mail(const std::string& recipient_address,
+                                                                             size_t limit,
+                                                                             uint32_t timeout_ms) {
+    std::string normalized;
+    try {
+        normalized = crypto::canonicalize_address(recipient_address);
+    } catch (...) {
+        return distributed_mail_records(std::nullopt, limit);
+    }
+    auto local = distributed_mail_records(normalized, limit);
+    auto labels = active_peer_labels();
+    if (labels.empty()) return local;
+
+    const auto query_id = lan_discovery_node_id_ + ":" + std::to_string(now_millis()) + ":" + std::to_string(hash_key64(normalized + std::to_string(now_millis())));
+    {
+        std::lock_guard<std::mutex> lock(dht_mutex_);
+        dht_pending_results_[query_id] = {};
+        dht_last_lookup_at_ = static_cast<uint64_t>(std::time(nullptr));
+    }
+
+    DhtMailFindPayload query;
+    query.query_id = query_id;
+    query.recipient_address = normalized;
+    query.requester_label = advertised_endpoint().value_or("");
+    query.limit = static_cast<uint32_t>(std::max<size_t>(1, limit));
+    query.hops = static_cast<uint8_t>(query.requester_label.empty() ? 0 : 1);
+    Message msg;
+    msg.type = MessageType::DHT_MAIL_FIND;
+    msg.payload = query.serialize();
+
+    const auto nearest = select_nearest_mail_peers(labels,
+                                                   normalized,
+                                                   std::min<size_t>(std::max<uint32_t>(mail_replication_policy().replica_target, 1), labels.size()));
+    for (const auto& label : nearest) {
+        (void)send_to_or_relay_mail_peer(label, msg, "mail-lookup");
+    }
+
+    std::unique_lock<std::mutex> lock(dht_mutex_);
+    dht_results_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
+        const auto it = dht_pending_results_.find(query_id);
+        return it != dht_pending_results_.end() && !it->second.empty();
+    });
+    auto it = dht_pending_results_.find(query_id);
+    if (it != dht_pending_results_.end()) {
+        local.insert(local.end(), it->second.begin(), it->second.end());
+        dht_pending_results_.erase(it);
+    }
+    lock.unlock();
+
+    std::sort(local.begin(), local.end(), [](const auto& a, const auto& b) {
+        if (a.stored_at != b.stored_at) return a.stored_at < b.stored_at;
+        return a.message_id < b.message_id;
+    });
+    local.erase(std::unique(local.begin(), local.end(), [](const auto& a, const auto& b) {
+        return a.message_id == b.message_id;
+    }), local.end());
+    if (limit > 0 && local.size() > limit) {
+        local.erase(local.begin(), local.end() - static_cast<std::ptrdiff_t>(limit));
+    }
+    return local;
+}
+
+NetworkNode::DhtMailboxStatus NetworkNode::dht_mailbox_status() const {
+    DhtMailboxStatus status;
+    status.local_store_records = distributed_mail_count();
+    status.active_peers = active_peer_labels().size();
+    const auto policy = mail_replication_policy();
+    status.replica_target = policy.replica_target;
+    status.proof_of_storage = policy.proof_of_storage;
+    status.minimum_bond_sats = policy.minimum_bond_sats;
+    status.required_verified_replicas = policy.required_verified_replicas;
+    status.slash_on_failed_proof = policy.slash_on_failed_proof;
+    status.slash_penalty_score = policy.slash_penalty_score;
+    status.nat_assist = policy.nat_assist;
+    status.relay_fallback = policy.relay_fallback;
+    status.relay_peer_count = policy.relay_peers.size();
+    status.stun_server_count = policy.stun_servers.size();
+    status.port_mapping_active = port_mapping_status().active;
+    status.advertised_endpoint = advertised_endpoint().value_or("");
+    {
+        std::lock_guard<std::mutex> lock(stun_probe_mutex_);
+        status.reflexive_endpoint = stun_reflexive_candidates_.empty() ? std::string() : stun_reflexive_candidates_.front();
+        status.last_stun_probe_at = dht_last_stun_probe_at_;
+    }
+    status.candidate_count = build_nat_candidates().size();
+    const auto receipts = mail_storage_receipts();
+    status.receipt_count = receipts.size();
+    status.verified_receipts = static_cast<size_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+        return receipt.verified;
+    }));
+    status.bond_satisfied_receipts = static_cast<size_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+        return receipt.bond_satisfied;
+    }));
+    status.trusted_verified_receipts = static_cast<size_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+        return receipt.verified && receipt.bond_satisfied && !receipt.provider_signature_b64.empty() && !receipt.slashed;
+    }));
+    status.slashed_receipts = static_cast<size_t>(std::count_if(receipts.begin(), receipts.end(), [](const auto& receipt) {
+        return receipt.slashed;
+    }));
+    status.last_proof_at = dht_last_proof_at_;
+    status.last_nat_intro_at = dht_last_nat_intro_at_;
+    status.last_reverse_intro_at = dht_last_reverse_intro_at_;
+    status.last_candidate_attempt_at = dht_last_candidate_attempt_at_;
+    status.relay_attempts = dht_relay_attempts_;
+    status.relay_successes = dht_relay_successes_;
+    std::lock_guard<std::mutex> lock(dht_mutex_);
+    status.pending_queries = dht_pending_results_.size();
+    status.seen_queries = dht_seen_queries_.size();
+    status.pending_proofs = pending_mail_challenges_.size();
+    status.last_lookup_at = dht_last_lookup_at_;
+    status.last_results_at = dht_last_results_at_;
+    return status;
+}
+
+NetworkNode::NatTraversalStatus NetworkNode::nat_traversal_status() const {
+    NatTraversalStatus status;
+    const auto policy = mail_replication_policy();
+    status.enabled = policy.nat_assist;
+    status.relay_fallback = policy.relay_fallback;
+    status.relay_peer_count = policy.relay_peers.size();
+    status.stun_server_count = policy.stun_servers.size();
+    status.port_mapping_active = port_mapping_status().active;
+    status.advertised_endpoint = advertised_endpoint().value_or("");
+    {
+        std::lock_guard<std::mutex> lock(stun_probe_mutex_);
+        status.reflexive_endpoint = stun_reflexive_candidates_.empty() ? std::string() : stun_reflexive_candidates_.front();
+        status.last_stun_probe_at = dht_last_stun_probe_at_;
+    }
+    status.candidate_count = build_nat_candidates().size();
+    status.last_intro_at = dht_last_nat_intro_at_;
+    status.last_reverse_intro_at = dht_last_reverse_intro_at_;
+    status.last_candidate_attempt_at = dht_last_candidate_attempt_at_;
+    status.relay_attempts = dht_relay_attempts_;
+    status.relay_successes = dht_relay_successes_;
+    return status;
+}
+
 bool NetworkNode::delete_chat_message(const std::string& message_id) {
     std::lock_guard<std::mutex> lock(chat_mutex_);
     return chat::delete_history_entry(chat_history_file_, message_id);
+}
+
+bool NetworkNode::delete_mail_message(const std::string& message_id) {
+    std::lock_guard<std::mutex> lock(mail_mutex_);
+    return chat::delete_history_entry(mail_history_file_, message_id);
+}
+
+bool NetworkNode::delete_distributed_mail(const std::string& message_id) {
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+        removed = delete_distributed_mail_record_file(distributed_mail_file_, message_id);
+    }
+    if (removed) {
+        std::lock_guard<std::mutex> receipts_lock(mail_receipts_mutex_);
+        auto receipts = load_mail_storage_receipts_file(mail_receipts_file_);
+        receipts.erase(std::remove_if(receipts.begin(), receipts.end(), [&](const auto& receipt) {
+            return receipt.message_id == message_id;
+        }), receipts.end());
+        save_mail_storage_receipts_file(mail_receipts_file_, receipts);
+    }
+    return removed;
+}
+
+size_t NetworkNode::distributed_mail_count() const {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    return distributed_mail_record_count_file(distributed_mail_file_);
+}
+
+void NetworkNode::set_mail_replication_policy(const MailReplicationPolicy& policy) {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    mail_policy_.ttl_hours = std::max<uint32_t>(policy.ttl_hours, 1);
+    mail_policy_.replica_target = std::max<uint32_t>(policy.replica_target, 1);
+    mail_policy_.max_store_items = std::max<uint32_t>(policy.max_store_items, 1);
+    mail_policy_.prune_imported = policy.prune_imported;
+    mail_policy_.prune_expired = policy.prune_expired;
+    mail_policy_.proof_of_storage = policy.proof_of_storage;
+    mail_policy_.challenge_interval_minutes = std::max<uint32_t>(policy.challenge_interval_minutes, 1);
+    mail_policy_.minimum_bond_sats = policy.minimum_bond_sats;
+    mail_policy_.required_verified_replicas = std::max<uint32_t>(policy.required_verified_replicas, 1);
+    mail_policy_.slash_on_failed_proof = policy.slash_on_failed_proof;
+    mail_policy_.slash_penalty_score = std::max<uint32_t>(policy.slash_penalty_score, 1);
+    mail_policy_.nat_assist = policy.nat_assist;
+    mail_policy_.relay_fallback = policy.relay_fallback;
+    mail_policy_.relay_peers = policy.relay_peers;
+    mail_policy_.stun_servers = policy.stun_servers;
+    mail_policy_.stun_timeout_ms = std::max<uint32_t>(policy.stun_timeout_ms, 100);
+    {
+        std::lock_guard<std::mutex> stun_lock(stun_probe_mutex_);
+        stun_reflexive_candidates_.clear();
+        last_stun_server_.clear();
+        dht_last_stun_probe_at_ = 0;
+    }
+}
+
+NetworkNode::MailReplicationPolicy NetworkNode::mail_replication_policy() const {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    return mail_policy_;
+}
+
+size_t NetworkNode::prune_distributed_mail_store() {
+    std::lock_guard<std::mutex> lock(distributed_mail_mutex_);
+    auto records = load_distributed_mail_records_file(distributed_mail_file_, std::nullopt, 0);
+    const size_t before = records.size();
+    if (records.size() > mail_policy_.max_store_items) {
+        records.erase(records.begin(),
+                      records.end() - static_cast<std::ptrdiff_t>(mail_policy_.max_store_items));
+    }
+    save_distributed_mail_records_file(distributed_mail_file_, records);
+    {
+        std::lock_guard<std::mutex> receipts_lock(mail_receipts_mutex_);
+        auto receipts = load_mail_storage_receipts_file(mail_receipts_file_);
+        receipts.erase(std::remove_if(receipts.begin(), receipts.end(), [&](const auto& receipt) {
+            return std::none_of(records.begin(), records.end(), [&](const auto& record) {
+                return record.message_id == receipt.message_id;
+            });
+        }), receipts.end());
+        save_mail_storage_receipts_file(mail_receipts_file_, receipts);
+    }
+    return before >= records.size() ? before - records.size() : 0;
 }
 
 void NetworkNode::punish_label(const std::string& label, int score, const std::string& reason) {
@@ -2284,6 +3740,10 @@ void NetworkNode::register_default_handlers() {
 
             const bool is_voice_control = chat_payload.chat_type == chat::CHAT_TYPE_VOICE_CONTROL;
             const bool is_voice_frame = chat_payload.chat_type == chat::CHAT_TYPE_VOICE_FRAME;
+            const bool is_mail = chat_payload.chat_type == chat::CHAT_TYPE_MAIL;
+            if (is_mail) {
+                record_distributed_mail(chat_payload, peer->remote_label());
+            }
             if (is_voice_control || is_voice_frame) {
                 if (is_voice_control) {
                     if (parsed.decrypted) {
@@ -2317,6 +3777,9 @@ void NetworkNode::register_default_handlers() {
             entry.recipient_address = parsed.recipient_address;
             entry.recipient_pubkey = crypto::base64_encode(chat_payload.recipient_pubkey);
             entry.channel = parsed.channel;
+            entry.subject = parsed.content.subject;
+            entry.mail_to = parsed.content.mail_to;
+            entry.mail_cc = parsed.content.mail_cc;
             entry.message = parsed.message;
             entry.peer_label = peer->remote_label();
             entry.status = parsed.encrypted && !parsed.decrypted ? "received-opaque" : "received";
@@ -2329,21 +3792,300 @@ void NetworkNode::register_default_handlers() {
             entry.encryption_mode = chat::encryption_mode_name(parsed.encryption_mode);
             if (!parsed.content.attachment_bytes.empty()) {
                 entry.attachment_path = chat::persist_attachment(parsed.content,
-                                                                 chat_history_file_.parent_path(),
-                                                                 parsed.message_id).string();
+                                                                 (is_mail ? mail_history_file_ : chat_history_file_).parent_path(),
+                                                                 parsed.message_id,
+                                                                 is_mail ? "p2pmail_media" : "chat_media").string();
             }
 
             auto summary = chat::describe_history_entry(entry);
-            log_info("chat", summary);
-            record_chat_history(entry);
-            append_chat_inbox(summary);
+            log_info(is_mail ? "mail" : "chat", summary);
+            if (is_mail) {
+                record_mail_history(entry);
+            } else {
+                record_chat_history(entry);
+                append_chat_inbox(summary);
+            }
             auto relayed = broadcast_chat(m, peer);
             if (relayed > 0) {
-                log_info("chat", "relayed chat id=" + parsed.message_id +
-                                     " peers=" + std::to_string(relayed));
+                log_info(is_mail ? "mail" : "chat",
+                         std::string("relayed ") + (is_mail ? "mail" : "chat") +
+                         " id=" + parsed.message_id +
+                         " peers=" + std::to_string(relayed));
             }
         } catch (const std::exception& ex) {
             punish(peer, 10, std::string("invalid chat payload: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_STORE, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto payload = DhtMailStorePayload::deserialize(m.payload);
+            if (payload.record.message_id.empty() || payload.record.recipient_address.empty()) {
+                return;
+            }
+            if (payload.record.peer_label.empty()) {
+                payload.record.peer_label = peer->remote_label();
+            }
+            store_distributed_mail_record(payload.record);
+            MailStorageReceipt receipt;
+            receipt.message_id = payload.record.message_id;
+            receipt.recipient_address = payload.record.recipient_address;
+            receipt.replica_label = advertised_endpoint().value_or(peer->remote_label());
+            receipt.storage_hash_hex = mail_storage_hash_hex(payload.record);
+            receipt.stored_at = payload.record.stored_at;
+            receipt.expires_at = payload.record.expires_at;
+            receipt.receipt_at = static_cast<uint64_t>(std::time(nullptr));
+            sign_mail_receipt(receipt, chat_wallet_.get());
+            refresh_mail_receipt_bond(receipt, chain_, mail_policy_.minimum_bond_sats);
+            upsert_mail_storage_receipt(receipt);
+
+            Message ack;
+            ack.type = MessageType::DHT_MAIL_RECEIPT;
+            ack.payload = DhtMailReceiptPayload{2, receipt}.serialize();
+            peer->send(ack);
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail store: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_RECEIPT, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto payload = DhtMailReceiptPayload::deserialize(m.payload);
+            if (payload.receipt.message_id.empty()) return;
+            if (payload.receipt.replica_label.empty()) {
+                payload.receipt.replica_label = peer->remote_label();
+            }
+            refresh_mail_receipt_bond(payload.receipt, chain_, mail_policy_.minimum_bond_sats);
+            if (!verify_mail_receipt_signature(payload.receipt)) {
+                slash_mail_receipt(payload.receipt, "invalid receipt signature", payload.receipt.provider_signature_b64, peer->remote_label());
+                return;
+            }
+            upsert_mail_storage_receipt(payload.receipt);
+            maybe_issue_mail_storage_challenge(payload.receipt);
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail receipt: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_FIND, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto query = DhtMailFindPayload::deserialize(m.payload);
+            if (query.query_id.empty() || query.recipient_address.empty()) {
+                return;
+            }
+            bool fresh = false;
+            {
+                std::lock_guard<std::mutex> lock(dht_mutex_);
+                fresh = dht_seen_queries_.insert(query.query_id).second;
+            }
+            if (!fresh) return;
+
+            auto matches = distributed_mail_records(query.recipient_address, query.limit);
+            if (!matches.empty()) {
+                Message resp;
+                resp.type = MessageType::DHT_MAIL_RESULTS;
+                resp.payload = DhtMailResultsPayload{1, query.query_id, matches}.serialize();
+                bool delivered = false;
+                if (!query.requester_label.empty() && query.requester_label != peer->remote_label()) {
+                    delivered = send_to_or_relay_mail_peer(query.requester_label, resp, "mail-results");
+                }
+                if (!delivered) {
+                    peer->send(resp);
+                }
+            }
+
+            if (query.hops > 0 && !query.requester_label.empty()) {
+                auto labels = active_peer_labels();
+                const auto policy = mail_replication_policy();
+                const auto forwards = select_nearest_mail_peers(labels,
+                                                                query.recipient_address,
+                                                                std::min<size_t>(std::max<uint32_t>(policy.replica_target, 1), labels.size()),
+                                                                peer->remote_label(),
+                                                                query.requester_label.empty() ? std::nullopt : std::make_optional(query.requester_label));
+                if (!forwards.empty()) {
+                    query.hops = static_cast<uint8_t>(query.hops - 1);
+                    Message fwd;
+                    fwd.type = MessageType::DHT_MAIL_FIND;
+                    fwd.payload = query.serialize();
+                    for (const auto& label : forwards) {
+                        (void)send_to_or_relay_mail_peer(label, fwd, "mail-find-forward");
+                    }
+                }
+            }
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail find: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_RESULTS, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto payload = DhtMailResultsPayload::deserialize(m.payload);
+            if (payload.query_id.empty()) return;
+            {
+                std::lock_guard<std::mutex> lock(dht_mutex_);
+                auto it = dht_pending_results_.find(payload.query_id);
+                if (it == dht_pending_results_.end()) {
+                    return;
+                }
+                auto& rows = it->second;
+                for (auto record : payload.records) {
+                    if (record.peer_label.empty()) {
+                        record.peer_label = peer->remote_label();
+                    }
+                    const bool exists = std::any_of(rows.begin(), rows.end(), [&](const auto& existing) {
+                        return existing.message_id == record.message_id;
+                    });
+                    if (!exists) {
+                        rows.push_back(std::move(record));
+                    }
+                }
+                dht_last_results_at_ = static_cast<uint64_t>(std::time(nullptr));
+            }
+            dht_results_cv_.notify_all();
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail results: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_CHALLENGE, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto challenge = DhtMailChallengePayload::deserialize(m.payload);
+            if (challenge.challenge_id.empty() || challenge.message_id.empty()) return;
+            const auto matches = distributed_mail_records(std::make_optional(challenge.recipient_address), 0);
+            auto it = std::find_if(matches.begin(), matches.end(), [&](const auto& record) {
+                return record.message_id == challenge.message_id;
+            });
+            if (it == matches.end()) return;
+
+            DhtMailProofPayload proof;
+            proof.challenge_id = challenge.challenge_id;
+            proof.message_id = challenge.message_id;
+            proof.recipient_address = challenge.recipient_address;
+            proof.replica_label = advertised_endpoint().value_or(peer->remote_label());
+            proof.proof_hash_hex = mail_storage_proof_hash_hex(*it, challenge.nonce_b64);
+            proof.responded_at = static_cast<uint64_t>(std::time(nullptr));
+
+            Message resp;
+            resp.type = MessageType::DHT_MAIL_PROOF;
+            resp.payload = proof.serialize();
+            if (!challenge.requester_label.empty() && challenge.requester_label != peer->remote_label()) {
+                if (!send_to_or_relay_mail_peer(challenge.requester_label, resp, "mail-proof-response")) {
+                    peer->send(resp);
+                }
+            } else {
+                peer->send(resp);
+            }
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail challenge: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_PROOF, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto proof = DhtMailProofPayload::deserialize(m.payload);
+            PendingMailProofChallenge pending;
+            {
+                std::lock_guard<std::mutex> lock(dht_mutex_);
+                auto it = pending_mail_challenges_.find(proof.challenge_id);
+                if (it == pending_mail_challenges_.end()) return;
+                pending = it->second;
+                pending_mail_challenges_.erase(it);
+            }
+            const auto local = distributed_mail_records(std::make_optional(pending.recipient_address), 0);
+            auto it = std::find_if(local.begin(), local.end(), [&](const auto& record) {
+                return record.message_id == pending.message_id;
+            });
+            if (it == local.end()) return;
+
+            const auto expected = mail_storage_proof_hash_hex(*it, pending.nonce_b64);
+            if (expected != proof.proof_hash_hex) {
+                auto receipts = mail_storage_receipts(std::make_optional(pending.message_id));
+                auto receipt_it = std::find_if(receipts.begin(), receipts.end(), [&](const auto& receipt) {
+                    return receipt.replica_label == pending.replica_label || receipt.replica_label == proof.replica_label;
+                });
+                if (receipt_it != receipts.end()) {
+                    slash_mail_receipt(*receipt_it, "invalid proof hash", proof.proof_hash_hex, peer->remote_label());
+                } else {
+                    punish(peer, 5, "invalid dht mail proof");
+                }
+                return;
+            }
+
+            auto receipts = mail_storage_receipts(std::make_optional(pending.message_id));
+            auto receipt_it = std::find_if(receipts.begin(), receipts.end(), [&](const auto& receipt) {
+                return receipt.replica_label == pending.replica_label || receipt.replica_label == proof.replica_label;
+            });
+            if (receipt_it != receipts.end()) {
+                auto receipt = *receipt_it;
+                if (!proof.replica_label.empty()) {
+                    receipt.replica_label = proof.replica_label;
+                }
+                refresh_mail_receipt_bond(receipt, chain_, mail_policy_.minimum_bond_sats);
+                if (!verify_mail_receipt_signature(receipt) || !receipt.bond_satisfied) {
+                    slash_mail_receipt(receipt, "receipt lost trust during proof verification", proof.proof_hash_hex, peer->remote_label());
+                    return;
+                }
+                receipt.last_proof_hash_hex = proof.proof_hash_hex;
+                receipt.verified = true;
+                receipt.verified_at = proof.responded_at;
+                receipt.last_challenged_at = pending.created_at;
+                upsert_mail_storage_receipt(receipt);
+                dht_last_proof_at_ = proof.responded_at;
+            }
+        } catch (const std::exception& ex) {
+            punish(peer, 5, std::string("invalid dht mail proof: ") + ex.what());
+        }
+    });
+
+    set_handler(MessageType::DHT_MAIL_NAT_INTRO, [this](const Message& m, std::shared_ptr<PeerSession> peer) {
+        try {
+            auto intro = DhtMailNatIntroPayload::deserialize(m.payload);
+            if (intro.target_label.empty() || intro.initiator_label.empty()) return;
+            if (intro.hops == 0) return;
+            dht_last_nat_intro_at_ = static_cast<uint64_t>(std::time(nullptr));
+            if (is_self_label(intro.target_label) && looks_like_peer_label(intro.initiator_label)) {
+                bool attempted = attempt_nat_candidates(intro.initiator_candidates);
+                if (!attempted) {
+                    auto parsed = parse_host_port(intro.initiator_label, listen_port_ ? listen_port_ : default_p2p_port());
+                    if (parsed) {
+                        connect(parsed->first, parsed->second);
+                    }
+                }
+                if (intro.request_reverse) {
+                    const auto self = advertised_endpoint().value_or(peer->remote_label());
+                    Message reverse;
+                    reverse.type = MessageType::DHT_MAIL_NAT_INTRO;
+                    reverse.payload = DhtMailNatIntroPayload{2,
+                                                             self,
+                                                             intro.initiator_label,
+                                                             intro.purpose,
+                                                             static_cast<uint64_t>(std::time(nullptr)),
+                                                             2,
+                                                             false,
+                                                             true,
+                                                             build_nat_candidates(std::make_optional(intro.initiator_label))}.serialize();
+                    (void)send_to_or_relay_mail_peer(intro.initiator_label, reverse, "mail-nat-reverse");
+                    dht_last_reverse_intro_at_ = static_cast<uint64_t>(std::time(nullptr));
+                }
+                return;
+            }
+            if (send_to(intro.target_label, m)) {
+                ++dht_relay_successes_;
+                return;
+            }
+
+            auto relays = active_peer_labels();
+            relays.erase(std::remove(relays.begin(), relays.end(), peer->remote_label()), relays.end());
+            relays.erase(std::remove(relays.begin(), relays.end(), intro.target_label), relays.end());
+            intro.hops = static_cast<uint8_t>(intro.hops - 1);
+            Message fwd = m;
+            fwd.payload = intro.serialize();
+            const size_t fanout = std::min<size_t>(2, relays.size());
+            for (size_t i = 0; i < fanout; ++i) {
+                (void)send_to(relays[i], fwd);
+            }
+        } catch (const std::exception& ex) {
+            punish(peer, 3, std::string("invalid dht nat intro: ") + ex.what());
         }
     });
 

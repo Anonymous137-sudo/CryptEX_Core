@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(CryptEX LANGUAGES CXX)
+project(CryptEX LANGUAGES CXX ASM)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,8 +44,7 @@ else()
     set(CRYPTEX_OPUS_LINK_TARGET "PkgConfig::OPUS")
 endif()
 
-add_executable(cryptexd
-    main.cpp
+set(CRYPTEX_CORE_SOURCES
     chainparams.cpp
     chat_content.cpp
     chat_state.cpp
@@ -68,6 +67,11 @@ add_executable(cryptexd
     wallet.cpp
     blockchain.cpp
     block_store.cpp
+)
+
+add_executable(cryptexd
+    main.cpp
+    ${CRYPTEX_CORE_SOURCES}
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -88,28 +92,7 @@ endif()
 
 add_executable(cryptex_tests
     tests.cpp
-    chainparams.cpp
-    chat_content.cpp
-    chat_state.cpp
-    chat_history.cpp
-    chat_secure.cpp
-    config.cpp
-    debug.cpp
-    duckdns.cpp
-    block.cpp
-    transaction.cpp
-    types.cpp
-    voice_call.cpp
-    base64.cpp
-    bip39.cpp
-    utxo.cpp
-    mempool.cpp
-    script.cpp
-    network.cpp
-    rpc.cpp
-    block_store.cpp
-    blockchain.cpp
-    wallet.cpp
+    ${CRYPTEX_CORE_SOURCES}
 )
 target_include_directories(cryptex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
 target_compile_definitions(cryptex_tests PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
@@ -119,10 +102,49 @@ else()
     target_link_libraries(cryptex_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z ${CRYPTEX_OPUS_LINK_TARGET})
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION ".")
-elseif(WIN32)
-    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION ".")
+set(CRYPTEX_ASM_POWMINER FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND
+   ((DEFINED CMAKE_OSX_ARCHITECTURES AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64") OR
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+    set(CRYPTEX_ASM_POWMINER TRUE)
+    add_executable(cryptex_powminer
+        asm/powminer_darwin_arm64.S
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    set(CRYPTEX_ASM_POWMINER TRUE)
+    add_executable(cryptex_powminer
+        asm/powminer_linux_arm64.S
+    )
 else()
-    install(TARGETS cryptexd cryptex_tests RUNTIME DESTINATION "bin")
+    add_executable(cryptex_powminer
+        powminer_main.cpp
+        ${CRYPTEX_CORE_SOURCES}
+    )
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set_target_properties(cryptex_powminer PROPERTIES OUTPUT_NAME "cryptex_powminer_osx")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    set_target_properties(cryptex_powminer PROPERTIES OUTPUT_NAME "cryptex_powminer_win32")
+else()
+    set_target_properties(cryptex_powminer PROPERTIES OUTPUT_NAME "cryptex_powminer_linux")
+endif()
+
+if(NOT CRYPTEX_ASM_POWMINER)
+    target_include_directories(cryptex_powminer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
+    target_compile_definitions(cryptex_powminer PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
+    if(WIN32 AND CMAKE_CROSSCOMPILING)
+        target_link_libraries(cryptex_powminer PRIVATE ${OPENSSL_LIBRARIES} ${OPUS_LIBRARIES})
+    else()
+        target_link_libraries(cryptex_powminer PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread z ${CRYPTEX_OPUS_LINK_TARGET})
+    endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    install(TARGETS cryptexd cryptex_tests cryptex_powminer RUNTIME DESTINATION ".")
+elseif(WIN32)
+    install(TARGETS cryptexd cryptex_tests cryptex_powminer RUNTIME DESTINATION ".")
+else()
+    install(TARGETS cryptexd cryptex_tests cryptex_powminer RUNTIME DESTINATION "bin")
 endif()

@@ -47,6 +47,32 @@ UTXOEntry UTXOEntry::deserialize(const uint8_t*& data, size_t& remaining) {
 // -------------------------------------------------------------------
 // UTXOSet
 // -------------------------------------------------------------------
+UTXOSet::UTXOSet(const UTXOSet& other) {
+    std::shared_lock lock(other.mutex_);
+    map_ = other.map_;
+}
+
+UTXOSet& UTXOSet::operator=(const UTXOSet& other) {
+    if (this == &other) return *this;
+    std::unique_lock lock(mutex_);
+    std::shared_lock lock_other(other.mutex_);
+    map_ = other.map_;
+    return *this;
+}
+
+UTXOSet::UTXOSet(UTXOSet&& other) noexcept {
+    std::unique_lock lock(other.mutex_);
+    map_ = std::move(other.map_);
+}
+
+UTXOSet& UTXOSet::operator=(UTXOSet&& other) noexcept {
+    if (this == &other) return *this;
+    std::unique_lock lock(mutex_);
+    std::unique_lock lock_other(other.mutex_);
+    map_ = std::move(other.map_);
+    return *this;
+}
+
 bool UTXOSet::apply_transaction(const Transaction& tx, uint32_t block_height, int64_t* fee_out) {
     std::unique_lock lock(mutex_);
 
@@ -334,6 +360,14 @@ void UTXOSet::swap_in(UTXOSet&& other) {
     std::unique_lock lock_other(other.mutex_);
     map_.swap(other.map_);
 }
+
+UTXOSet UTXOSet::snapshot() const {
+    UTXOSet copy;
+    std::shared_lock lock(mutex_);
+    copy.map_ = map_;
+    return copy;
+}
+
 std::vector<std::pair<OutPoint, UTXOEntry>> UTXOSet::list_for_address(const std::string& address,
                                                                       uint32_t current_height,
                                                                       bool include_immature) const {

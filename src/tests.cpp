@@ -9,7 +9,9 @@
 #include "utxo.hpp"
 #include "script.hpp"
 #include "block.hpp"
+#include "block_store.hpp"
 #include "blockchain.hpp"
+#include "crc.hpp"
 #include "rpc.hpp"
 #include "serialization.hpp"
 #include "voice_call.hpp"
@@ -18,6 +20,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <openssl/hmac.h>
 #include <filesystem>
 #ifdef NDEBUG
 #undef NDEBUG
@@ -28,6 +31,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 #ifdef _WIN32
@@ -69,6 +73,62 @@ TestKey make_test_key() {
     return key;
 }
 
+std::vector<uint8_t> decode_base32(std::string text) {
+    auto decode_char = [](char ch) -> int {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a';
+        if (ch >= '2' && ch <= '7') return 26 + (ch - '2');
+        return -1;
+    };
+    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char ch) {
+        return std::isspace(ch) || ch == '=';
+    }), text.end());
+    std::vector<uint8_t> out;
+    int buffer = 0;
+    int bits_left = 0;
+    for (char ch : text) {
+        const int value = decode_char(ch);
+        if (value < 0) continue;
+        buffer = (buffer << 5) | value;
+        bits_left += 5;
+        if (bits_left >= 8) {
+            out.push_back(static_cast<uint8_t>((buffer >> (bits_left - 8)) & 0xFF));
+            bits_left -= 8;
+        }
+    }
+    return out;
+}
+
+std::string current_totp_code(const std::string& secret_b32) {
+    const auto secret = decode_base32(secret_b32);
+    assert(!secret.empty());
+    const uint64_t counter = static_cast<uint64_t>(std::time(nullptr)) / 30ULL;
+    unsigned char msg[8];
+    uint64_t tmp = counter;
+    for (int i = 7; i >= 0; --i) {
+        msg[i] = static_cast<unsigned char>(tmp & 0xFF);
+        tmp >>= 8;
+    }
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    assert(HMAC(EVP_sha1(),
+                secret.data(),
+                static_cast<int>(secret.size()),
+                msg,
+                sizeof(msg),
+                digest,
+                &digest_len) != nullptr);
+    const int offset = digest[19] & 0x0F;
+    uint32_t code = (static_cast<uint32_t>(digest[offset] & 0x7F) << 24) |
+                    (static_cast<uint32_t>(digest[offset + 1]) << 16) |
+                    (static_cast<uint32_t>(digest[offset + 2]) << 8) |
+                    static_cast<uint32_t>(digest[offset + 3]);
+    code %= 1000000U;
+    std::ostringstream out;
+    out << std::setw(6) << std::setfill('0') << code;
+    return out.str();
+}
+
 void remove_all_if_exists(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::remove_all(path, ec);
@@ -87,6 +147,88 @@ std::filesystem::path unique_temp_path(const std::string& stem, const std::strin
     return std::filesystem::temp_directory_path() /
            (stem + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" +
             std::to_string(seq) + suffix);
+}
+
+void write_index_file(const std::filesystem::path& dir,
+                      const std::vector<std::pair<uint64_t, uint256_t>>& entries) {
+    std::ofstream f(dir / "index.dat", std::ios::binary | std::ios::trunc);
+    assert(f);
+    uint8_t version = 2;
+    f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    uint64_t count = entries.size();
+    uint32_t crc = 0xFFFFFFFF;
+    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& [height, hash] : entries) {
+        f.write(reinterpret_cast<const char*>(&height), sizeof(height));
+        auto bytes = hash.to_padded_bytes(constants::POW_HASH_BYTES);
+        f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        crc = crc32_update(crc, reinterpret_cast<const uint8_t*>(&height), sizeof(height));
+        crc = crc32_update(crc, bytes.data(), bytes.size());
+    }
+    crc = crc32_finalize(crc);
+    f.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
+}
+
+void write_headers_file(const std::filesystem::path& dir,
+                        const std::vector<std::pair<uint256_t, BlockHeader>>& entries) {
+    std::ofstream f(dir / "headers.dat", std::ios::binary | std::ios::trunc);
+    assert(f);
+    uint8_t version = 2;
+    f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    uint64_t count = entries.size();
+    uint32_t crc = 0xFFFFFFFF;
+    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& [hash, header] : entries) {
+        auto hash_bytes = hash.to_padded_bytes(constants::POW_HASH_BYTES);
+        auto serialized = header.serialize();
+        uint64_t len = serialized.size();
+        f.write(reinterpret_cast<const char*>(hash_bytes.data()), hash_bytes.size());
+        f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        f.write(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+        crc = crc32_update(crc, hash_bytes.data(), hash_bytes.size());
+        crc = crc32_update(crc, reinterpret_cast<const uint8_t*>(&len), sizeof(len));
+        crc = crc32_update(crc, serialized.data(), serialized.size());
+    }
+    crc = crc32_finalize(crc);
+    f.write(reinterpret_cast<const char*>(&crc), sizeof(crc));
+}
+
+Block make_coinbase_only_test_block(const BlockHeader& prev_header,
+                                    uint64_t height,
+                                    uint32_t bits,
+                                    uint32_t timestamp) {
+    Block blk;
+    blk.header.version = 1;
+    blk.header.prev_block_hash = prev_header.hash();
+    blk.header.timestamp = timestamp;
+    blk.header.bits = bits;
+    blk.header.nonce = 0;
+
+    Transaction coinbase;
+    coinbase.version = 1;
+    TxIn in;
+    in.prevout.tx_hash = uint256_t();
+    in.prevout.index = 0xFFFFFFFF;
+    const auto marker = std::string("test-coinbase-") + std::to_string(height);
+    in.scriptSig.assign(marker.begin(), marker.end());
+    in.sequence = 0xFFFFFFFF;
+    coinbase.inputs.push_back(in);
+
+    TxOut out;
+    out.value = Block::get_block_reward(height);
+    out.scriptPubKey = "genesis";
+    coinbase.outputs.push_back(out);
+    coinbase.lockTime = 0;
+
+    blk.transactions.push_back(coinbase);
+    blk.header.merkle_root = blk.compute_merkle_root();
+    return blk;
+}
+
+void mine_block_nonce(Block& blk) {
+    while (!blk.check_pow()) {
+        ++blk.header.nonce;
+    }
 }
 
 Transaction make_coinbase_tx(const std::string& address, int64_t value) {
@@ -271,6 +413,31 @@ static void test_genesis_pow_full_512() {
            "000000ebd1f4a050003997d5be294b41345fc5717ae39468a55f01a7e4285c9dc9ead014b906a333a565764f329d1771b1abe3950459b1aaefc7f3787524b6b3");
 }
 
+static void test_compact_target_canonical_rules() {
+    compact_target pow_limit{pow_limit_bits()};
+    assert(!pow_limit.is_negative());
+    assert(!pow_limit.is_zero());
+    assert(!pow_limit.overflows(constants::POW_HASH_BYTES));
+    assert(pow_limit.is_canonical(constants::POW_HASH_BYTES));
+    assert(compact_target::from_target(pow_limit.expand()).bits == pow_limit.bits);
+
+    std::array<uint8_t, constants::POW_HASH_BYTES> sign_edge_bytes{};
+    sign_edge_bytes[0] = 0x80;
+    auto sign_edge_target = uint256_t::from_bytes(sign_edge_bytes.data(), sign_edge_bytes.size());
+    auto sign_edge_bits = compact_target::from_target(sign_edge_target);
+    assert((sign_edge_bits.bits & 0x00800000u) == 0);
+    assert(sign_edge_bits.is_canonical(constants::POW_HASH_BYTES));
+    assert(sign_edge_bits.expand() == sign_edge_target);
+
+    compact_target negative_bits{0x1d80ffffu};
+    assert(negative_bits.is_negative());
+    assert(!negative_bits.is_canonical(constants::POW_HASH_BYTES));
+
+    compact_target overflow_bits{0x43010000u};
+    assert(overflow_bits.overflows(constants::POW_HASH_BYTES));
+    assert(!overflow_bits.is_canonical(constants::POW_HASH_BYTES));
+}
+
 static void test_reward_schedule_matches_new_consensus() {
     assert(constants::TOTAL_SUPPLY == 1'000'000'000ULL);
     assert(constants::INITIAL_BLOCK_REWARD == 2500);
@@ -279,6 +446,31 @@ static void test_reward_schedule_matches_new_consensus() {
     assert(Block::get_block_reward(constants::HALVING_INTERVAL_BLOCKS - 1) == 2500LL * 100000000LL);
     assert(Block::get_block_reward(constants::HALVING_INTERVAL_BLOCKS) == 1250LL * 100000000LL);
     assert(Block::get_block_reward(constants::HALVING_INTERVAL_BLOCKS * 2ULL) == 625LL * 100000000LL);
+}
+
+static void test_invalid_compact_target_bits_are_rejected() {
+    std::filesystem::path tmp = unique_temp_path("cryptex_invalid_bits");
+    remove_all_if_exists(tmp);
+    Blockchain chain(tmp);
+    auto prev = chain.get_block(chain.best_height());
+    assert(prev);
+
+    Block invalid_sign = make_coinbase_only_test_block(prev->header,
+                                                       chain.best_height() + 1,
+                                                       0x1d80ffffu,
+                                                       std::max<uint32_t>(prev->header.timestamp + 1,
+                                                                          static_cast<uint32_t>(std::time(nullptr))));
+    assert(!invalid_sign.check_pow());
+    assert(!chain.connect_block(invalid_sign));
+
+    Block invalid_overflow = make_coinbase_only_test_block(prev->header,
+                                                           chain.best_height() + 1,
+                                                           0x43010000u,
+                                                           invalid_sign.header.timestamp + 1);
+    assert(!invalid_overflow.check_pow());
+    assert(!chain.connect_block(invalid_overflow));
+
+    remove_all_if_exists(tmp);
 }
 
 static void test_network_modes() {
@@ -396,6 +588,53 @@ static void test_mainnet_emergency_difficulty_allows_low_hash_takeover() {
     remove_all_if_exists(tmp);
 }
 
+static void test_mainnet_emergency_difficulty_recovers_without_oscillation() {
+    NetworkScope scope(NetworkKind::Mainnet);
+    std::filesystem::path tmp = unique_temp_path("cryptex_diff_takeover_recovery");
+    remove_all_if_exists(tmp);
+
+    Blockchain chain(tmp);
+    auto miner = make_test_key();
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    constexpr uint32_t kFastSpacing = 60;
+    constexpr int kFastBlocks = 16;
+    const uint32_t emergency_delay = params().emergency_min_difficulty_delay_seconds;
+    const uint32_t start_timestamp =
+        now - (emergency_delay * 2) - 60 -
+        static_cast<uint32_t>((kFastBlocks - 1) * kFastSpacing);
+
+    for (int i = 0; i < kFastBlocks; ++i) {
+        auto blk = make_test_block(chain, miner.address, start_timestamp + static_cast<uint32_t>(i) * kFastSpacing);
+        assert(chain.accept_block(blk, /*skip_pow_check=*/true));
+    }
+
+    const uint32_t stable_bits = chain.tip_bits();
+    const uint256_t stable_target = compact_target{stable_bits}.expand();
+    const uint256_t pow_limit_target = compact_target{pow_limit_bits()}.expand();
+    assert(stable_target < pow_limit_target);
+
+    auto tip = chain.get_block(chain.best_height());
+    assert(tip.has_value());
+
+    auto rescue_one = make_test_block(chain, miner.address, tip->header.timestamp + emergency_delay + 1);
+    assert(rescue_one.header.bits == pow_limit_bits());
+    assert(chain.accept_block(rescue_one, /*skip_pow_check=*/true));
+
+    auto rescue_two = make_test_block(chain, miner.address, rescue_one.header.timestamp + emergency_delay + 1);
+    assert(rescue_two.header.bits == pow_limit_bits());
+    assert(chain.accept_block(rescue_two, /*skip_pow_check=*/true));
+
+    const uint32_t recovery_timestamp = rescue_two.header.timestamp + 1;
+    assert(chain.next_work_bits(recovery_timestamp) == stable_bits);
+
+    auto recovery_block = make_test_block(chain, miner.address, recovery_timestamp);
+    assert(recovery_block.header.bits == stable_bits);
+    assert(chain.accept_block(recovery_block, /*skip_pow_check=*/true));
+    assert(chain.next_work_bits(recovery_block.header.timestamp + 1) != pow_limit_bits());
+
+    remove_all_if_exists(tmp);
+}
+
 static void test_future_timestamp_block_is_rejected() {
     NetworkScope scope(NetworkKind::Mainnet);
     std::filesystem::path tmp = unique_temp_path("cryptex_future_block_reject");
@@ -409,6 +648,109 @@ static void test_future_timestamp_block_is_rejected() {
         miner.address,
         now + params().max_future_block_time_seconds + 60);
     assert(!chain.accept_block(future_block, /*skip_pow_check=*/true));
+
+    remove_all_if_exists(tmp);
+}
+
+static void test_rejected_candidate_does_not_become_processed() {
+    NetworkScope scope(NetworkKind::Mainnet);
+    std::filesystem::path tmp = unique_temp_path("cryptex_rejected_candidate_retry");
+    remove_all_if_exists(tmp);
+    Blockchain chain(tmp);
+    BlockStore store(tmp);
+
+    auto prev = chain.get_block(chain.best_height());
+    assert(prev);
+
+    Block invalid = make_coinbase_only_test_block(
+        prev->header,
+        chain.best_height() + 1,
+        static_cast<uint32_t>(pow_limit_bits() + 1U),
+        prev->header.timestamp + 1U);
+    const auto invalid_pow_hash = invalid.header.pow_hash();
+    const auto invalid_header_hash = invalid.header.hash();
+
+    assert(!chain.connect_block(invalid, /*skip_pow_check=*/true));
+    assert(chain.best_height() == 0);
+    assert(chain.tip_hash() == prev->header.pow_hash());
+    assert(!chain.get_block_by_hash(invalid_pow_hash).has_value());
+    assert(!chain.get_block_by_hash(invalid_header_hash).has_value());
+    assert(!chain.knows_hash(invalid_pow_hash));
+    assert(!chain.knows_hash(invalid_header_hash));
+    assert(!store.exists_by_hash(invalid_pow_hash));
+
+    assert(!chain.connect_block(invalid, /*skip_pow_check=*/true));
+    assert(chain.best_height() == 0);
+    assert(chain.tip_hash() == prev->header.pow_hash());
+    assert(!chain.get_block_by_hash(invalid_pow_hash).has_value());
+    assert(!chain.knows_hash(invalid_pow_hash));
+    assert(!store.exists_by_hash(invalid_pow_hash));
+
+    Blockchain reloaded(tmp);
+    assert(!reloaded.get_block_by_hash(invalid_pow_hash).has_value());
+    assert(!reloaded.knows_hash(invalid_pow_hash));
+
+    remove_all_if_exists(tmp);
+}
+
+static void test_blockchain_repairs_invalid_active_tail_on_load() {
+    NetworkScope scope(NetworkKind::Mainnet);
+    std::filesystem::path tmp = unique_temp_path("cryptex_invalid_tail_repair");
+    remove_all_if_exists(tmp);
+
+    BlockStore store(tmp);
+    Block genesis = Block::create_genesis();
+    const uint256_t genesis_hash = genesis.header.pow_hash();
+    assert(store.store(0, genesis));
+    assert(store.store_by_hash(genesis_hash, genesis));
+
+    Block invalid = make_coinbase_only_test_block(
+        genesis.header,
+        1,
+        static_cast<uint32_t>(pow_limit_bits() + 1U),
+        genesis.header.timestamp + 1U);
+    mine_block_nonce(invalid);
+    const uint256_t invalid_hash = invalid.header.pow_hash();
+    assert(store.store(1, invalid));
+    assert(store.store_by_hash(invalid_hash, invalid));
+
+    write_index_file(tmp, {{0, genesis_hash}, {1, invalid_hash}});
+    write_headers_file(tmp, {{genesis_hash, genesis.header}, {invalid_hash, invalid.header}});
+
+    Blockchain repaired(tmp);
+    assert(repaired.best_height() == 0);
+    assert(repaired.tip_hash() == genesis_hash);
+    assert(!repaired.has_block(1));
+    assert(!repaired.get_block_by_hash(invalid_hash).has_value());
+
+    remove_all_if_exists(tmp);
+}
+
+static void test_blockchain_repairs_missing_block_active_tail_on_load() {
+    NetworkScope scope(NetworkKind::Mainnet);
+    std::filesystem::path tmp = unique_temp_path("cryptex_missing_block_tail_repair");
+    remove_all_if_exists(tmp);
+
+    Blockchain chain(tmp);
+    auto miner = make_test_key();
+    for (int i = 0; i < 3; ++i) {
+        auto blk = make_test_block(chain,
+                                   miner.address,
+                                   genesis_timestamp() + 60 + static_cast<uint32_t>(i * 60));
+        assert(chain.accept_block(blk, /*skip_pow_check=*/true));
+    }
+
+    auto missing = chain.get_block(2);
+    assert(missing.has_value());
+
+    BlockStore store(tmp);
+    store.remove_height(2);
+    store.remove_by_hash(missing->header.pow_hash());
+
+    Blockchain repaired(tmp);
+    assert(repaired.best_height() == 1);
+    assert(!repaired.has_block(2));
+    assert(!repaired.get_block_by_hash(missing->header.pow_hash()).has_value());
 
     remove_all_if_exists(tmp);
 }
@@ -1099,7 +1441,7 @@ static void test_offline_tip_extension_after_network_approval_stays_approved() {
     remove_all_if_exists(tmp);
 }
 
-static void test_sync_approval_survives_backend_attach_without_peers() {
+static void test_sync_approval_peerless_attach_reapproves_local_chain() {
     NetworkScope scope(NetworkKind::Regtest);
     std::filesystem::path tmp = unique_temp_path("cryptex_sync_approval_attach");
     remove_all_if_exists(tmp);
@@ -1116,8 +1458,9 @@ static void test_sync_approval_survives_backend_attach_without_peers() {
     node.attach_blockchain(&chain);
 
     auto summary = wallet.balance_summary(chain);
-    assert(!summary.approved);
-    assert(summary.locked == Block::get_block_reward(1));
+    assert(summary.approved);
+    assert(summary.locked == 0);
+    assert(summary.immature == Block::get_block_reward(1));
 
     remove_all_if_exists(tmp);
 }
@@ -1135,6 +1478,33 @@ static void test_fresh_genesis_node_is_not_auto_approved() {
     node.attach_blockchain(&chain);
 
     assert(!chain.wallet_state_approved());
+
+    remove_all_if_exists(tmp);
+}
+
+static void test_blockchain_restores_missing_height_files_from_hash_index() {
+    NetworkScope scope(NetworkKind::Regtest);
+    std::filesystem::path tmp = unique_temp_path("cryptex_restore_height_files");
+    remove_all_if_exists(tmp);
+
+    Blockchain chain(tmp);
+    auto key = make_test_key();
+    for (int i = 0; i < 8; ++i) {
+        auto blk = mine_valid_block(chain, key.address);
+        assert(chain.accept_block(blk));
+    }
+    assert(chain.best_height() == 8);
+
+    for (uint64_t h = 4; h <= chain.best_height(); ++h) {
+        std::error_code ec;
+        std::filesystem::remove(tmp / "blocks" / ("blk" + std::to_string(h) + ".dat"), ec);
+    }
+
+    Blockchain repaired(tmp);
+    assert(repaired.best_height() == 8);
+    for (uint64_t h = 0; h <= repaired.best_height(); ++h) {
+        assert(repaired.has_block(h));
+    }
 
     remove_all_if_exists(tmp);
 }
@@ -1198,6 +1568,52 @@ static void test_mempool_orphan_promotion() {
     assert(pool.orphan_count() == 0);
     assert(pool.contains(parent.hash()));
     assert(pool.contains(child.hash()));
+}
+
+static void test_mempool_mineable_transactions_filter_invalid_entries() {
+    auto key = make_test_key();
+    auto other_key = make_test_key();
+    UTXOSet utxo;
+    Transaction funding = make_coinbase_tx(key.address, 50 * 100000000LL);
+    Transaction other_funding = make_coinbase_tx(other_key.address, 25 * 100000000LL);
+    assert(utxo.apply_transaction(funding, 0));
+    assert(utxo.apply_transaction(other_funding, 0));
+
+    TxOut parent_out;
+    parent_out.value = funding.outputs[0].value - 5000;
+    parent_out.scriptPubKey = key.address;
+    auto parent = make_signed_spend({funding.hash(), 0}, funding.outputs[0], key, {parent_out});
+
+    TxOut child_out;
+    child_out.value = parent_out.value - 1500;
+    child_out.scriptPubKey = key.address;
+    auto child = make_signed_spend({parent.hash(), 0}, parent.outputs[0], key, {child_out});
+
+    TxOut stale_out;
+    stale_out.value = other_funding.outputs[0].value - 2500;
+    stale_out.scriptPubKey = other_key.address;
+    auto stale = make_signed_spend({other_funding.hash(), 0}, other_funding.outputs[0], other_key, {stale_out});
+
+    Mempool pool;
+    Mempool::AcceptStatus status = Mempool::AcceptStatus::Accepted;
+    assert(!pool.add_transaction(child, utxo, 99, &status));
+    assert(status == Mempool::AcceptStatus::MissingInputs);
+    assert(pool.add_transaction(parent, utxo, 99, &status));
+    assert(status == Mempool::AcceptStatus::Accepted);
+    assert(pool.add_transaction(stale, utxo, 99, &status));
+    assert(status == Mempool::AcceptStatus::Accepted);
+
+    UTXOSet advanced_tip = utxo.snapshot();
+    TxOut confirmed_out;
+    confirmed_out.value = other_funding.outputs[0].value - 5000;
+    confirmed_out.scriptPubKey = other_key.address;
+    auto confirmed = make_signed_spend({other_funding.hash(), 0}, other_funding.outputs[0], other_key, {confirmed_out});
+    assert(advanced_tip.apply_transaction(confirmed, 100));
+
+    auto mineable = pool.get_mineable_transactions(advanced_tip, 101, constants::MAX_BLOCK_SIZE_BYTES, 256);
+    assert(mineable.size() == 2);
+    assert(mineable[0].hash() == parent.hash());
+    assert(mineable[1].hash() == child.hash());
 }
 
 static void test_peer_state_persistence() {
@@ -1295,6 +1711,7 @@ static void test_rpc_service() {
     net::NetworkNode rpc_node(rpc_ctx, 0, tmp);
     rpc_node.set_external_address("127.0.0.1:9333");
     auto external_key = make_test_key();
+    auto mail_sender_wallet = Wallet::create_new("mailpass", (tmp / "MailSender.dat").string());
 
     chat::HistoryEntry seeded_chat;
     seeded_chat.direction = "in";
@@ -1309,6 +1726,41 @@ static void test_rpc_service() {
     seeded_chat.peer_label = "127.0.0.1:9333";
     seeded_chat.status = "received";
     rpc_node.record_chat_history(seeded_chat);
+
+    chat::HistoryEntry seeded_mail;
+    seeded_mail.direction = "in";
+    seeded_mail.is_private = true;
+    seeded_mail.authenticated = true;
+    seeded_mail.encrypted = true;
+    seeded_mail.decrypted = true;
+    seeded_mail.timestamp = static_cast<uint64_t>(std::time(nullptr));
+    seeded_mail.nonce = 43;
+    seeded_mail.message_id = "seeded-mail-id";
+    seeded_mail.sender_address = external_key.address;
+    seeded_mail.sender_pubkey = crypto::base64_encode(external_key.pub);
+    seeded_mail.recipient_address = wallet.address;
+    seeded_mail.subject = "mail hello";
+    seeded_mail.mail_to = wallet.display_address(wallet.address) + "@p2pmail.crx";
+    seeded_mail.mail_cc = "ops@p2pmail.crx";
+    seeded_mail.message = "hello from p2pmail";
+    seeded_mail.peer_label = "127.0.0.1:9333";
+    seeded_mail.status = "received";
+    seeded_mail.content_type = "text";
+    seeded_mail.encryption_mode = "ecdh";
+    rpc_node.record_mail_history(seeded_mail);
+
+    auto distributed_mail_content = chat::make_text_content("hello from distributed store");
+    distributed_mail_content.subject = "distributed sync";
+    auto distributed_mail_payload = chat::make_encrypted_private_chat(mail_sender_wallet,
+                                                                      mail_sender_wallet.address,
+                                                                      wallet.address,
+                                                                      wallet.pubkeys.front(),
+                                                                      distributed_mail_content,
+                                                                      chat::KeyDerivation::Argon2id,
+                                                                      chat::EncryptionMode::ECDH,
+                                                                      {},
+                                                                      chat::CHAT_TYPE_MAIL);
+    rpc_node.record_distributed_mail(distributed_mail_payload, "127.0.0.1:9333");
 
     Block blk;
     blk.header.version = 1;
@@ -1396,6 +1848,14 @@ static void test_rpc_service() {
         stop_requested);
     assert(chatinbox_resp.find("seeded-chat-id") != std::string::npos);
     assert(chatinbox_resp.find("hello from history") != std::string::npos);
+
+    auto p2pmail_inbox_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":150,"method":"getp2pmail","params":[{"folder":"inbox"}]})",
+        stop_requested);
+    assert(p2pmail_inbox_resp.find("seeded-mail-id") != std::string::npos);
+    assert(p2pmail_inbox_resp.find("mail hello") != std::string::npos);
+    assert(p2pmail_inbox_resp.find("distributed sync") != std::string::npos);
+    assert(p2pmail_inbox_resp.find("\"mail_cc\":\"ops@p2pmail.crx\"") != std::string::npos);
 
     auto chaininfo_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":8,"method":"getblockchaininfo","params":[]})",
@@ -1517,6 +1977,11 @@ static void test_rpc_service() {
     assert(addressbook_resp.find(wallet.display_address(wallet.address)) != std::string::npos);
     assert(addressbook_resp.find("\"address_base64\":\"") != std::string::npos);
     assert(addressbook_resp.find("\"address_hex\":\"0x") != std::string::npos);
+
+    auto p2pmail_accounts_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":210,"method":"getp2pmailaccounts","params":[]})",
+        stop_requested);
+    assert(p2pmail_accounts_resp.find("@p2pmail.crx") != std::string::npos);
 
     auto history_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":19,"method":"getwallethistory","params":[true]})",
@@ -1665,6 +2130,13 @@ static void test_rpc_service() {
     assert(resolve_private_contact_resp.find("\"voice_ready\":true") != std::string::npos);
     assert(resolve_private_contact_resp.find(crypto::base64_encode(external_key.pub)) != std::string::npos);
 
+    auto resolve_mail_contact_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":452,"method":"resolvep2pmailrecipient","params":[")") +
+        crypto::address_to_base58(external_key.address) + R"(@p2pmail.crx"]})",
+        stop_requested);
+    assert(resolve_mail_contact_resp.find("\"found\":true") != std::string::npos);
+    assert(resolve_mail_contact_resp.find("@p2pmail.crx") != std::string::npos);
+
     auto set_proxy_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":46,"method":"setchatproxyconfig","params":[{"enabled":true,"host":"127.0.0.1","port":9050,"remote_dns":true}]})",
         stop_requested);
@@ -1675,6 +2147,51 @@ static void test_rpc_service() {
         R"({"jsonrpc":"2.0","id":47,"method":"getchatproxyconfig","params":[]})",
         stop_requested);
     assert(get_proxy_resp.find("\"host\":\"127.0.0.1\"") != std::string::npos);
+
+    auto get_mail_proxy_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":471,"method":"getp2pmailproxyconfig","params":[]})",
+        stop_requested);
+    assert(get_mail_proxy_resp.find("\"host\":\"127.0.0.1\"") != std::string::npos);
+
+    const std::string totp_secret = "JBSWY3DPEHPK3PXP";
+    auto set_mail_security_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":472,"method":"setp2pmailsecurity","params":[{"two_factor_enabled":true,"issuer":"CryptEX Mail","totp_secret_b32":")") +
+        totp_secret + R"("}]})",
+        stop_requested);
+    assert(set_mail_security_resp.find("\"two_factor_enabled\":true") != std::string::npos);
+    const auto totp_code = current_totp_code(totp_secret);
+    auto verify_mail_2fa_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":473,"method":"verifyp2pmail2fa","params":[")") + totp_code + R"("]})",
+        stop_requested);
+    assert(verify_mail_2fa_resp.find("\"verified\":true") != std::string::npos);
+
+    auto mail_security_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":474,"method":"getp2pmailsecurity","params":[]})",
+        stop_requested);
+    assert(mail_security_resp.find("\"dht_enabled\":true") != std::string::npos);
+    assert(mail_security_resp.find("\"proof_receipts\":") != std::string::npos);
+    assert(mail_security_resp.find("\"minimum_bond_sats\":") != std::string::npos);
+    assert(mail_security_resp.find("\"nat_assist\":true") != std::string::npos);
+    assert(mail_security_resp.find("\"slash_on_failed_proof\":") != std::string::npos);
+
+    auto set_mail_policy_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":475,"method":"setp2pmailpolicy","params":[{"ttl_hours":72,"replica_target":4,"max_store_items":9000,"prune_imported":true,"prune_expired":true,"proof_of_storage":true,"challenge_interval_minutes":15,"minimum_bond_sats":2500000,"required_verified_replicas":2,"slash_on_failed_proof":true,"slash_penalty_score":33,"nat_assist":true,"relay_fallback":true,"relay_peers":["relay-a.example:9333"],"stun_servers":["stun.example.org:3478"],"stun_timeout_ms":1500}]})",
+        stop_requested);
+    assert(set_mail_policy_resp.find("\"replica_target\":4") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"challenge_interval_minutes\":15") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"minimum_bond_sats\":2500000") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"required_verified_replicas\":2") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"slash_penalty_score\":33") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"relay_fallback\":true") != std::string::npos);
+    assert(set_mail_policy_resp.find("\"stun_timeout_ms\":1500") != std::string::npos);
+
+    auto get_mail_policy_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":476,"method":"getp2pmailpolicy","params":[]})",
+        stop_requested);
+    assert(get_mail_policy_resp.find("\"proof_of_storage\":true") != std::string::npos);
+    assert(get_mail_policy_resp.find("\"minimum_bond_sats\":2500000") != std::string::npos);
+    assert(get_mail_policy_resp.find("\"nat_assist\":true") != std::string::npos);
+    assert(get_mail_policy_resp.find("\"relay_peers\":[\"relay-a.example:9333\"]") != std::string::npos);
 
     auto send_private_resp = rpc_service.handle_jsonrpc(
         std::string(R"({"jsonrpc":"2.0","id":52,"method":"sendchatprivate","params":[{"recipient_address":")") +
@@ -1694,6 +2211,26 @@ static void test_rpc_service() {
         stop_requested);
     assert(send_private_resolved_resp.find("\"status\":\"no-peer\"") != std::string::npos);
     assert(send_private_resolved_resp.find("\"messageid\":\"") != std::string::npos);
+
+    auto send_mail_resp = rpc_service.handle_jsonrpc(
+        std::string(R"({"jsonrpc":"2.0","id":522,"method":"sendp2pmail","params":[{"to":")") +
+        crypto::address_to_base58(external_key.address) +
+        R"(@p2pmail.crx","cc":")" + wallet.address +
+        R"(@p2pmail.crx","bcc":")" + import_source_wallet.address +
+        R"(@p2pmail.crx","subject":"status update","body":"mail body","encryption":"ecdh","kdf":"argon2id","totp_code":")" +
+        totp_code + R"("}]})",
+        stop_requested);
+    assert(send_mail_resp.find("\"status\":\"") != std::string::npos);
+    assert(send_mail_resp.find("\"subject\":\"status update\"") != std::string::npos);
+    assert(send_mail_resp.find("\"to_mail_address\":\"") != std::string::npos);
+    assert(send_mail_resp.find("\"cc_count\":1") != std::string::npos);
+    assert(send_mail_resp.find("\"bcc_count\":1") != std::string::npos);
+    assert(send_mail_resp.find("\"recipient_count\":3") != std::string::npos);
+
+    auto p2pmail_sent_resp = rpc_service.handle_jsonrpc(
+        R"({"jsonrpc":"2.0","id":523,"method":"getp2pmail","params":[{"folder":"sent"}]})",
+        stop_requested);
+    assert(p2pmail_sent_resp.find("status update") != std::string::npos);
 
     auto set_irc_resp = rpc_service.handle_jsonrpc(
         R"({"jsonrpc":"2.0","id":48,"method":"setircconfig","params":[{"enabled":true,"server":"irc.example.net","port":6667,"nick":"cryptex-dev","username":"cryptex","realname":"CryptEX","channel":"#cryptex"}]})",
@@ -2030,6 +2567,54 @@ static void test_local_checkpoint_persists_and_blocks_deep_rewrite() {
     remove_all_if_exists(tmp);
 }
 
+static void test_stale_checkpoint_above_tip_is_cleared_on_startup() {
+    NetworkScope scope(NetworkKind::Regtest);
+    auto key = make_test_key();
+    auto tmp = unique_temp_path("cryptex_stale_checkpoint_recovery");
+    remove_all_if_exists(tmp);
+
+    uint256_t pinned_hash;
+    {
+        Blockchain chain(tmp);
+        auto genesis = chain.get_block(0);
+        assert(genesis.has_value());
+
+        auto a1 = make_branch_block(genesis->header, 1, key.address, 5);
+        auto a2 = make_branch_block(a1.header, 2, key.address, 5);
+        auto a3 = make_branch_block(a2.header, 3, key.address, 5);
+        auto a4 = make_branch_block(a3.header, 4, key.address, 5);
+        assert(chain.accept_block(a1, /*skip_pow_check=*/true));
+        assert(chain.accept_block(a2, /*skip_pow_check=*/true));
+        assert(chain.accept_block(a3, /*skip_pow_check=*/true));
+        assert(chain.accept_block(a4, /*skip_pow_check=*/true));
+        assert(chain.best_height() == 4);
+        pinned_hash = a4.header.pow_hash();
+    }
+
+    {
+        std::ofstream local(tmp / "local_checkpoint.dat", std::ios::binary | std::ios::trunc);
+        assert(local.good());
+        local << 99 << " " << pinned_hash.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+    }
+    {
+        std::ofstream manual(tmp / "manual_checkpoint.dat", std::ios::binary | std::ios::trunc);
+        assert(manual.good());
+        manual << 99 << " " << pinned_hash.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+    }
+
+    {
+        Blockchain chain(tmp);
+        assert(chain.best_height() == 4);
+        const auto checkpoint = chain.checkpoint_info();
+        assert(checkpoint.present);
+        assert(!checkpoint.pinned);
+        assert(checkpoint.height <= chain.best_height());
+        assert(!std::filesystem::exists(tmp / "manual_checkpoint.dat"));
+    }
+
+    remove_all_if_exists(tmp);
+}
+
 static void test_wallet_session_rpc_independent_of_startup_wallet_flags() {
     NetworkScope scope(NetworkKind::Regtest);
     auto tmp = unique_temp_path("cryptex_wallet_session_rpc");
@@ -2203,13 +2788,19 @@ int main() {
     test_version_payload_and_seed_bootstrap();
     test_structured_logging_to_file();
     test_genesis_pow_full_512();
+    test_compact_target_canonical_rules();
     test_reward_schedule_matches_new_consensus();
     test_network_modes();
     test_secure_chat_roundtrip();
     test_secure_chat_kdf_profiles();
     test_legacy_address_compatibility();
     test_mainnet_emergency_difficulty_allows_low_hash_takeover();
+    test_mainnet_emergency_difficulty_recovers_without_oscillation();
     test_future_timestamp_block_is_rejected();
+    test_invalid_compact_target_bits_are_rejected();
+    test_rejected_candidate_does_not_become_processed();
+    test_blockchain_repairs_invalid_active_tail_on_load();
+    test_blockchain_repairs_missing_block_active_tail_on_load();
     test_unique_coinbase_rewards_accumulate();
     test_sighash_and_signature();
     test_utxo_apply_and_fee();
@@ -2223,10 +2814,12 @@ int main() {
     test_chainstate_snapshot_reload();
     test_wallet_balance_locks_when_chain_unapproved();
     test_offline_tip_extension_after_network_approval_stays_approved();
-    test_sync_approval_survives_backend_attach_without_peers();
+    test_sync_approval_peerless_attach_reapproves_local_chain();
     test_fresh_genesis_node_is_not_auto_approved();
+    test_blockchain_restores_missing_height_files_from_hash_index();
     test_mempool_policy_rejections();
     test_mempool_orphan_promotion();
+    test_mempool_mineable_transactions_filter_invalid_entries();
     test_peer_state_persistence();
     test_block_locator_and_header_slice();
     test_voice_call_content_roundtrip();
@@ -2234,6 +2827,7 @@ int main() {
     test_deep_reorg_policy_blocks_history_rewrite();
     test_shallow_reorg_within_limit_is_allowed();
     test_local_checkpoint_persists_and_blocks_deep_rewrite();
+    test_stale_checkpoint_above_tip_is_cleared_on_startup();
     test_wallet_session_rpc_independent_of_startup_wallet_flags();
     test_rpc_service();
     test_rpc_tls_autogenerates_certificate_and_serves_https();

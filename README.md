@@ -1,6 +1,6 @@
 # CryptEX
 
-Current release: `v0.6.0`
+Current release: `v0.6.1`
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 

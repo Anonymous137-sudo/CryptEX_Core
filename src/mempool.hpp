@@ -43,6 +43,12 @@ public:
     // Get all transactions currently in mempool
     std::vector<Transaction> get_transactions() const;
 
+    // Return transactions that still apply cleanly to the current UTXO tip snapshot.
+    std::vector<Transaction> get_mineable_transactions(const UTXOSet& utxo,
+                                                       uint32_t next_block_height,
+                                                       size_t max_block_bytes,
+                                                       size_t reserved_bytes = 0) const;
+
     // Check if mempool contains transaction
     bool contains(const uint256_t& tx_hash) const;
 

@@ -6,6 +6,34 @@ BUILD_DIR="${1:-${ROOT_DIR}/build-release/windows-x86_64}"
 OUT_DIR="${2:-${ROOT_DIR}/dist/CryptEX_windows_x86_64_bundle}"
 QT_ROOT="${QT6_ROOT_WIN_X86_64:-${HOME}/Qt/6.10.2/mingw_64}"
 
+cache_value() {
+  local key="$1"
+  local cache="${BUILD_DIR}/CMakeCache.txt"
+  if [[ ! -f "${cache}" ]]; then
+    return 0
+  fi
+  sed -n "s/^${key}:[^=]*=//p" "${cache}" | head -n 1
+}
+
+OPENSSL_ROOT="${OPENSSL_ROOT_DIR_WIN_X86_64:-$(cache_value OPENSSL_ROOT_DIR)}"
+OPUS_ROOT="${OPUS_ROOT_DIR_WIN_X86_64:-$(cache_value OPUS_ROOT_DIR)}"
+
+detect_mingw_bin() {
+  for candidate in \
+    "$(command -v x86_64-w64-mingw32-g++ 2>/dev/null || true)" \
+    "$(command -v x86_64-w64-mingw32-g++-posix 2>/dev/null || true)" \
+    "$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)" \
+    "$(command -v x86_64-w64-mingw32-gcc-posix 2>/dev/null || true)"; do
+    if [[ -n "${candidate}" ]]; then
+      dirname "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+MINGW_BIN="${MINGW_W64_BIN_WIN_X86_64:-$(detect_mingw_bin || true)}"
+
 if [[ ! -d "${BUILD_DIR}" ]]; then
   echo "[package-win] build directory not found: ${BUILD_DIR}" >&2
   exit 1
@@ -17,59 +45,62 @@ if [[ ! -d "${QT_ROOT}" ]]; then
 fi
 
 rm -rf "${OUT_DIR}"
-mkdir -p \
-  "${OUT_DIR}" \
-  "${OUT_DIR}/plugins/platforms" \
-  "${OUT_DIR}/plugins/imageformats" \
-  "${OUT_DIR}/plugins/iconengines" \
-  "${OUT_DIR}/plugins/styles" \
-  "${OUT_DIR}/plugins/tls" \
-  "${OUT_DIR}/plugins/networkinformation"
+mkdir -p "${OUT_DIR}"
 
-copy_file() {
+copy_required() {
   local src="$1"
   local dst="$2"
   if [[ ! -f "${src}" ]]; then
-    echo "[package-win] missing file: ${src}" >&2
+    echo "[package-win] missing required file: ${src}" >&2
     exit 1
   fi
   cp "${src}" "${dst}"
 }
 
-copy_file "${BUILD_DIR}/cryptexqt_win32.exe" "${OUT_DIR}/cryptexqt_win32.exe"
-copy_file "${BUILD_DIR}/cryptexd_win32.exe" "${OUT_DIR}/cryptexd_win32.exe"
-copy_file "${BUILD_DIR}/cryptex_tests.exe" "${OUT_DIR}/cryptex_tests.exe"
+copy_optional_glob() {
+  local pattern="$1"
+  local dst_dir="$2"
+  local matched=0
+  shopt -s nullglob
+  for file in ${pattern}; do
+    cp "${file}" "${dst_dir}/"
+    matched=1
+  done
+  shopt -u nullglob
+  return ${matched}
+}
 
-for dll in \
-  Qt6Core.dll \
-  Qt6Gui.dll \
-  Qt6Network.dll \
-  Qt6Widgets.dll \
-  Qt6Svg.dll \
-  libgcc_s_seh-1.dll \
-  libstdc++-6.dll \
-  libwinpthread-1.dll \
-  d3dcompiler_47.dll \
-  opengl32sw.dll
-do
-  copy_file "${QT_ROOT}/bin/${dll}" "${OUT_DIR}/${dll}"
-done
+copy_tree_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -d "${src}" ]]; then
+    mkdir -p "${dst}"
+    cp -R "${src}/." "${dst}/"
+  fi
+}
 
-for plugin in \
-  platforms/qwindows.dll \
-  imageformats/qico.dll \
-  imageformats/qjpeg.dll \
-  imageformats/qgif.dll \
-  imageformats/qsvg.dll \
-  iconengines/qsvgicon.dll \
-  styles/qmodernwindowsstyle.dll \
-  tls/qcertonlybackend.dll \
-  tls/qschannelbackend.dll \
-  tls/qopensslbackend.dll \
-  networkinformation/qnetworklistmanager.dll
-do
-  copy_file "${QT_ROOT}/plugins/${plugin}" "${OUT_DIR}/plugins/${plugin}"
-done
+copy_required "${BUILD_DIR}/cryptexqt_win32.exe" "${OUT_DIR}/cryptexqt_win32.exe"
+copy_required "${BUILD_DIR}/cryptexd_win32.exe" "${OUT_DIR}/cryptexd_win32.exe"
+copy_required "${BUILD_DIR}/cryptex_tests.exe" "${OUT_DIR}/cryptex_tests.exe"
+copy_required "${BUILD_DIR}/cryptex_powminer_win32.exe" "${OUT_DIR}/cryptex_powminer_win32.exe"
+
+# Copy the broad Qt runtime set to avoid missing transitive DLLs at launch time.
+copy_optional_glob "${QT_ROOT}/bin/*.dll" "${OUT_DIR}" || true
+
+# Copy compiler/runtime DLLs from the active mingw toolchain if available.
+if [[ -n "${MINGW_BIN}" && -d "${MINGW_BIN}" ]]; then
+  copy_optional_glob "${MINGW_BIN}/*.dll" "${OUT_DIR}" || true
+fi
+
+# OpenSSL and Opus are not always inside the Qt prefix.
+if [[ -n "${OPENSSL_ROOT}" && -d "${OPENSSL_ROOT}" ]]; then
+  copy_optional_glob "${OPENSSL_ROOT}/bin/*.dll" "${OUT_DIR}" || true
+fi
+if [[ -n "${OPUS_ROOT}" && -d "${OPUS_ROOT}" ]]; then
+  copy_optional_glob "${OPUS_ROOT}/bin/*.dll" "${OUT_DIR}" || true
+fi
+
+copy_tree_if_exists "${QT_ROOT}/plugins" "${OUT_DIR}/plugins"
 
 cat > "${OUT_DIR}/qt.conf" <<'EOF'
 [Paths]
@@ -77,22 +108,24 @@ Plugins = plugins
 EOF
 
 cat > "${OUT_DIR}/README.txt" <<'EOF'
-CryptEX Windows x86_64 Runtime Bundle
-====================================
+CryptEX Windows Runtime Bundle
+==============================
 
 Contents
 - cryptexqt_win32.exe : Qt GUI client
 - cryptexd_win32.exe  : backend / node / RPC daemon
 - cryptex_tests.exe   : test binary
+- cryptex_powminer_win32.exe : external SHA3-512 PoW worker
 
 How to launch
 1. Start cryptexqt_win32.exe
 2. The GUI will auto-discover cryptexd_win32.exe in the same folder
 3. The GUI can launch the backend for you
+4. Mining uses cryptex_powminer_win32.exe from the same folder
 
 Notes
 - Keep the plugins directory and DLLs beside the executables
-- Do not move cryptexqt_win32.exe away from cryptexd_win32.exe if you want auto-discovery to keep working
+- This bundle intentionally includes the broad Qt/runtime DLL set to reduce missing-dependency crashes on clean Windows systems
 EOF
 
 (

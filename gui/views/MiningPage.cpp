@@ -122,7 +122,7 @@ MiningPage::MiningPage(QWidget* parent)
     }
     templateSummaryView_->setPlaceholderText(QStringLiteral("Request a template to inspect the next candidate block, target, and coinbase destination."));
     templateTxView_->setPlaceholderText(QStringLiteral("Candidate transaction set will appear here."));
-    templateBlockHexView_->setPlaceholderText(QStringLiteral("Raw block hex ready for external miner or proposal workflows."));
+    templateBlockHexView_->setPlaceholderText(QStringLiteral("Raw block hex ready for external assembly miner or proposal workflows."));
     templateJsonView_->setPlaceholderText(QStringLiteral("Full template JSON will appear here."));
     templateTabs_->addTab(templateSummaryView_, QStringLiteral("Summary"));
     templateTabs_->addTab(templateTxView_, QStringLiteral("Transactions"));
@@ -131,7 +131,7 @@ MiningPage::MiningPage(QWidget* parent)
     templateLayout->addWidget(templateTabs_);
     root->addWidget(templateBox);
 
-    auto* note = new QLabel(QStringLiteral("The GUI miner uses its own datadir by default. If you leave the peer target blank it will mine against the local node, and found blocks are submitted back into the backend so your wallet and dashboard stay in sync. Live miner logs appear in the separate Miner Output tab, while this template panel is meant for external-miner-style inspection and copy/export workflows."));
+    auto* note = new QLabel(QStringLiteral("The GUI miner now launches the daemon mining command, which orchestrates the external assembly-only SHA3-512 worker. If you leave the peer target blank it will mine against the local node, and found blocks are submitted back into the backend so your wallet and dashboard stay in sync. Live miner logs appear in the separate Miner Output tab, while this template panel is meant for template inspection and copy/export workflows."));
     note->setWordWrap(true);
     root->addWidget(note);
     root->addStretch(1);

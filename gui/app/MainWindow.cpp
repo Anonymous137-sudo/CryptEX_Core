@@ -9,6 +9,7 @@
 #include "views/RpcConsolePage.hpp"
 #include "views/TerminalPage.hpp"
 #include "app/ChatWindow.hpp"
+#include "app/MailWindow.hpp"
 #include "app/NodeWindow.hpp"
 #include "app/WalletManagerWindow.hpp"
 
@@ -236,6 +237,17 @@ bool isAddressInUseError(const QString& line) {
            line.contains(QStringLiteral("bind:"), Qt::CaseInsensitive);
 }
 
+bool looksLikeBackendFailureLine(const QString& line) {
+    const auto lowered = line.toLower();
+    return lowered.contains(QStringLiteral("failed")) ||
+           lowered.contains(QStringLiteral("error")) ||
+           lowered.contains(QStringLiteral("crash")) ||
+           lowered.contains(QStringLiteral("fatal")) ||
+           lowered.contains(QStringLiteral("exception")) ||
+           lowered.contains(QStringLiteral("unable")) ||
+           lowered.contains(QStringLiteral("not found"));
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -246,6 +258,18 @@ MainWindow::MainWindow(QWidget* parent)
     setBackendState(QStringLiteral("Checking backend..."));
 
     connect(&daemon_, &DaemonController::stateChanged, this, [this](bool running) {
+        if (backendBootstrapInProgress_ && !running) {
+            if (backendPortConflictPending_) {
+                setBackendState(QStringLiteral("Existing backend detected"));
+                return;
+            }
+            ++backendBootstrapGeneration_;
+            const auto detail = backendStartupFailureText_.isEmpty()
+                ? QStringLiteral("The backend stopped before the local RPC server became available. Check the System Log for the launch error.")
+                : backendStartupFailureText_;
+            showBackendStartupFailure(detail);
+            return;
+        }
         if (backendBootstrapInProgress_ && running) {
             setBackendState(QStringLiteral("Backend process started, waiting for RPC..."));
         } else if (running) {
@@ -257,16 +281,26 @@ MainWindow::MainWindow(QWidget* parent)
     connect(&daemon_, &DaemonController::outputLine, this, [this](const QString& line) {
         systemLogView_->appendPlainText(QStringLiteral("[daemon] ") + line);
         if (isAddressInUseError(line)) {
-            handleBackendPortConflict();
+            handleBackendPortConflict(line.trimmed());
+        } else if (backendBootstrapInProgress_ && looksLikeBackendFailureLine(line)) {
+            backendStartupFailureText_ = line.trimmed();
         }
     });
     connect(&daemon_, &DaemonController::errorLine, this, [this](const QString& line) {
         systemLogView_->appendPlainText(QStringLiteral("[daemon-error] ") + line);
         if (isAddressInUseError(line)) {
-            handleBackendPortConflict();
+            handleBackendPortConflict(line.trimmed());
+        } else if (backendBootstrapInProgress_ && looksLikeBackendFailureLine(line)) {
+            backendStartupFailureText_ = line.trimmed();
+            ++backendBootstrapGeneration_;
+            showBackendStartupFailure(backendStartupFailureText_);
         }
     });
     connect(&miner_, &MinerController::stateChanged, this, [this](bool running) {
+        if (running == minerProcessRunning_) {
+            return;
+        }
+        minerProcessRunning_ = running;
         minerOutputView_->appendPlainText(running ? QStringLiteral("[miner] process started")
                                                   : QStringLiteral("[miner] process stopped"));
     });
@@ -348,6 +382,7 @@ void MainWindow::buildUi() {
     openNodeAction_ = windowMenu->addAction(QStringLiteral("Node Window"));
     auto* openWalletManagerAction = windowMenu->addAction(QStringLiteral("Wallet Manager"));
     openChatAction_ = windowMenu->addAction(QStringLiteral("P2P Messenger"));
+    openMailAction_ = windowMenu->addAction(QStringLiteral("P2P Mail Service"));
     auto* refreshAction = fileMenu->addAction(QStringLiteral("Refresh"));
     advancedModeAction_ = settingsMenu->addAction(QStringLiteral("Advanced Mode"));
     advancedModeAction_->setCheckable(true);
@@ -387,6 +422,7 @@ void MainWindow::buildUi() {
     minerOutputPage_ = new QWidget(this);
     nodeWindow_ = new NodeWindow(this);
     chatWindow_ = new ChatWindow(this);
+    mailWindow_ = new MailWindow(this);
     walletManagerWindow_ = new WalletManagerWindow(this);
 
     dashboardPage_->setRpcClient(&rpc_);
@@ -398,6 +434,7 @@ void MainWindow::buildUi() {
     miningPage_->setRpcClient(&rpc_);
     rpcConsolePage_->setRpcClient(&rpc_);
     chatWindow_->setRpcClient(&rpc_);
+    mailWindow_->setRpcClient(&rpc_);
     miningPage_->setMinerController(&miner_);
     connect(walletPage_, &WalletPage::walletTypeChanged, this, [this]() {
         refreshWalletSessionState();
@@ -446,7 +483,7 @@ void MainWindow::buildUi() {
 
     miningPage_->setBaseLaunchConfigProvider([this]() {
         MinerController::LaunchConfig config;
-        config.executablePath = daemonPathEdit_->text().trimmed();
+        config.executablePath = guessedDaemonPath();
         config.network = networkCombo_->currentText();
         config.dataDir = dataDirEdit_->text().trimmed();
         return config;
@@ -460,7 +497,7 @@ void MainWindow::buildUi() {
     auto* interfaceLayout = new QVBoxLayout(interfaceBox);
     interfaceLayout->setContentsMargins(12, 12, 12, 12);
     interfaceLayout->setSpacing(8);
-    auto* advancedHint = new QLabel(QStringLiteral("Advanced Mode unlocks expert tooling like the Node Window, P2P Messenger, and related network controls. Leave it off for the simplified wallet-first view."), interfaceBox);
+    auto* advancedHint = new QLabel(QStringLiteral("Advanced Mode unlocks expert tooling like the Node Window, P2P Messenger, P2P Mail Service, and related network controls. Leave it off for the simplified wallet-first view."), interfaceBox);
     advancedHint->setWordWrap(true);
     interfaceLayout->addWidget(advancedModeCheck_);
     interfaceLayout->addWidget(advancedHint);
@@ -726,6 +763,11 @@ void MainWindow::buildUi() {
     chatWindowButton_->setAutoRaise(true);
     chatWindowButton_->setToolTip(QStringLiteral("Open P2P Messenger"));
     cornerLayout->addWidget(chatWindowButton_);
+    mailWindowButton_ = new QToolButton(cornerWidget);
+    mailWindowButton_->setIcon(makeAdaptiveIcon(QStringLiteral(":/branding/icons/receive.png"), iconTint, QSize(18, 18)));
+    mailWindowButton_->setAutoRaise(true);
+    mailWindowButton_->setToolTip(QStringLiteral("Open P2P Mail Service"));
+    cornerLayout->addWidget(mailWindowButton_);
     tabs_->setCornerWidget(cornerWidget, Qt::TopRightCorner);
 
     daemonStatusLabel_ = new QLabel(QStringLiteral("Node: stopped"), this);
@@ -883,6 +925,7 @@ void MainWindow::buildUi() {
     connect(openNodeAction_, &QAction::triggered, this, [this]() { openNodeWindow(); });
     connect(openWalletManagerAction, &QAction::triggered, this, [this]() { openWalletManagerWindow(); });
     connect(openChatAction_, &QAction::triggered, this, [this]() { openChatWindow(); });
+    connect(openMailAction_, &QAction::triggered, this, [this]() { openMailWindow(); });
     connect(refreshAction, &QAction::triggered, this, [this]() { refreshAll(); });
     connect(advancedModeAction_, &QAction::toggled, this, [this](bool enabled) { setAdvancedModeEnabled(enabled); });
     connect(advancedModeCheck_, &QCheckBox::toggled, this, [this](bool enabled) { setAdvancedModeEnabled(enabled); });
@@ -895,9 +938,11 @@ void MainWindow::buildUi() {
     });
     connect(nodeWindowButton_, &QToolButton::clicked, this, [this]() { openNodeWindow(); });
     connect(chatWindowButton_, &QToolButton::clicked, this, [this]() { openChatWindow(); });
+    connect(mailWindowButton_, &QToolButton::clicked, this, [this]() { openMailWindow(); });
     connect(tabs_, &QTabWidget::currentChanged, this, [this](int) { refreshCurrentMainTab(); });
     connect(nodeWindow_, &NodeWindow::sectionChanged, this, [this](const QString&) { refreshVisibleNodeSection(); });
     connect(chatWindow_, &ChatWindow::sectionChanged, this, [this](const QString&) { refreshVisibleChatSection(); });
+    connect(mailWindow_, &MailWindow::sectionChanged, this, [this](const QString&) { refreshVisibleMailSection(); });
     connect(connectButton, &QPushButton::clicked, this, [this]() {
         systemLogView_->appendPlainText(QStringLiteral("[gui] Connect requested for %1").arg(rpcUrlEdit_->text().trimmed()));
         applyAutomaticBackendDefaults();
@@ -1359,6 +1404,33 @@ void MainWindow::refreshSyncState() {
         startupLockedBalanceLabel_->setText(QStringLiteral("-"));
         setStartupProgressBusy(true, QStringLiteral("Starting..."));
         updateSyncStatusBar(QStringLiteral("Synchronizing with network..."), true);
+        syncOverlayPinned_ = true;
+        setStartupOverlayVisible(true);
+        updateStatusIcons();
+        return;
+    }
+
+    if (backendStartupFailed_) {
+        startupIntroLabel_->setText(QStringLiteral("CryptEX could not start or attach to the backend."));
+        startupSummaryLabel_->setText(backendStartupFailureText_.isEmpty()
+            ? QStringLiteral("Check the System Log below for the launch error, then retry once the backend configuration is corrected.")
+            : backendStartupFailureText_);
+        startupBlocksLeftLabel_->setText(QStringLiteral("-"));
+        startupLastBlockLabel_->setText(QStringLiteral("-"));
+        startupProgressLabel_->setText(QStringLiteral("Failed"));
+        startupRateLabel_->setText(QStringLiteral("-"));
+        startupEtaLabel_->setText(QStringLiteral("-"));
+        startupStateLabel_->setText(QStringLiteral("Backend startup failed"));
+        startupApprovalLabel_->setText(QStringLiteral("Unavailable"));
+        startupValidatedPeersLabel_->setText(QStringLiteral("0 validated / 0 connected"));
+        startupLockedBalanceLabel_->setText(QStringLiteral("-"));
+        setStartupProgressBusy(false);
+        if (startupProgressBar_) {
+            startupProgressBar_->setRange(0, 1000);
+            startupProgressBar_->setValue(0);
+            startupProgressBar_->setFormat(QStringLiteral("Failed"));
+        }
+        updateSyncStatusBar(QStringLiteral("Backend startup failed"), false, 0.0);
         syncOverlayPinned_ = true;
         setStartupOverlayVisible(true);
         updateStatusIcons();
@@ -2041,6 +2113,9 @@ void MainWindow::bootstrapBackendAndRefresh(int retries, int generation) {
             if (generation != backendBootstrapGeneration_) {
                 return;
             }
+            backendPortConflictPending_ = false;
+            backendPortConflictDetail_.clear();
+            clearBackendStartupFailure();
             backendBootstrapInProgress_ = false;
             setBackendState(QStringLiteral("Connected"));
             setConnectionStatus(QStringLiteral("Connected to cryptexd backend."));
@@ -2055,6 +2130,33 @@ void MainWindow::bootstrapBackendAndRefresh(int retries, int generation) {
             const auto daemonPath = daemonPathEdit_->text().trimmed();
             const bool authError = isRpcAuthError(error);
             const bool retryableStartupError = isRetryableRpcStartupError(error);
+
+            if (backendPortConflictPending_) {
+                if (retries > 0) {
+                    backendBootstrapInProgress_ = true;
+                    setBackendState(QStringLiteral("Existing backend detected"));
+                    const auto detail = backendPortConflictDetail_.isEmpty()
+                        ? QStringLiteral("Ports are already in use. Trying to attach to an existing backend before giving up.")
+                        : backendPortConflictDetail_;
+                    setConnectionStatus(detail);
+                    refreshSyncState();
+                    QTimer::singleShot(1000, this, [this, retries, generation]() {
+                        if (generation == backendBootstrapGeneration_) {
+                            bootstrapBackendAndRefresh(retries - 1, generation);
+                        }
+                    });
+                    return;
+                }
+
+                backendPortConflictPending_ = false;
+                const auto detail = backendPortConflictDetail_.isEmpty()
+                    ? QStringLiteral("Another process is already using one of the configured CryptEX ports. Stop the existing process or change the node/RPC ports, then try again.")
+                    : QStringLiteral("%1\n\nAnother process is already using one of the configured CryptEX ports. Stop the existing process or change the node/RPC ports, then try again.")
+                          .arg(backendPortConflictDetail_);
+                showBackendStartupFailure(detail);
+                refreshSyncState();
+                return;
+            }
 
             if (!authError && !daemon_.isRunning() && !daemonPath.isEmpty() && retryableStartupError) {
                 backendBootstrapInProgress_ = true;
@@ -2079,11 +2181,14 @@ void MainWindow::bootstrapBackendAndRefresh(int retries, int generation) {
             backendBootstrapInProgress_ = false;
             setBackendState(QStringLiteral("Backend unavailable"), true);
             if (authError) {
-                setConnectionStatus(QStringLiteral("RPC rejected the connection. Check the local RPC user/password in Settings or cryptex.conf."), true);
+                const auto detail = QStringLiteral("RPC rejected the connection. Check the local RPC user/password in Settings or cryptex.conf.");
+                setConnectionStatus(detail, true);
                 systemLogView_->appendPlainText(QStringLiteral("[gui] RPC auth rejected: %1").arg(error));
+                showBackendStartupFailure(detail);
             } else {
                 setConnectionStatus(error, true);
                 systemLogView_->appendPlainText(QStringLiteral("[gui] RPC connection failed: %1").arg(error));
+                showBackendStartupFailure(error);
             }
             refreshSyncState();
         });
@@ -2099,6 +2204,53 @@ void MainWindow::setBackendState(const QString& text, bool error) {
     } else {
         daemonStatusLabel_->setStyleSheet(QStringLiteral("color:#8ed0a2; font-weight:600;"));
     }
+}
+
+void MainWindow::showBackendStartupFailure(const QString& detail) {
+    backendBootstrapInProgress_ = false;
+    backendStartupFailed_ = true;
+    backendStartupFailureText_ = detail.trimmed();
+    backendPortConflictPending_ = false;
+    approvalKnown_ = false;
+    chainApproved_ = false;
+    lockedBalanceSats_ = 0;
+    validatedPeerCount_ = 0;
+    networkSyncing_ = false;
+    connectedPeerCount_ = 0;
+    networkActive_ = false;
+    setBackendState(QStringLiteral("Backend stopped"), true);
+    setConnectionStatus(backendStartupFailureText_.isEmpty()
+        ? QStringLiteral("Backend startup failed.")
+        : backendStartupFailureText_, true);
+    startupIntroLabel_->setText(QStringLiteral("CryptEX could not start or attach to the backend."));
+    startupSummaryLabel_->setText(backendStartupFailureText_.isEmpty()
+        ? QStringLiteral("Check the System Log below for the launch error, then retry once the backend configuration is corrected.")
+        : backendStartupFailureText_);
+    startupBlocksLeftLabel_->setText(QStringLiteral("-"));
+    startupLastBlockLabel_->setText(QStringLiteral("-"));
+    startupProgressLabel_->setText(QStringLiteral("Failed"));
+    startupRateLabel_->setText(QStringLiteral("-"));
+    startupEtaLabel_->setText(QStringLiteral("-"));
+    startupStateLabel_->setText(QStringLiteral("Backend startup failed"));
+    startupApprovalLabel_->setText(QStringLiteral("Unavailable"));
+    startupValidatedPeersLabel_->setText(QStringLiteral("0 validated / 0 connected"));
+    startupLockedBalanceLabel_->setText(QStringLiteral("-"));
+    setStartupProgressBusy(false);
+    if (startupProgressBar_) {
+        startupProgressBar_->setRange(0, 1000);
+        startupProgressBar_->setValue(0);
+        startupProgressBar_->setFormat(QStringLiteral("Failed"));
+    }
+    updateSyncStatusBar(QStringLiteral("Backend startup failed"), false, 0.0);
+    syncOverlayPinned_ = true;
+    setStartupOverlayVisible(true);
+    updateApprovalIndicators();
+    updateStatusIcons();
+}
+
+void MainWindow::clearBackendStartupFailure() {
+    backendStartupFailed_ = false;
+    backendStartupFailureText_.clear();
 }
 
 void MainWindow::setAdvancedModeEnabled(bool enabled) {
@@ -2123,11 +2275,18 @@ void MainWindow::applyAdvancedModeUi() {
         openChatAction_->setVisible(advancedModeEnabled_);
         openChatAction_->setEnabled(advancedModeEnabled_);
     }
+    if (openMailAction_) {
+        openMailAction_->setVisible(advancedModeEnabled_);
+        openMailAction_->setEnabled(advancedModeEnabled_);
+    }
     if (nodeWindowButton_) {
         nodeWindowButton_->setVisible(advancedModeEnabled_);
     }
     if (chatWindowButton_) {
         chatWindowButton_->setVisible(advancedModeEnabled_);
+    }
+    if (mailWindowButton_) {
+        mailWindowButton_->setVisible(advancedModeEnabled_);
     }
     if (peerActivityButton_) {
         peerActivityButton_->setVisible(advancedModeEnabled_);
@@ -2138,6 +2297,7 @@ void MainWindow::applyAdvancedModeUi() {
     if (!advancedModeEnabled_) {
         if (nodeWindow_) nodeWindow_->hide();
         if (chatWindow_) chatWindow_->hide();
+        if (mailWindow_) mailWindow_->hide();
     }
 }
 
@@ -2171,6 +2331,18 @@ void MainWindow::openChatWindow(const QString& section) {
     }
     chatWindow_->showSection(section);
     refreshVisibleChatSection();
+}
+
+void MainWindow::openMailWindow(const QString& section) {
+    if (!advancedModeEnabled_) {
+        setConnectionStatus(QStringLiteral("Enable Advanced Mode to open P2P Mail Service."));
+        return;
+    }
+    if (!mailWindow_) {
+        return;
+    }
+    mailWindow_->showSection(section);
+    refreshVisibleMailSection();
 }
 
 void MainWindow::refreshNodeInformation() {
@@ -2260,6 +2432,7 @@ void MainWindow::refreshAll() {
     refreshVisibleNodeSection();
     refreshVisibleWalletManager();
     refreshVisibleChatSection();
+    refreshVisibleMailSection();
 }
 
 void MainWindow::refreshCurrentMainTab() {
@@ -2316,6 +2489,13 @@ void MainWindow::refreshVisibleChatSection() {
         return;
     }
     chatWindow_->refreshCurrentSection();
+}
+
+void MainWindow::refreshVisibleMailSection() {
+    if (!mailWindow_ || !mailWindow_->isVisible()) {
+        return;
+    }
+    mailWindow_->refreshCurrentSection();
 }
 
 void MainWindow::refreshCheckpointManager() {
@@ -2433,8 +2613,10 @@ void MainWindow::reconcilePendingMinedBlocks() {
                     [this, height, submitNext, path](const QJsonValue& response) {
                         const auto status = response.toString();
                         systemLogView_->appendPlainText(QStringLiteral("[gui] reconciled mined block height %1 -> %2").arg(height).arg(status));
-                        // FIX: Remove file after successful submission
-                        if (status == QStringLiteral("accepted") || status == QStringLiteral("duplicate")) {
+                        // Remove replay entries once the backend has conclusively classified them.
+                        if (status == QStringLiteral("accepted") ||
+                            status == QStringLiteral("duplicate") ||
+                            status == QStringLiteral("rejected")) {
                             QFile::remove(path);
                         }
                         (*submitNext)();
@@ -2479,6 +2661,9 @@ void MainWindow::startBackend() {
     systemLogView_->appendPlainText(QStringLiteral("[gui] Start Backend requested"));
     ++backendBootstrapGeneration_;
     const int bootstrapGeneration = backendBootstrapGeneration_;
+    backendPortConflictPending_ = false;
+    backendPortConflictDetail_.clear();
+    clearBackendStartupFailure();
     applyAutomaticBackendDefaults();
     applyConfigBackedDefaults();
     if (rpcUserEdit_->text().trimmed().isEmpty()) {
@@ -2499,6 +2684,8 @@ void MainWindow::startBackend() {
             if (bootstrapGeneration != backendBootstrapGeneration_) {
                 return;
             }
+            backendPortConflictPending_ = false;
+            backendPortConflictDetail_.clear();
             backendBootstrapInProgress_ = false;
             setBackendState(QStringLiteral("Connected"));
             setConnectionStatus(QStringLiteral("Existing cryptexd backend is already running. Attached without starting a second node."));
@@ -2558,7 +2745,13 @@ void MainWindow::launchBackendProcess() {
     } else if (config.connectTargets.isEmpty()) {
         systemLogView_->appendPlainText(QStringLiteral("[gui] No manual peers configured; using built-in automatic global peer discovery."));
     }
-    daemon_.startNode(config);
+    clearBackendStartupFailure();
+    backendPortConflictPending_ = false;
+    backendPortConflictDetail_.clear();
+    if (!daemon_.startNode(config)) {
+        showBackendStartupFailure(QStringLiteral("CryptEX could not launch the backend process. Check the daemon path and local permissions."));
+        return;
+    }
     backendBootstrapInProgress_ = true;
     syncOverlayDismissed_ = false;
     syncOverlayPinned_ = true;
@@ -2578,10 +2771,13 @@ void MainWindow::launchBackendProcess() {
     });
 }
 
-void MainWindow::handleBackendPortConflict() {
-    backendBootstrapInProgress_ = false;
+void MainWindow::handleBackendPortConflict(const QString& detail) {
+    backendPortConflictPending_ = true;
+    backendPortConflictDetail_ = detail.trimmed();
+    clearBackendStartupFailure();
+    backendBootstrapInProgress_ = true;
     setBackendState(QStringLiteral("Existing backend detected"));
-    setConnectionStatus(QStringLiteral("Ports are already in use by another cryptexd instance. Trying to attach to the existing backend."));
+    setConnectionStatus(QStringLiteral("Ports are already in use. Trying to attach to an existing backend."));
     const int bootstrapGeneration = backendBootstrapGeneration_;
     QTimer::singleShot(250, this, [this, bootstrapGeneration]() {
         if (bootstrapGeneration == backendBootstrapGeneration_) {
@@ -2594,6 +2790,9 @@ void MainWindow::stopBackend() {
     ++backendBootstrapGeneration_;
     daemon_.stopNode();
     backendBootstrapInProgress_ = false;
+    backendPortConflictPending_ = false;
+    backendPortConflictDetail_.clear();
+    clearBackendStartupFailure();
     syncOverlayDismissed_ = false;
     syncOverlayPinned_ = false;
     connectedPeerCount_ = 0;

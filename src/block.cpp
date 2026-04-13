@@ -27,6 +27,49 @@ uint256_t clamp_to_pow_limit(const uint256_t& target) {
     return target > pow_limit ? pow_limit : target;
 }
 
+bool is_emergency_min_difficulty_block(const BlockHeader& previous,
+                                       const BlockHeader& current) {
+    return params().emergency_min_difficulty_delay_seconds > 0 &&
+           current.bits == pow_limit_bits() &&
+           current.timestamp >=
+               previous.timestamp + params().emergency_min_difficulty_delay_seconds;
+}
+
+uint32_t last_non_emergency_bits(const std::map<uint64_t, uint256_t>& height_map,
+                                 const std::unordered_map<uint256_t, BlockHeader>& index,
+                                 uint64_t best_height,
+                                 uint32_t fallback_bits) {
+    if (best_height == 0) return fallback_bits;
+
+    for (uint64_t cursor = best_height; cursor > 0; --cursor) {
+        const auto& current_hash = height_map.at(cursor);
+        const auto& previous_hash = height_map.at(cursor - 1);
+        const auto& current_header = index.at(current_hash);
+        const auto& previous_header = index.at(previous_hash);
+        if (!is_emergency_min_difficulty_block(previous_header, current_header)) {
+            return current_header.bits;
+        }
+    }
+    return fallback_bits;
+}
+
+bool pow_target_valid(uint32_t bits, uint256_t* out_target = nullptr) {
+    compact_target compact{bits};
+    if (compact.is_negative() || compact.is_zero() ||
+        compact.overflows(constants::POW_HASH_BYTES)) {
+        return false;
+    }
+
+    uint256_t target = compact.expand();
+    if (target == uint256_t()) return false;
+    if (target > compact_target{pow_limit_bits()}.expand()) return false;
+
+    if (out_target) {
+        *out_target = std::move(target);
+    }
+    return true;
+}
+
 } // namespace
 
 // -------------------------------------------------------------------
@@ -141,7 +184,10 @@ Block Block::deserialize(const uint8_t*& data, size_t& remaining) {
 }
 
 bool Block::check_pow() const {
-    uint256_t target = compact_target{header.bits}.expand();
+    uint256_t target;
+    if (!pow_target_valid(header.bits, &target)) {
+        return false;
+    }
     auto h = header.pow_hash();
     return h <= target;  // using uint256_t operator<=
 }
@@ -217,6 +263,9 @@ uint32_t get_next_work_required(const std::map<uint64_t, uint256_t>& height_map,
     const int64_t candidate_gap = clamp_solvetime(
         static_cast<int64_t>(effective_candidate_timestamp) -
         static_cast<int64_t>(last_header.timestamp));
+    const bool last_was_emergency =
+        best_height > 0 &&
+        is_emergency_min_difficulty_block(index.at(height_map.at(best_height - 1)), last_header);
 
     if (params().allow_min_difficulty_blocks) {
         if (effective_candidate_timestamp > last_header.timestamp + constants::BLOCK_TIME_SECONDS * 2) {
@@ -230,13 +279,25 @@ uint32_t get_next_work_required(const std::map<uint64_t, uint256_t>& height_map,
         return pow_limit_bits();
     }
 
+    const uint32_t stable_last_bits =
+        last_was_emergency ? last_non_emergency_bits(height_map, index, best_height, last_bits)
+                           : last_bits;
+    const uint256_t stable_last_target = compact_target{stable_last_bits}.expand();
+
+    // Once the stalled network has been rescued by an emergency min-difficulty block,
+    // immediately snap follow-up work back to the last stable non-emergency difficulty.
+    if (last_was_emergency) {
+        return stable_last_bits;
+    }
+
     const uint64_t window = std::min<uint64_t>(best_height, constants::DIFFICULTY_LWMA_WINDOW);
     if (window < 6)
-        return last_bits;
+        return stable_last_bits;
 
     uint64_t weighted_solvetime = 0;
     uint64_t total_weight = 0;
     uint256_t weighted_targets(uint64_t{0});
+    uint256_t last_stable_target = compact_target{index.at(height_map.at(best_height - window)).bits}.expand();
 
     for (uint64_t offset = 0; offset < window; ++offset) {
         uint64_t current_height = best_height - window + 1 + offset;
@@ -249,11 +310,21 @@ uint32_t get_next_work_required(const std::map<uint64_t, uint256_t>& height_map,
         int64_t solvetime = clamp_solvetime(
             static_cast<int64_t>(current_header.timestamp) -
             static_cast<int64_t>(previous_header.timestamp));
+        uint256_t sample_target = compact_target{current_header.bits}.expand();
+
+        if (is_emergency_min_difficulty_block(previous_header, current_header)) {
+            // Treat emergency rescue blocks as neutral history samples so they do not
+            // drag the next several retargets back toward pow-limit difficulty.
+            solvetime = constants::BLOCK_TIME_SECONDS;
+            sample_target = last_stable_target;
+        } else {
+            last_stable_target = sample_target;
+        }
 
         uint64_t weight = offset + 1;
         weighted_solvetime += static_cast<uint64_t>(solvetime) * weight;
         total_weight += weight;
-        weighted_targets += compact_target{current_header.bits}.expand() * uint256_t(weight);
+        weighted_targets += sample_target * uint256_t(weight);
     }
 
     uint256_t average_target = weighted_targets / uint256_t(total_weight);
@@ -294,7 +365,7 @@ uint32_t get_next_work_required(const std::map<uint64_t, uint256_t>& height_map,
             ((alpha_den - alpha_num) * ema_solvetime +
              alpha_num * static_cast<uint64_t>(candidate_gap) * kScale) / alpha_den;
 
-        uint256_t ema_target = compact_target{last_bits}.expand() * uint256_t(ema_solvetime);
+        uint256_t ema_target = stable_last_target * uint256_t(ema_solvetime);
         ema_target /= uint256_t(static_cast<uint64_t>(constants::BLOCK_TIME_SECONDS) * kScale);
 
         if (ema_target > next_target) {
@@ -303,7 +374,7 @@ uint32_t get_next_work_required(const std::map<uint64_t, uint256_t>& height_map,
     }
 
     if (candidate_gap > constants::BLOCK_TIME_SECONDS) {
-        uint256_t realtime_target = compact_target{last_bits}.expand() * uint256_t(static_cast<uint64_t>(candidate_gap));
+        uint256_t realtime_target = stable_last_target * uint256_t(static_cast<uint64_t>(candidate_gap));
         realtime_target /= uint256_t(static_cast<uint64_t>(constants::BLOCK_TIME_SECONDS));
         if (realtime_target > next_target) {
             next_target = realtime_target;

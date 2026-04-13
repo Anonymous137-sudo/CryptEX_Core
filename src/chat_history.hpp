@@ -25,6 +25,10 @@ struct HistoryEntry {
     std::string recipient_address;
     std::string recipient_pubkey;
     std::string channel;
+    std::string subject;
+    std::string mail_to;
+    std::string mail_cc;
+    std::string mail_bcc;
     std::string message;
     std::string peer_label;
     std::string status;

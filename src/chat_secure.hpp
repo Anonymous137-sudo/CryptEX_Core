@@ -14,6 +14,7 @@ constexpr uint8_t CHAT_TYPE_PUBLIC = 0;
 constexpr uint8_t CHAT_TYPE_PRIVATE = 1;
 constexpr uint8_t CHAT_TYPE_VOICE_CONTROL = 2;
 constexpr uint8_t CHAT_TYPE_VOICE_FRAME = 3;
+constexpr uint8_t CHAT_TYPE_MAIL = 4;
 
 enum class KeyDerivation : uint8_t {
     LegacySha3 = 0,

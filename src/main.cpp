@@ -15,6 +15,8 @@
 #include "serialization.hpp"
 #include <chrono>
 #include <cstdlib>
+#include <future>
+#include <fstream>
 #include <iostream>
 #include <thread>
 #include <string>
@@ -28,6 +30,14 @@
 #include <mutex>
 #include <sstream>
 #include <iomanip>
+#include <cerrno>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
 #include <boost/asio.hpp>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -350,6 +360,65 @@ static std::filesystem::path prepare_data_dir(std::filesystem::path path) {
     return path;
 }
 
+static std::filesystem::path locate_external_powminer_binary(const char* argv0) {
+    std::error_code ec;
+    std::filesystem::path binary_path = std::filesystem::absolute(argv0, ec);
+    if (!ec) binary_path = binary_path.lexically_normal();
+    std::filesystem::path binary_dir = ec ? std::filesystem::current_path() : binary_path.parent_path();
+    if (binary_dir.empty()) binary_dir = std::filesystem::current_path();
+
+#ifdef _WIN32
+    const std::string binary_name = "cryptex_powminer_win32.exe";
+#elif defined(__APPLE__)
+    const std::string binary_name = "cryptex_powminer_osx";
+#else
+    const std::string binary_name = "cryptex_powminer_linux";
+#endif
+    const std::vector<std::filesystem::path> candidates{
+        binary_dir / binary_name,
+        binary_dir.parent_path() / binary_name
+    };
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+static int run_external_process_wait(const std::filesystem::path& executable,
+                                     const std::vector<std::string>& args) {
+    if (executable.empty()) {
+        return 127;
+    }
+    std::vector<std::string> storage;
+    storage.reserve(args.size() + 1);
+    storage.push_back(executable.string());
+    storage.insert(storage.end(), args.begin(), args.end());
+    std::vector<char*> argv_ptrs;
+    argv_ptrs.reserve(storage.size() + 1);
+    for (auto& value : storage) {
+        argv_ptrs.push_back(value.data());
+    }
+    argv_ptrs.push_back(nullptr);
+#ifdef _WIN32
+    return _spawnv(_P_WAIT, executable.string().c_str(), argv_ptrs.data());
+#else
+    pid_t pid = 0;
+    const int spawn_rc = posix_spawn(&pid, executable.string().c_str(), nullptr, nullptr, argv_ptrs.data(), environ);
+    if (spawn_rc != 0) {
+        return spawn_rc;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return errno != 0 ? errno : 1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return status;
+#endif
+}
+
 struct GlobalCliOptions {
     std::optional<NetworkKind> network;
     std::optional<std::filesystem::path> datadir;
@@ -594,6 +663,137 @@ static std::array<uint8_t, 80> serialize_header_fast(const BlockHeader& header) 
     return buffer;
 }
 
+struct PowAsmWorkerJob {
+    std::array<uint8_t, 80> header{};
+    std::array<uint8_t, constants::POW_HASH_BYTES> target{};
+    uint32_t start_nonce{0};
+    uint32_t nonce_step{1};
+    uint64_t max_iterations{0};
+};
+
+struct PowAsmWorkerResult {
+    bool ok{false};
+    bool found{false};
+    uint32_t nonce{0};
+    uint64_t iterations{0};
+    std::array<uint8_t, constants::POW_HASH_BYTES> hash{};
+    std::string error;
+};
+
+static constexpr char kPowAsmJobMagic[8] = {'C','R','X','P','O','W','2','!'};
+static constexpr char kPowAsmResultMagic[8] = {'C','R','X','R','E','S','2','!'};
+
+static void append_u32_le(std::vector<uint8_t>& out, uint32_t value) {
+    out.push_back(static_cast<uint8_t>(value & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+static void append_u64_le(std::vector<uint8_t>& out, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    }
+}
+
+static uint32_t read_u32_le(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+           (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) |
+           (static_cast<uint32_t>(data[3]) << 24);
+}
+
+static uint64_t read_u64_le(const uint8_t* data) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(data[i]) << (i * 8);
+    }
+    return value;
+}
+
+static std::vector<uint8_t> encode_pow_asm_job(const PowAsmWorkerJob& job) {
+    std::vector<uint8_t> encoded;
+    encoded.reserve(168);
+    encoded.insert(encoded.end(), std::begin(kPowAsmJobMagic), std::end(kPowAsmJobMagic));
+    encoded.insert(encoded.end(), job.header.begin(), job.header.end());
+    encoded.insert(encoded.end(), job.target.begin(), job.target.end());
+    append_u32_le(encoded, job.start_nonce);
+    append_u32_le(encoded, job.nonce_step);
+    append_u64_le(encoded, job.max_iterations);
+    return encoded;
+}
+
+static bool write_binary_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return out.good();
+}
+
+static std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+static std::filesystem::path make_pow_asm_temp_path(const std::filesystem::path& dir,
+                                                    const char* kind,
+                                                    uint64_t block_index,
+                                                    unsigned worker_id) {
+    const auto tick = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::ostringstream name;
+    name << kind << "-" << block_index << "-" << worker_id << "-" << tick;
+    return dir / name.str();
+}
+
+static PowAsmWorkerResult run_pow_asm_worker(const std::filesystem::path& miner_path,
+                                             const std::filesystem::path& work_dir,
+                                             uint64_t block_index,
+                                             unsigned worker_id,
+                                             const PowAsmWorkerJob& job) {
+    PowAsmWorkerResult result;
+    std::error_code ec;
+    std::filesystem::create_directories(work_dir, ec);
+    const auto job_path = make_pow_asm_temp_path(work_dir, "powjob", block_index, worker_id);
+    const auto result_path = make_pow_asm_temp_path(work_dir, "powresult", block_index, worker_id);
+    const auto cleanup = [&]() {
+        std::filesystem::remove(job_path, ec);
+        std::filesystem::remove(result_path, ec);
+    };
+
+    if (!write_binary_file(job_path, encode_pow_asm_job(job))) {
+        result.error = "failed to write assembly miner job file";
+        cleanup();
+        return result;
+    }
+
+    const int rc = run_external_process_wait(miner_path, {job_path.string(), result_path.string()});
+    if (rc != 0) {
+        result.error = "assembly miner exited with code " + std::to_string(rc);
+        cleanup();
+        return result;
+    }
+
+    auto payload = read_binary_file(result_path);
+    cleanup();
+    if (payload.size() != 88) {
+        result.error = "assembly miner returned malformed result payload";
+        return result;
+    }
+    if (!std::equal(std::begin(kPowAsmResultMagic), std::end(kPowAsmResultMagic), payload.begin())) {
+        result.error = "assembly miner returned unexpected result magic";
+        return result;
+    }
+
+    result.ok = true;
+    result.found = read_u32_le(payload.data() + 8) != 0;
+    result.nonce = read_u32_le(payload.data() + 12);
+    result.iterations = read_u64_le(payload.data() + 16);
+    std::memcpy(result.hash.data(), payload.data() + 24, result.hash.size());
+    return result;
+}
+
 static bool hash_meets_target(const std::array<uint8_t, constants::POW_HASH_BYTES>& hash_bytes,
                               const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes) {
     return std::memcmp(hash_bytes.data(), target_bytes.data(), hash_bytes.size()) <= 0;
@@ -699,7 +899,10 @@ static Block build_template(Blockchain& chain, const std::string& coinbase_addr)
     blk.header.version = 1;
     auto prev = chain.get_block(chain.best_height());
     blk.header.prev_block_hash = prev ? prev->header.hash() : uint256_t();
-    blk.header.timestamp = static_cast<uint32_t>(std::time(nullptr));
+    const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+    const uint32_t minimum_timestamp =
+        prev ? static_cast<uint32_t>(prev->header.timestamp + 1U) : now;
+    blk.header.timestamp = std::max(now, minimum_timestamp);
     blk.header.bits = chain.next_work_bits(blk.header.timestamp);
     blk.header.nonce = 0;
 
@@ -725,11 +928,14 @@ static Block build_template(Blockchain& chain, const std::string& coinbase_addr)
     coinbase.lockTime = 0;
     blk.transactions.push_back(coinbase);
 
-    auto txs = chain.mempool().get_transactions();
     size_t total_size = coinbase.serialize().size();
+    auto txs = chain.mempool().get_mineable_transactions(
+        chain.utxo(),
+        static_cast<uint32_t>(height),
+        constants::MAX_BLOCK_SIZE_BYTES,
+        total_size);
     for (const auto& tx : txs) {
         auto sz = tx.serialize().size();
-        if (total_size + sz > constants::MAX_BLOCK_SIZE_BYTES) break;
         blk.transactions.push_back(tx);
         total_size += sz;
     }
@@ -1527,11 +1733,21 @@ int main(int argc, char** argv) {
     if (cycles == 0) infinite = true;
     if (block_cycles == 0) infinite_block_cycles = true;
     set_debug(debug);
-    log_info("mine", "starting miner threads=" + std::to_string(thread_count) +
+    const auto miner_path = locate_external_powminer_binary(argv[0]);
+    if (miner_path.empty()) {
+        std::cerr << "ERROR: assembly miner binary was not found beside the daemon.\n";
+        return 1;
+    }
+    log_info("mine", "orchestrating assembly-only pow worker threads=" + std::to_string(thread_count) +
                      " datadir=" + datadir.string() +
                      " address=" + coinbase_addr +
+                     " worker=" + miner_path.string() +
                      (infinite ? " cycles=infinite" : " cycles=" + std::to_string(cycles)) +
                      (infinite_block_cycles ? " block_cycles=infinite" : " block_cycles=" + std::to_string(block_cycles)));
+    std::cout << "[mine] assembly worker=" << miner_path.string()
+              << " threads=" << thread_count
+              << " datadir=" << datadir.string()
+              << " address=" << coinbase_addr << "\n";
 
     Blockchain chain(datadir);
     if (hostport.empty() && !chain.wallet_state_approved()) {
@@ -1539,31 +1755,38 @@ int main(int argc, char** argv) {
                   << " (network height " << chain.approval_network_height() << ")."
                   << " New rewards will stay locked until the chain catches up or is revalidated.\n";
     }
+
     boost::asio::io_context ctx;
     std::unique_ptr<net::NetworkNode> node;
     std::unique_ptr<std::thread> net_thread;
     if (!hostport.empty()) {
         node = std::make_unique<net::NetworkNode>(ctx, 0, datadir);
         if (auto proxy_value = runtime.config.get_string("proxy")) {
-            if (auto parsed = parse_hostport_value(*proxy_value)) {
-                node->set_socks5_proxy(parsed->first, parsed->second,
+            const auto proxy = *proxy_value;
+            const auto pos = proxy.rfind(':');
+            if (pos != std::string::npos) {
+                const auto proxy_host = proxy.substr(0, pos);
+                const auto proxy_port = static_cast<uint16_t>(std::stoul(proxy.substr(pos + 1)));
+                node->set_socks5_proxy(proxy_host,
+                                       proxy_port,
                                        runtime.config.get_bool("proxydns").value_or(true));
             }
         }
         node->attach_blockchain(&chain);
         node->best_height = chain.best_height();
         node->start();
-        auto pos = hostport.find(':');
+        const auto pos = hostport.find(':');
         if (pos != std::string::npos) {
-            node->connect(hostport.substr(0, pos),
-                         static_cast<uint16_t>(std::stoi(hostport.substr(pos + 1))));
+            node->connect(hostport.substr(0, pos), static_cast<uint16_t>(std::stoi(hostport.substr(pos + 1))));
         }
         net_thread = std::make_unique<std::thread>([&ctx]() { ctx.run(); });
         wait_for_mining_sync(*node, sync_wait_ms, true);
     }
 
+    const auto work_dir = datadir / "powasm_jobs";
     uint64_t blocks_mined = 0;
     bool stopped_without_block = false;
+    bool assembly_failure = false;
 
     while (infinite_block_cycles || blocks_mined < block_cycles) {
         const uint64_t target_index = blocks_mined + 1;
@@ -1579,164 +1802,107 @@ int main(int argc, char** argv) {
                       << " at height " << chain.best_height() + 1 << "\n";
         }
 
-        // Shared mining job state
-        std::atomic<uint64_t> job_version{0};
-        std::mutex job_mutex;
-        Block current_job = build_template(chain, coinbase_addr);
-
-        // Console output mutex
-        std::mutex cout_mutex;
-        std::atomic<size_t> status_width{0};
-
-        // Background thread to refresh the job every 5 seconds
-        std::atomic<bool> refresh_running{true};
-        std::thread refresh_thread([&]() {
-            while (refresh_running) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                auto new_job = build_template(chain, coinbase_addr);
-                bool job_reset_needed = false;
-                {
-                    std::lock_guard<std::mutex> lock(job_mutex);
-                    if (new_job.header.prev_block_hash != current_job.header.prev_block_hash) {
-                        job_reset_needed = true;
-                        current_job = new_job;
-                        job_version++;
-                    } else if (new_job.header.timestamp != current_job.header.timestamp) {
-                        current_job = new_job;
-                    }
-                }
-                if (job_reset_needed && debug_enabled()) {
-                    std::lock_guard<std::mutex> lock(cout_mutex);
-                    std::cout << "\n[refresh] New block received, mining at height " << chain.best_height() + 1 << "\n";
-                }
-            }
-        });
-
-        std::atomic<bool> found{false};
-        std::atomic<uint64_t> iterations{0};
-        std::atomic<uint32_t> found_nonce{0};
-        std::mutex found_mutex;
+        const auto start = std::chrono::steady_clock::now();
+        uint64_t total_iter = 0;
+        uint32_t next_nonce_seed = 0;
+        bool found = false;
+        uint32_t found_nonce = 0;
         Block found_block;
-        uint256_t found_hash;
+        std::array<uint8_t, constants::POW_HASH_BYTES> found_hash{};
+        constexpr uint64_t kChunkIterationsPerWorker = 250000;
 
-        auto start = std::chrono::steady_clock::now();
-        auto last_report_time = start;
-        uint64_t last_report_iter = 0;
-        const auto status_interval = std::chrono::milliseconds(250);
+        while (!found && (infinite || total_iter < cycles)) {
+            auto current_job = build_template(chain, coinbase_addr);
+            auto header_bytes = serialize_header_fast(current_job.header);
+            auto target_vec = compact_target{current_job.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
+            std::array<uint8_t, constants::POW_HASH_BYTES> target_bytes{};
+            std::memcpy(target_bytes.data(), target_vec.data(), target_bytes.size());
 
-        auto worker = [&](unsigned int tid) {
-            Block local_job;
-            std::array<uint8_t, constants::POW_HASH_BYTES> local_target_bytes{};
-            std::array<uint8_t, 80> header_bytes{};
-            crypto::SHA3_512_Hasher prefix_hasher;
-            crypto::SHA3_512_Hasher nonce_hasher;
-            uint32_t nonce = tid;
-            uint64_t local_job_version = 0;
+            const uint64_t remaining = infinite ? 0 : (cycles - total_iter);
+            const uint64_t worker_limit = infinite
+                ? kChunkIterationsPerWorker
+                : std::max<uint64_t>(1, std::min<uint64_t>(
+                    kChunkIterationsPerWorker,
+                    (remaining + static_cast<uint64_t>(thread_count) - 1) / static_cast<uint64_t>(thread_count)));
 
-            {
-                std::lock_guard<std::mutex> lock(job_mutex);
-                local_job = current_job;
-                auto target_vec = compact_target{local_job.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
-                std::memcpy(local_target_bytes.data(), target_vec.data(), local_target_bytes.size());
-                header_bytes = serialize_header_fast(local_job.header);
-                prefix_hasher.reset();
-                prefix_hasher.update(header_bytes.data(), 76);
-                local_job_version = job_version.load();
+            std::vector<std::future<PowAsmWorkerResult>> workers;
+            workers.reserve(thread_count);
+            for (unsigned int tid = 0; tid < thread_count; ++tid) {
+                PowAsmWorkerJob job;
+                job.header = header_bytes;
+                job.target = target_bytes;
+                job.start_nonce = static_cast<uint32_t>(next_nonce_seed + tid);
+                job.nonce_step = thread_count;
+                job.max_iterations = worker_limit;
+                workers.push_back(std::async(std::launch::async,
+                                             run_pow_asm_worker,
+                                             miner_path,
+                                             work_dir,
+                                             target_index,
+                                             tid,
+                                             job));
             }
 
-            while (!found.load(std::memory_order_relaxed) && (infinite || iterations.load(std::memory_order_relaxed) < cycles)) {
-                uint64_t cur_ver = job_version.load();
-                if (cur_ver != local_job_version) {
-                    std::lock_guard<std::mutex> lock(job_mutex);
-                    local_job = current_job;
-                    auto target_vec = compact_target{local_job.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
-                    std::memcpy(local_target_bytes.data(), target_vec.data(), local_target_bytes.size());
-                    header_bytes = serialize_header_fast(local_job.header);
-                    prefix_hasher.reset();
-                    prefix_hasher.update(header_bytes.data(), 76);
-                    local_job_version = cur_ver;
-                    nonce = tid;
+            uint64_t chunk_iter = 0;
+            bool chunk_failure = false;
+            for (auto& future : workers) {
+                auto worker = future.get();
+                if (!worker.ok) {
+                    chunk_failure = true;
+                    assembly_failure = true;
+                    std::cerr << "ERROR: " << worker.error << "\n";
+                    continue;
                 }
-
-                local_job.header.nonce = nonce;
-                write_u32_le(header_bytes, 76, nonce);
-                nonce_hasher.copy_state_from(prefix_hasher);
-                nonce_hasher.update(header_bytes.data() + 76, 4);
-                auto digest = nonce_hasher.finalize();
-                std::array<uint8_t, constants::POW_HASH_BYTES> pow_hash{};
-                std::memcpy(pow_hash.data(), digest.data(), pow_hash.size());
-                uint64_t cur_iter = iterations.fetch_add(1, std::memory_order_relaxed) + 1;
-                bool ok = hash_meets_target(pow_hash, local_target_bytes);
-                if (ok) {
-                    if (!found.exchange(true)) {
-                        std::lock_guard<std::mutex> lk(found_mutex);
-                        found_block = local_job;
-                        found_hash = uint256_t::from_bytes(pow_hash.data(), pow_hash.size());
-                        found_nonce = nonce;
-                    }
-                    break;
+                chunk_iter += worker.iterations;
+                if (worker.found && !found) {
+                    found = true;
+                    found_nonce = worker.nonce;
+                    found_hash = worker.hash;
+                    found_block = current_job;
+                    found_block.header.nonce = found_nonce;
                 }
-                if (debug && tid == 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (now - last_report_time >= status_interval) {
-                        double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_report_time).count();
-                        double rate = secs > 0 ? static_cast<double>(cur_iter - last_report_iter) / secs : 0.0;
-                        std::string line = format_mining_status(cur_iter, nonce, pow_hash, rate);
-                        {
-                            std::lock_guard<std::mutex> lock(cout_mutex);
-                            size_t width = std::max(status_width.load(), line.size());
-                            std::cout << '\r' << line;
-                            if (line.size() < width) {
-                                std::cout << std::string(width - line.size(), ' ');
-                            }
-                            std::cout << std::flush;
-                            status_width = width;
-                        }
-                        last_report_time = now;
-                        last_report_iter = cur_iter;
-                    }
-                }
-                nonce += thread_count;
             }
-        };
 
-        std::vector<std::thread> workers;
-        workers.reserve(thread_count);
-        for (unsigned int t = 0; t < thread_count; ++t) {
-            workers.emplace_back(worker, t);
-        }
-        for (auto& t : workers) t.join();
+            if (chunk_iter == 0 && chunk_failure) {
+                break;
+            }
 
-        refresh_running = false;
-        refresh_thread.join();
+            total_iter += chunk_iter;
+            next_nonce_seed = static_cast<uint32_t>(
+                next_nonce_seed + static_cast<uint32_t>(thread_count * worker_limit));
 
-        if (debug) {
-            std::lock_guard<std::mutex> lock(cout_mutex);
-            std::cout << '\r' << std::string(status_width.load(), ' ') << "\r";
+            if (debug && chunk_iter > 0 && !found) {
+                const auto now = std::chrono::steady_clock::now();
+                const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+                const double rate = secs > 0.0 ? static_cast<double>(total_iter) / secs : 0.0;
+                std::cout << "[mine] iter=" << total_iter
+                          << " next_nonce=" << next_nonce_seed
+                          << " rate=" << format_rate(rate) << "\n";
+            }
         }
 
-        auto end = std::chrono::steady_clock::now();
-        uint64_t total_iter = iterations.load();
-        if (found.load()) {
-            double secs = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
-            double avg_rate = secs > 0 ? static_cast<double>(total_iter) / secs : 0.0;
-            {
-                std::lock_guard<std::mutex> lock(cout_mutex);
-                std::cout << "Found block nonce=" << found_nonce.load()
-                          << " powhash=" << found_hash.to_hex_padded(constants::POW_HASH_BYTES)
-                          << " after " << total_iter << " iterations in "
-                          << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
-                          << " ms using " << thread_count << " threads"
-                          << " avg_rate=" << format_rate(avg_rate) << "\n";
+        const auto end = std::chrono::steady_clock::now();
+        if (found) {
+            const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+            const double avg_rate = secs > 0.0 ? static_cast<double>(total_iter) / secs : 0.0;
+            const auto found_hash_value = uint256_t::from_bytes(found_hash.data(), found_hash.size());
+            std::cout << "Found block nonce=" << found_nonce
+                      << " powhash=" << found_hash_value.to_hex_padded(constants::POW_HASH_BYTES)
+                      << " after " << total_iter << " iterations in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
+                      << " ms using " << thread_count << " assembly workers"
+                      << " avg_rate=" << format_rate(avg_rate) << "\n";
 
-                uint256_t block_target = compact_target{found_block.header.bits}.expand();
-                std::cout << "Target:  " << block_target.to_hex_padded(constants::POW_HASH_BYTES) << std::endl;
-                std::cout << "PoWHash: " << found_hash.to_hex_padded(constants::POW_HASH_BYTES) << std::endl;
-                std::cout << "LinkHash: " << found_block.header.hash().to_hex() << std::endl;
-            }
+            const uint256_t block_target = compact_target{found_block.header.bits}.expand();
+            std::cout << "Target:  " << block_target.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+            std::cout << "PoWHash: " << found_hash_value.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+            std::cout << "LinkHash: " << found_block.header.hash().to_hex() << "\n";
 
-            if (!chain.connect_block(found_block)) {
-                log_warn("mine", "block was found locally but rejected by chain");
+            const auto previous_height = chain.best_height();
+            if (!chain.connect_block(found_block) ||
+                chain.tip_hash() != found_block.header.pow_hash() ||
+                chain.best_height() != previous_height + 1) {
+                log_warn("mine", "block was found by the assembly worker but rejected by chain");
                 std::cerr << "ERROR: Block was rejected by the chain (stale or invalid)!\n";
             } else {
                 bool approved_tip = true;
@@ -1763,13 +1929,13 @@ int main(int argc, char** argv) {
                 }
                 const auto block_bytes = found_block.serialize();
                 std::cout << "MinedBlockHex: " << lower_hex(block_bytes.data(), block_bytes.size()) << "\n";
-            }
-            if (node) {
-                node->best_height = static_cast<uint32_t>(chain.best_height());
-                net::Message msg;
-                msg.type = net::MessageType::BLOCK;
-                msg.payload = found_block.serialize();
-                node->broadcast(msg);
+                if (node) {
+                    node->best_height = static_cast<uint32_t>(chain.best_height());
+                    net::Message msg;
+                    msg.type = net::MessageType::BLOCK;
+                    msg.payload = found_block.serialize();
+                    node->broadcast(msg);
+                }
             }
         } else {
             stopped_without_block = true;
@@ -1792,7 +1958,7 @@ int main(int argc, char** argv) {
         ctx.stop();
         if (net_thread && net_thread->joinable()) net_thread->join();
     }
-    return 0;
+    return assembly_failure ? 1 : 0;
 }
      
 

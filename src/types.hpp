@@ -80,6 +80,10 @@ struct compact_target {
 
     uint256_t expand() const;   // convert to uint256_t target
     static compact_target from_target(const uint256_t& target);
+    bool is_negative() const;
+    bool is_zero() const;
+    bool overflows(size_t width_bytes) const;
+    bool is_canonical(size_t width_bytes) const;
 };
 
 // Network port

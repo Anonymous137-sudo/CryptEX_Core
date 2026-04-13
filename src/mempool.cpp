@@ -213,6 +213,53 @@ std::vector<Transaction> Mempool::get_transactions() const {
     return result;
 }
 
+std::vector<Transaction> Mempool::get_mineable_transactions(const UTXOSet& utxo,
+                                                            uint32_t next_block_height,
+                                                            size_t max_block_bytes,
+                                                            size_t reserved_bytes) const {
+    std::vector<TxEntry> ordered_entries;
+    {
+        std::shared_lock lock(mutex_);
+        ordered_entries.reserve(sorted_by_feerate_.size());
+        for (auto it = sorted_by_feerate_.rbegin(); it != sorted_by_feerate_.rend(); ++it) {
+            ordered_entries.push_back(txs_.at(std::get<2>(*it)));
+        }
+    }
+
+    UTXOSet working = utxo.snapshot();
+    std::vector<Transaction> selected;
+    selected.reserve(ordered_entries.size());
+
+    std::vector<TxEntry> pending = std::move(ordered_entries);
+    size_t total_bytes = reserved_bytes;
+
+    while (!pending.empty()) {
+        bool made_progress = false;
+        std::vector<TxEntry> next_pending;
+        next_pending.reserve(pending.size());
+
+        for (const auto& entry : pending) {
+            if (total_bytes + entry.size > max_block_bytes) {
+                continue;
+            }
+            if (working.apply_transaction(entry.tx, next_block_height)) {
+                selected.push_back(entry.tx);
+                total_bytes += entry.size;
+                made_progress = true;
+            } else {
+                next_pending.push_back(entry);
+            }
+        }
+
+        if (!made_progress) {
+            break;
+        }
+        pending = std::move(next_pending);
+    }
+
+    return selected;
+}
+
 bool Mempool::contains(const uint256_t& tx_hash) const {
     std::shared_lock lock(mutex_);
     return txs_.find(tx_hash) != txs_.end();
