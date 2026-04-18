@@ -25,9 +25,486 @@
 #include <thread>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 using namespace cryptex;
 
 namespace {
+
+struct PowWorkerJob {
+    std::array<uint8_t, 80> header{};
+    std::array<uint8_t, constants::POW_HASH_BYTES> target{};
+    uint32_t start_nonce{0};
+    uint32_t nonce_step{1};
+    uint64_t max_iterations{0};
+};
+
+struct PowWorkerResult {
+    bool found{false};
+    uint32_t nonce{0};
+    uint64_t iterations{0};
+    std::array<uint8_t, constants::POW_HASH_BYTES> hash{};
+};
+
+struct NonceSearchResult {
+    bool found{false};
+    uint32_t nonce{0};
+    uint32_t next_nonce{0};
+    uint64_t iterations{0};
+    std::array<uint8_t, constants::POW_HASH_BYTES> hash{};
+};
+
+static constexpr char kPowWorkerJobMagic[8] = {'C','R','X','P','O','W','2','!'};
+static constexpr char kPowWorkerResultMagic[8] = {'C','R','X','R','E','S','2','!'};
+
+uint32_t read_u32_le(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+           (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) |
+           (static_cast<uint32_t>(data[3]) << 24);
+}
+
+uint64_t read_u64_le(const uint8_t* data) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(data[i]) << (i * 8);
+    }
+    return value;
+}
+
+void write_u64_le_bytes(uint8_t* data, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        data[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+    }
+}
+
+void append_u32_le(std::vector<uint8_t>& out, uint32_t value) {
+    out.push_back(static_cast<uint8_t>(value & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+void append_u64_le(std::vector<uint8_t>& out, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    }
+}
+
+std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+inline void set_header_nonce_le(std::array<uint8_t, 80>& header, uint32_t nonce) {
+    header[76] = static_cast<uint8_t>(nonce & 0xFF);
+    header[77] = static_cast<uint8_t>((nonce >> 8) & 0xFF);
+    header[78] = static_cast<uint8_t>((nonce >> 16) & 0xFF);
+    header[79] = static_cast<uint8_t>((nonce >> 24) & 0xFF);
+}
+
+bool hash_meets_target_scalar(const std::array<uint8_t, constants::POW_HASH_BYTES>& hash_bytes,
+                              const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes) {
+    return std::memcmp(hash_bytes.data(), target_bytes.data(), hash_bytes.size()) <= 0;
+}
+
+NonceSearchResult run_nonce_search_scalar(const std::array<uint8_t, 80>& header_template,
+                                          const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes,
+                                          const crypto::SHA3_512_Hasher& prefix_hasher,
+                                          uint32_t start_nonce,
+                                          uint32_t nonce_step,
+                                          uint64_t max_iterations) {
+    NonceSearchResult result;
+    auto header_bytes = header_template;
+    crypto::SHA3_512_Hasher nonce_hasher;
+    uint32_t nonce = start_nonce;
+
+    while (max_iterations == 0 || result.iterations < max_iterations) {
+        set_header_nonce_le(header_bytes, nonce);
+        nonce_hasher.copy_state_from(prefix_hasher);
+        nonce_hasher.update(header_bytes.data() + 76, 4);
+        const auto digest = nonce_hasher.finalize();
+        std::memcpy(result.hash.data(), digest.data(), result.hash.size());
+        ++result.iterations;
+        result.next_nonce = nonce + nonce_step;
+        if (hash_meets_target_scalar(result.hash, target_bytes)) {
+            result.found = true;
+            result.nonce = nonce;
+            return result;
+        }
+        nonce += nonce_step;
+    }
+
+    return result;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+bool cpu_supports_avx2() {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+#else
+    return false;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+bool hash_meets_target_avx2(const std::array<uint8_t, constants::POW_HASH_BYTES>& hash_bytes,
+                            const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes) {
+    for (size_t offset = 0; offset < constants::POW_HASH_BYTES; offset += 32) {
+        const auto* hash_ptr = reinterpret_cast<const __m256i*>(hash_bytes.data() + offset);
+        const auto* target_ptr = reinterpret_cast<const __m256i*>(target_bytes.data() + offset);
+        const __m256i hash_chunk = _mm256_loadu_si256(hash_ptr);
+        const __m256i target_chunk = _mm256_loadu_si256(target_ptr);
+        const __m256i equal_mask = _mm256_cmpeq_epi8(hash_chunk, target_chunk);
+        const uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(equal_mask));
+        if (mask != 0xFFFFFFFFu) {
+            const uint32_t diff = ~mask;
+#if defined(__GNUC__) || defined(__clang__)
+            const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(diff));
+#else
+            uint32_t lane = 0;
+            while (lane < 32 && ((diff >> lane) & 1u) == 0u) ++lane;
+#endif
+            const uint8_t hash_byte = hash_bytes[offset + lane];
+            const uint8_t target_byte = target_bytes[offset + lane];
+            return hash_byte < target_byte;
+        }
+    }
+    return true;
+}
+
+bool hash_meets_target_x86_64(const std::array<uint8_t, constants::POW_HASH_BYTES>& hash_bytes,
+                              const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes,
+                              bool use_avx2) {
+    if (use_avx2) {
+        return hash_meets_target_avx2(hash_bytes, target_bytes);
+    }
+    return hash_meets_target_scalar(hash_bytes, target_bytes);
+}
+
+constexpr std::array<uint64_t, 24> kKeccakRoundConstants{
+    0x0000000000000001ull, 0x0000000000008082ull,
+    0x800000000000808aull, 0x8000000080008000ull,
+    0x000000000000808bull, 0x0000000080000001ull,
+    0x8000000080008081ull, 0x8000000000008009ull,
+    0x000000000000008aull, 0x0000000000000088ull,
+    0x0000000080008009ull, 0x000000008000000aull,
+    0x000000008000808bull, 0x800000000000008bull,
+    0x8000000000008089ull, 0x8000000000008003ull,
+    0x8000000000008002ull, 0x8000000000000080ull,
+    0x000000000000800aull, 0x800000008000000aull,
+    0x8000000080008081ull, 0x8000000000008080ull,
+    0x0000000080000001ull, 0x8000000080008008ull,
+};
+
+constexpr std::array<int, 25> kKeccakRhoOffsets{
+    0,  1, 62, 28, 27,
+    36, 44,  6, 55, 20,
+     3, 10, 43, 25, 39,
+    41, 45, 15, 21,  8,
+    18,  2, 61, 56, 14,
+};
+
+inline uint64_t rotl64(uint64_t value, int shift) {
+    if (shift == 0) return value;
+    return (value << shift) | (value >> (64 - shift));
+}
+
+void keccakf_scalar_state(uint64_t state[25]) {
+    uint64_t b[25]{};
+    uint64_t c[5]{};
+    uint64_t d[5]{};
+
+    for (size_t round = 0; round < kKeccakRoundConstants.size(); ++round) {
+        for (int x = 0; x < 5; ++x) {
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        for (int x = 0; x < 5; ++x) {
+            d[x] = c[(x + 4) % 5] ^ rotl64(c[(x + 1) % 5], 1);
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                state[x + 5 * y] ^= d[x];
+            }
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const int index = x + 5 * y;
+                const int dest_x = y;
+                const int dest_y = (2 * x + 3 * y) % 5;
+                b[dest_x + 5 * dest_y] = rotl64(state[index], kKeccakRhoOffsets[index]);
+            }
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const uint64_t lane = b[x + 5 * y];
+                const uint64_t lane1 = b[((x + 1) % 5) + 5 * y];
+                const uint64_t lane2 = b[((x + 2) % 5) + 5 * y];
+                state[x + 5 * y] = lane ^ ((~lane1) & lane2);
+            }
+        }
+        state[0] ^= kKeccakRoundConstants[round];
+    }
+}
+
+std::array<uint64_t, 25> prepare_prefix_state_x86_64(const std::array<uint8_t, 80>& header_template) {
+    std::array<uint64_t, 25> state{};
+    for (size_t lane = 0; lane < 9; ++lane) {
+        state[lane] = read_u64_le(header_template.data() + lane * 8);
+    }
+    keccakf_scalar_state(state.data());
+    return state;
+}
+
+std::array<uint8_t, constants::POW_HASH_BYTES> finalize_suffix_scalar_x86_64(const std::array<uint64_t, 25>& prefix_state,
+                                                                              uint32_t bits,
+                                                                              uint32_t nonce) {
+    auto state = prefix_state;
+    state[0] ^= static_cast<uint64_t>(bits) | (static_cast<uint64_t>(nonce) << 32);
+    state[1] ^= 0x06ull;
+    state[8] ^= (1ull << 63);
+    keccakf_scalar_state(state.data());
+
+    std::array<uint8_t, constants::POW_HASH_BYTES> hash{};
+    for (size_t lane = 0; lane < 8; ++lane) {
+        write_u64_le_bytes(hash.data() + lane * 8, state[lane]);
+    }
+    return hash;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+__m256i rotl64_avx2(__m256i value, int shift) {
+    switch (shift) {
+    case 0: return value;
+    case 1: return _mm256_or_si256(_mm256_slli_epi64(value, 1), _mm256_srli_epi64(value, 63));
+    case 2: return _mm256_or_si256(_mm256_slli_epi64(value, 2), _mm256_srli_epi64(value, 62));
+    case 3: return _mm256_or_si256(_mm256_slli_epi64(value, 3), _mm256_srli_epi64(value, 61));
+    case 6: return _mm256_or_si256(_mm256_slli_epi64(value, 6), _mm256_srli_epi64(value, 58));
+    case 8: return _mm256_or_si256(_mm256_slli_epi64(value, 8), _mm256_srli_epi64(value, 56));
+    case 10: return _mm256_or_si256(_mm256_slli_epi64(value, 10), _mm256_srli_epi64(value, 54));
+    case 14: return _mm256_or_si256(_mm256_slli_epi64(value, 14), _mm256_srli_epi64(value, 50));
+    case 15: return _mm256_or_si256(_mm256_slli_epi64(value, 15), _mm256_srli_epi64(value, 49));
+    case 18: return _mm256_or_si256(_mm256_slli_epi64(value, 18), _mm256_srli_epi64(value, 46));
+    case 20: return _mm256_or_si256(_mm256_slli_epi64(value, 20), _mm256_srli_epi64(value, 44));
+    case 21: return _mm256_or_si256(_mm256_slli_epi64(value, 21), _mm256_srli_epi64(value, 43));
+    case 25: return _mm256_or_si256(_mm256_slli_epi64(value, 25), _mm256_srli_epi64(value, 39));
+    case 27: return _mm256_or_si256(_mm256_slli_epi64(value, 27), _mm256_srli_epi64(value, 37));
+    case 28: return _mm256_or_si256(_mm256_slli_epi64(value, 28), _mm256_srli_epi64(value, 36));
+    case 36: return _mm256_or_si256(_mm256_slli_epi64(value, 36), _mm256_srli_epi64(value, 28));
+    case 39: return _mm256_or_si256(_mm256_slli_epi64(value, 39), _mm256_srli_epi64(value, 25));
+    case 41: return _mm256_or_si256(_mm256_slli_epi64(value, 41), _mm256_srli_epi64(value, 23));
+    case 43: return _mm256_or_si256(_mm256_slli_epi64(value, 43), _mm256_srli_epi64(value, 21));
+    case 44: return _mm256_or_si256(_mm256_slli_epi64(value, 44), _mm256_srli_epi64(value, 20));
+    case 45: return _mm256_or_si256(_mm256_slli_epi64(value, 45), _mm256_srli_epi64(value, 19));
+    case 55: return _mm256_or_si256(_mm256_slli_epi64(value, 55), _mm256_srli_epi64(value, 9));
+    case 56: return _mm256_or_si256(_mm256_slli_epi64(value, 56), _mm256_srli_epi64(value, 8));
+    case 61: return _mm256_or_si256(_mm256_slli_epi64(value, 61), _mm256_srli_epi64(value, 3));
+    case 62: return _mm256_or_si256(_mm256_slli_epi64(value, 62), _mm256_srli_epi64(value, 2));
+    default: return value;
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+void keccakf4x_avx2(__m256i state[25]) {
+    __m256i b[25];
+    __m256i c[5];
+    __m256i d[5];
+
+    for (size_t round = 0; round < kKeccakRoundConstants.size(); ++round) {
+        for (int x = 0; x < 5; ++x) {
+            c[x] = _mm256_xor_si256(
+                _mm256_xor_si256(state[x], state[x + 5]),
+                _mm256_xor_si256(_mm256_xor_si256(state[x + 10], state[x + 15]), state[x + 20]));
+        }
+        for (int x = 0; x < 5; ++x) {
+            d[x] = _mm256_xor_si256(c[(x + 4) % 5], rotl64_avx2(c[(x + 1) % 5], 1));
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                state[x + 5 * y] = _mm256_xor_si256(state[x + 5 * y], d[x]);
+            }
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const int index = x + 5 * y;
+                const int dest_x = y;
+                const int dest_y = (2 * x + 3 * y) % 5;
+                b[dest_x + 5 * dest_y] = rotl64_avx2(state[index], kKeccakRhoOffsets[index]);
+            }
+        }
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const __m256i lane = b[x + 5 * y];
+                const __m256i lane1 = b[((x + 1) % 5) + 5 * y];
+                const __m256i lane2 = b[((x + 2) % 5) + 5 * y];
+                state[x + 5 * y] = _mm256_xor_si256(lane, _mm256_andnot_si256(lane1, lane2));
+            }
+        }
+        state[0] = _mm256_xor_si256(state[0], _mm256_set1_epi64x(static_cast<long long>(kKeccakRoundConstants[round])));
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+void finalize_suffix_batch4_x86_64(const std::array<uint64_t, 25>& prefix_state,
+                                   uint32_t bits,
+                                   const std::array<uint32_t, 4>& nonces,
+                                   std::array<std::array<uint8_t, constants::POW_HASH_BYTES>, 4>& hashes) {
+    __m256i state[25];
+    for (size_t lane = 0; lane < 25; ++lane) {
+        state[lane] = _mm256_set1_epi64x(static_cast<long long>(prefix_state[lane]));
+    }
+
+    alignas(32) uint64_t suffix_words[4] = {
+        static_cast<uint64_t>(bits) | (static_cast<uint64_t>(nonces[0]) << 32),
+        static_cast<uint64_t>(bits) | (static_cast<uint64_t>(nonces[1]) << 32),
+        static_cast<uint64_t>(bits) | (static_cast<uint64_t>(nonces[2]) << 32),
+        static_cast<uint64_t>(bits) | (static_cast<uint64_t>(nonces[3]) << 32),
+    };
+
+    state[0] = _mm256_xor_si256(state[0], _mm256_load_si256(reinterpret_cast<const __m256i*>(suffix_words)));
+    state[1] = _mm256_xor_si256(state[1], _mm256_set1_epi64x(0x06));
+    state[8] = _mm256_xor_si256(state[8], _mm256_set1_epi64x(static_cast<long long>(1ull << 63)));
+    keccakf4x_avx2(state);
+
+    alignas(32) uint64_t lane_words[4];
+    for (auto& hash : hashes) {
+        hash.fill(0);
+    }
+    for (size_t lane = 0; lane < 8; ++lane) {
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lane_words), state[lane]);
+        for (size_t candidate = 0; candidate < 4; ++candidate) {
+            write_u64_le_bytes(hashes[candidate].data() + lane * 8, lane_words[candidate]);
+        }
+    }
+}
+
+NonceSearchResult run_nonce_search_x86_64(const std::array<uint64_t, 25>& prefix_state,
+                                          uint32_t bits,
+                                          const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes,
+                                          uint32_t start_nonce,
+                                          uint32_t nonce_step,
+                                          uint64_t max_iterations,
+                                          bool use_avx2) {
+    NonceSearchResult result;
+    uint32_t nonce = start_nonce;
+
+    while (max_iterations == 0 || result.iterations < max_iterations) {
+        if (use_avx2) {
+            const uint64_t remaining = max_iterations == 0
+                ? 4
+                : std::min<uint64_t>(4, max_iterations - result.iterations);
+            std::array<uint32_t, 4> nonces{nonce, nonce + nonce_step, nonce + nonce_step * 2u, nonce + nonce_step * 3u};
+            std::array<std::array<uint8_t, constants::POW_HASH_BYTES>, 4> hashes{};
+            finalize_suffix_batch4_x86_64(prefix_state, bits, nonces, hashes);
+            for (size_t i = 0; i < remaining; ++i) {
+                ++result.iterations;
+                result.hash = hashes[i];
+                result.next_nonce = nonces[i] + nonce_step;
+                if (hash_meets_target_x86_64(hashes[i], target_bytes, true)) {
+                    result.found = true;
+                    result.nonce = nonces[i];
+                    return result;
+                }
+            }
+            nonce = nonces[static_cast<size_t>(remaining - 1)] + nonce_step;
+            continue;
+        }
+
+        result.hash = finalize_suffix_scalar_x86_64(prefix_state, bits, nonce);
+        ++result.iterations;
+        result.next_nonce = nonce + nonce_step;
+        if (hash_meets_target_x86_64(result.hash, target_bytes, false)) {
+            result.found = true;
+            result.nonce = nonce;
+            return result;
+        }
+        nonce += nonce_step;
+    }
+
+    return result;
+}
+
+PowWorkerResult run_worker_job_x86_64(const PowWorkerJob& job) {
+    PowWorkerResult result;
+    const bool use_avx2 = cpu_supports_avx2();
+    const auto prefix_state = prepare_prefix_state_x86_64(job.header);
+    const uint32_t bits = read_u32_le(job.header.data() + 72);
+    uint32_t nonce = job.start_nonce;
+    constexpr uint64_t kChunkIterations = 4096;
+
+    while (job.max_iterations == 0 || result.iterations < job.max_iterations) {
+        const uint64_t remaining = job.max_iterations == 0
+            ? kChunkIterations
+            : std::min<uint64_t>(kChunkIterations, job.max_iterations - result.iterations);
+        const auto chunk = run_nonce_search_x86_64(prefix_state,
+                                                   bits,
+                                                   job.target,
+                                                   nonce,
+                                                   job.nonce_step,
+                                                   remaining,
+                                                   use_avx2);
+        if (chunk.iterations == 0) {
+            break;
+        }
+        result.iterations += chunk.iterations;
+        result.hash = chunk.hash;
+        nonce = chunk.next_nonce;
+        if (chunk.found) {
+            result.found = true;
+            result.nonce = chunk.nonce;
+            return result;
+        }
+    }
+
+    return result;
+}
+#endif
+
+bool write_binary_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return out.good();
+}
+
+std::optional<PowWorkerJob> decode_worker_job(const std::vector<uint8_t>& payload) {
+    if (payload.size() != 168) return std::nullopt;
+    if (!std::equal(std::begin(kPowWorkerJobMagic), std::end(kPowWorkerJobMagic), payload.begin())) {
+        return std::nullopt;
+    }
+    PowWorkerJob job;
+    std::memcpy(job.header.data(), payload.data() + 8, job.header.size());
+    std::memcpy(job.target.data(), payload.data() + 88, job.target.size());
+    job.start_nonce = read_u32_le(payload.data() + 152);
+    job.nonce_step = read_u32_le(payload.data() + 156);
+    job.max_iterations = read_u64_le(payload.data() + 160);
+    if (job.nonce_step == 0) job.nonce_step = 1;
+    return job;
+}
+
+std::vector<uint8_t> encode_worker_result(const PowWorkerResult& result) {
+    std::vector<uint8_t> payload;
+    payload.reserve(88);
+    payload.insert(payload.end(), std::begin(kPowWorkerResultMagic), std::end(kPowWorkerResultMagic));
+    append_u32_le(payload, result.found ? 1u : 0u);
+    append_u32_le(payload, result.nonce);
+    append_u64_le(payload, result.iterations);
+    payload.insert(payload.end(), result.hash.begin(), result.hash.end());
+    return payload;
+}
 
 std::string format_rate(double hps) {
     std::ostringstream ss;
@@ -171,7 +648,43 @@ std::array<uint8_t, 80> serialize_header_fast(const BlockHeader& header) {
 
 bool hash_meets_target(const std::array<uint8_t, constants::POW_HASH_BYTES>& hash_bytes,
                        const std::array<uint8_t, constants::POW_HASH_BYTES>& target_bytes) {
-    return std::memcmp(hash_bytes.data(), target_bytes.data(), hash_bytes.size()) <= 0;
+    return hash_meets_target_scalar(hash_bytes, target_bytes);
+}
+
+PowWorkerResult run_worker_job(const PowWorkerJob& job) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return run_worker_job_x86_64(job);
+#else
+    PowWorkerResult result;
+    crypto::SHA3_512_Hasher prefix_hasher;
+    prefix_hasher.update(job.header.data(), 76);
+    const auto search = run_nonce_search_scalar(job.header,
+                                                job.target,
+                                                prefix_hasher,
+                                                job.start_nonce,
+                                                job.nonce_step,
+                                                job.max_iterations);
+    result.found = search.found;
+    result.nonce = search.nonce;
+    result.iterations = search.iterations;
+    result.hash = search.hash;
+    return result;
+#endif
+}
+
+int maybe_run_worker_protocol_mode(int argc, char* argv[]) {
+    if (argc != 3) return -1;
+    const std::filesystem::path job_path = argv[1];
+    const std::filesystem::path result_path = argv[2];
+    auto payload = read_binary_file(job_path);
+    auto job = decode_worker_job(payload);
+    if (!job) return -1;
+    const auto result = run_worker_job(*job);
+    if (!write_binary_file(result_path, encode_worker_result(result))) {
+        std::cerr << "failed to write pow worker result\n";
+        return 1;
+    }
+    return 0;
 }
 
 template <size_t N>
@@ -277,7 +790,10 @@ void usage() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+extern "C" int cryptex_powminer_entry(int argc, char** argv) {
+    if (const int worker_mode_rc = maybe_run_worker_protocol_mode(argc, argv); worker_mode_rc >= 0) {
+        return worker_mode_rc;
+    }
     if (argc < 2) {
         usage();
         return 1;
@@ -357,6 +873,11 @@ int main(int argc, char** argv) {
               << (infinite ? " cycles=infinite" : " cycles=" + std::to_string(cycles))
               << (infinite_block_cycles ? " block_cycles=infinite" : " block_cycles=" + std::to_string(block_cycles))
               << "\n";
+#if defined(__x86_64__) || defined(_M_X64)
+    std::cout << "[powminer] x86_64 backend="
+              << (cpu_supports_avx2() ? "batched-avx2-compare" : "batched-scalar")
+              << "\n";
+#endif
 
     Blockchain chain(datadir);
     if (hostport.empty() && !chain.wallet_state_approved()) {
@@ -442,15 +963,26 @@ int main(int argc, char** argv) {
         auto last_report_time = start;
         uint64_t last_report_iter = 0;
         const auto status_interval = std::chrono::milliseconds(250);
+#if defined(__x86_64__) || defined(_M_X64)
+        const bool use_avx2 = cpu_supports_avx2();
+#endif
 
         auto worker = [&](unsigned int tid) {
             Block local_job;
             std::array<uint8_t, constants::POW_HASH_BYTES> local_target_bytes{};
             std::array<uint8_t, 80> header_bytes{};
+#if defined(__x86_64__) || defined(_M_X64)
+            std::array<uint64_t, 25> prefix_state{};
+            uint32_t header_bits = 0;
+#else
             crypto::SHA3_512_Hasher prefix_hasher;
             crypto::SHA3_512_Hasher nonce_hasher;
+#endif
             uint32_t nonce = tid;
             uint64_t local_job_version = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+            constexpr uint64_t kBatchIterations = 256;
+#endif
 
             {
                 std::lock_guard<std::mutex> lock(job_mutex);
@@ -458,8 +990,13 @@ int main(int argc, char** argv) {
                 auto target_vec = compact_target{local_job.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
                 std::memcpy(local_target_bytes.data(), target_vec.data(), local_target_bytes.size());
                 header_bytes = serialize_header_fast(local_job.header);
+#if defined(__x86_64__) || defined(_M_X64)
+                prefix_state = prepare_prefix_state_x86_64(header_bytes);
+                header_bits = local_job.header.bits;
+#else
                 prefix_hasher.reset();
                 prefix_hasher.update(header_bytes.data(), 76);
+#endif
                 local_job_version = job_version.load();
             }
 
@@ -471,27 +1008,75 @@ int main(int argc, char** argv) {
                     auto target_vec = compact_target{local_job.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
                     std::memcpy(local_target_bytes.data(), target_vec.data(), local_target_bytes.size());
                     header_bytes = serialize_header_fast(local_job.header);
+#if defined(__x86_64__) || defined(_M_X64)
+                    prefix_state = prepare_prefix_state_x86_64(header_bytes);
+                    header_bits = local_job.header.bits;
+#else
                     prefix_hasher.reset();
                     prefix_hasher.update(header_bytes.data(), 76);
+#endif
                     local_job_version = cur_ver;
                     nonce = tid;
                 }
 
+                std::array<uint8_t, constants::POW_HASH_BYTES> pow_hash{};
+                uint64_t attempted = 0;
+                bool ok = false;
+                uint32_t candidate_nonce = nonce;
+                uint32_t status_nonce = nonce;
+
+#if defined(__x86_64__) || defined(_M_X64)
+                const uint64_t current_total = iterations.load(std::memory_order_relaxed);
+                if (!infinite && current_total >= cycles) {
+                    break;
+                }
+                const uint64_t remaining = infinite
+                    ? kBatchIterations
+                    : std::max<uint64_t>(1, std::min<uint64_t>(
+                          kBatchIterations,
+                          (cycles - current_total + static_cast<uint64_t>(thread_count) - 1) /
+                              static_cast<uint64_t>(thread_count)));
+                const auto batch = run_nonce_search_x86_64(prefix_state,
+                                                           header_bits,
+                                                           local_target_bytes,
+                                                           nonce,
+                                                           thread_count,
+                                                           remaining,
+                                                           use_avx2);
+                attempted = batch.iterations;
+                pow_hash = batch.hash;
+                ok = batch.found;
+                candidate_nonce = batch.nonce;
+                nonce = batch.next_nonce;
+                if (attempted > 0) {
+                    status_nonce = static_cast<uint32_t>(batch.next_nonce - thread_count);
+                }
+#else
                 local_job.header.nonce = nonce;
                 write_u32_le(header_bytes, 76, nonce);
                 nonce_hasher.copy_state_from(prefix_hasher);
                 nonce_hasher.update(header_bytes.data() + 76, 4);
                 auto digest = nonce_hasher.finalize();
-                std::array<uint8_t, constants::POW_HASH_BYTES> pow_hash{};
                 std::memcpy(pow_hash.data(), digest.data(), pow_hash.size());
-                uint64_t cur_iter = iterations.fetch_add(1, std::memory_order_relaxed) + 1;
-                bool ok = hash_meets_target(pow_hash, local_target_bytes);
+                attempted = 1;
+                ok = hash_meets_target(pow_hash, local_target_bytes);
+                candidate_nonce = nonce;
+                status_nonce = nonce;
+                nonce += thread_count;
+#endif
+
+                if (attempted == 0) {
+                    break;
+                }
+
+                uint64_t cur_iter = iterations.fetch_add(attempted, std::memory_order_relaxed) + attempted;
                 if (ok) {
                     if (!found.exchange(true)) {
                         std::lock_guard<std::mutex> lk(found_mutex);
                         found_block = local_job;
+                        found_block.header.nonce = candidate_nonce;
                         found_hash = uint256_t::from_bytes(pow_hash.data(), pow_hash.size());
-                        found_nonce = nonce;
+                        found_nonce = candidate_nonce;
                     }
                     break;
                 }
@@ -500,7 +1085,7 @@ int main(int argc, char** argv) {
                     if (now - last_report_time >= status_interval) {
                         double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_report_time).count();
                         double rate = secs > 0 ? static_cast<double>(cur_iter - last_report_iter) / secs : 0.0;
-                        std::string line = format_mining_status(cur_iter, nonce, pow_hash, rate);
+                        std::string line = format_mining_status(cur_iter, status_nonce, pow_hash, rate);
                         {
                             std::lock_guard<std::mutex> lock(cout_mutex);
                             size_t width = std::max(status_width.load(), line.size());
@@ -515,7 +1100,6 @@ int main(int argc, char** argv) {
                         last_report_iter = cur_iter;
                     }
                 }
-                nonce += thread_count;
             }
         };
 
@@ -616,3 +1200,9 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+#if !defined(CRYPTEX_ASM_ENTRY_STUB)
+int main(int argc, char** argv) {
+    return cryptex_powminer_entry(argc, argv);
+}
+#endif

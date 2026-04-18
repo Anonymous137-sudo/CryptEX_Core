@@ -130,9 +130,8 @@ if(TARGET cryptex_powminer)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET cryptexd AND TARGET cryptex_powminer)
-    set(CRYPTEXQT_BUNDLE_SYNC_STAMP "${CMAKE_CURRENT_BINARY_DIR}/cryptexqt_bundle_sync.stamp")
     add_custom_command(
-        OUTPUT "${CRYPTEXQT_BUNDLE_SYNC_STAMP}"
+        TARGET cryptexqt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory
             $<TARGET_BUNDLE_CONTENT_DIR:cryptexqt>/MacOS
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -141,10 +140,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET cryptexd AND TARGET cryptex_po
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:cryptex_powminer>
             $<TARGET_BUNDLE_CONTENT_DIR:cryptexqt>/MacOS/$<TARGET_FILE_NAME:cryptex_powminer>
-        COMMAND ${CMAKE_COMMAND} -E touch "${CRYPTEXQT_BUNDLE_SYNC_STAMP}"
-        DEPENDS cryptexqt cryptexd cryptex_powminer
         VERBATIM)
-    add_custom_target(cryptexqt_bundle_sync ALL DEPENDS "${CRYPTEXQT_BUNDLE_SYNC_STAMP}")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")

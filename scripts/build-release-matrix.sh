@@ -42,6 +42,17 @@ copy_bundle_if_exists() {
   return 1
 }
 
+zip_bundle_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -d "${src}" ]]; then
+    rm -f "${dst}"
+    ditto -c -k --sequesterRsrc --keepParent "${src}" "${dst}"
+    return 0
+  fi
+  return 1
+}
+
 openssl_is_universal() {
   local root="$1"
   local lib
@@ -69,6 +80,7 @@ build_macos_arm64() {
   if [[ -d "${build_dir}/cryptexqt_osx.app" ]]; then
     rm -f "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_arm64"
     copy_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/cryptexqt_macos_arm64.app" || true
+    zip_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/CryptEX_macos_arm64_bundle.zip" || true
   else
     copy_if_exists "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_arm64" || true
   fi
@@ -93,6 +105,7 @@ build_macos_universal() {
   if [[ -d "${build_dir}/cryptexqt_osx.app" ]]; then
     rm -f "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_universal"
     copy_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/cryptexqt_macos_universal.app" || true
+    zip_bundle_if_exists "${build_dir}/cryptexqt_osx.app" "${DIST_DIR}/CryptEX_macos_universal_bundle.zip" || true
   else
     copy_if_exists "${build_dir}/cryptexqt_osx" "${DIST_DIR}/cryptexqt_macos_universal" || true
   fi

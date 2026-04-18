@@ -1,6 +1,6 @@
 # CryptEX
 
-Current release: `v0.6.1`
+Current release: `v0.6.2`
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 
@@ -22,6 +22,21 @@ CryptEX is a C++ SHA3-512 cryptocurrency with full 512-bit proof-of-work math, a
 - Advanced Mode gating for Node Window and P2P Messenger
 - FastAPI website and Wrapped CryptEX EVM workspace
 - System datadir defaults so chain and wallet data survive binary deletion
+
+## Release Matrix
+
+The current release pipeline produces these platform artifacts:
+
+- macOS ARM64: daemon, tests, Qt app bundle, dedicated ARM64 assembly PoW worker
+- Linux x86_64: daemon, tests, AppImage, external PoW worker binary
+- Linux ARM64: daemon, tests, AppImage, dedicated ARM64 assembly PoW worker
+- Windows x86_64: daemon, tests, runtime bundle zip, external PoW worker binary
+
+Worker backend notes:
+
+- ARM64 macOS and Linux builds use handwritten assembly workers under `src/asm/`
+- Linux x86_64 and Windows x86_64 use dedicated handwritten external assembly workers under `src/asm/`, with AVX2-focused four-lane nonce search on AVX2-capable CPUs
+- Consensus stays in the daemon on every platform; workers only search nonce ranges
 
 ## Repository Layout
 
@@ -49,6 +64,16 @@ Full release matrix:
 
 ```bash
 ./scripts/build-release-matrix.sh all
+```
+
+Windows x86_64 dependency bootstrap:
+
+```bash
+./scripts/bootstrap-windows-x86_64-deps.sh
+export OPENSSL_ROOT_DIR_WIN_X86_64="$PWD/third_party/windows-x86_64/openssl"
+export OPUS_ROOT_DIR_WIN_X86_64="$PWD/third_party/windows-x86_64/opus"
+export QT6_ROOT_WIN_X86_64="$HOME/Qt/6.10.2/mingw_64"
+./scripts/build-release-matrix.sh windows-x86_64
 ```
 
 ## Run
@@ -107,3 +132,5 @@ By default, CryptEX stores chain and wallet data in system application-data loca
 - Whitepaper PDF: [WHITEPAPER.pdf](./WHITEPAPER.pdf)
 - Whitepaper source: [archives/CryptEX_Whitepaper_Source_April_2026.md](./archives/CryptEX_Whitepaper_Source_April_2026.md)
 - Release notes: [RELEASE_NOTES.md](./RELEASE_NOTES.md)
+- PoW rules: [docs/pow.md](./docs/pow.md)
+- Communication systems: [docs/communication-systems.md](./docs/communication-systems.md)

@@ -82,7 +82,7 @@ else()
     set_target_properties(cryptexd PROPERTIES OUTPUT_NAME "cryptexd_linux")
 endif()
 
-target_include_directories(cryptexd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
+target_include_directories(cryptexd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS})
 target_compile_definitions(cryptexd PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
 if(WIN32 AND CMAKE_CROSSCOMPILING)
     target_link_libraries(cryptexd PRIVATE ${OPENSSL_LIBRARIES} ${OPUS_LIBRARIES})
@@ -94,7 +94,7 @@ add_executable(cryptex_tests
     tests.cpp
     ${CRYPTEX_CORE_SOURCES}
 )
-target_include_directories(cryptex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
+target_include_directories(cryptex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS})
 target_compile_definitions(cryptex_tests PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
 if(WIN32 AND CMAKE_CROSSCOMPILING)
     target_link_libraries(cryptex_tests PRIVATE ${OPENSSL_LIBRARIES} ${OPUS_LIBRARIES})
@@ -103,18 +103,35 @@ else()
 endif()
 
 set(CRYPTEX_ASM_POWMINER FALSE)
+set(CRYPTEX_POWMINER_NEEDS_CORE TRUE)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND
    ((DEFINED CMAKE_OSX_ARCHITECTURES AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64") OR
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
     set(CRYPTEX_ASM_POWMINER TRUE)
+    set(CRYPTEX_POWMINER_NEEDS_CORE FALSE)
     add_executable(cryptex_powminer
         asm/powminer_darwin_arm64.S
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
     set(CRYPTEX_ASM_POWMINER TRUE)
+    set(CRYPTEX_POWMINER_NEEDS_CORE FALSE)
     add_executable(cryptex_powminer
         asm/powminer_linux_arm64.S
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(CRYPTEX_ASM_POWMINER TRUE)
+    set(CRYPTEX_POWMINER_NEEDS_CORE FALSE)
+    add_executable(cryptex_powminer
+        asm/powminer_linux_x86_64.S
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(CRYPTEX_ASM_POWMINER TRUE)
+    set(CRYPTEX_POWMINER_NEEDS_CORE FALSE)
+    add_executable(cryptex_powminer
+        asm/powminer_windows_x86_64.S
     )
 else()
     add_executable(cryptex_powminer
@@ -131,9 +148,12 @@ else()
     set_target_properties(cryptex_powminer PROPERTIES OUTPUT_NAME "cryptex_powminer_linux")
 endif()
 
-if(NOT CRYPTEX_ASM_POWMINER)
-    target_include_directories(cryptex_powminer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS})
+if(CRYPTEX_POWMINER_NEEDS_CORE)
+    target_include_directories(cryptex_powminer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${OPENSSL_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS})
     target_compile_definitions(cryptex_powminer PRIVATE BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_LIB)
+    if(CRYPTEX_ASM_POWMINER)
+        target_compile_definitions(cryptex_powminer PRIVATE CRYPTEX_ASM_ENTRY_STUB=1)
+    endif()
     if(WIN32 AND CMAKE_CROSSCOMPILING)
         target_link_libraries(cryptex_powminer PRIVATE ${OPENSSL_LIBRARIES} ${OPUS_LIBRARIES})
     else()

@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <random>
 #include <regex>
+#include <thread>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core.hpp>

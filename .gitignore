@@ -5,6 +5,7 @@
 /build-release/
 /build-release.zip
 /dist/
+/third_party/
 /Testing/
 /compile_commands.json
 /src/CMakeFiles/

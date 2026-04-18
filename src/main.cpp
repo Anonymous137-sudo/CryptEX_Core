@@ -763,14 +763,14 @@ static PowAsmWorkerResult run_pow_asm_worker(const std::filesystem::path& miner_
     };
 
     if (!write_binary_file(job_path, encode_pow_asm_job(job))) {
-        result.error = "failed to write assembly miner job file";
+        result.error = "failed to write pow worker job file";
         cleanup();
         return result;
     }
 
     const int rc = run_external_process_wait(miner_path, {job_path.string(), result_path.string()});
     if (rc != 0) {
-        result.error = "assembly miner exited with code " + std::to_string(rc);
+        result.error = "pow worker exited with code " + std::to_string(rc);
         cleanup();
         return result;
     }
@@ -778,11 +778,11 @@ static PowAsmWorkerResult run_pow_asm_worker(const std::filesystem::path& miner_
     auto payload = read_binary_file(result_path);
     cleanup();
     if (payload.size() != 88) {
-        result.error = "assembly miner returned malformed result payload";
+        result.error = "pow worker returned malformed result payload";
         return result;
     }
     if (!std::equal(std::begin(kPowAsmResultMagic), std::end(kPowAsmResultMagic), payload.begin())) {
-        result.error = "assembly miner returned unexpected result magic";
+        result.error = "pow worker returned unexpected result magic";
         return result;
     }
 
@@ -1735,16 +1735,16 @@ int main(int argc, char** argv) {
     set_debug(debug);
     const auto miner_path = locate_external_powminer_binary(argv[0]);
     if (miner_path.empty()) {
-        std::cerr << "ERROR: assembly miner binary was not found beside the daemon.\n";
+        std::cerr << "ERROR: pow worker binary was not found beside the daemon.\n";
         return 1;
     }
-    log_info("mine", "orchestrating assembly-only pow worker threads=" + std::to_string(thread_count) +
+    log_info("mine", "orchestrating external pow worker threads=" + std::to_string(thread_count) +
                      " datadir=" + datadir.string() +
                      " address=" + coinbase_addr +
                      " worker=" + miner_path.string() +
                      (infinite ? " cycles=infinite" : " cycles=" + std::to_string(cycles)) +
                      (infinite_block_cycles ? " block_cycles=infinite" : " block_cycles=" + std::to_string(block_cycles)));
-    std::cout << "[mine] assembly worker=" << miner_path.string()
+    std::cout << "[mine] worker=" << miner_path.string()
               << " threads=" << thread_count
               << " datadir=" << datadir.string()
               << " address=" << coinbase_addr << "\n";
@@ -1786,7 +1786,7 @@ int main(int argc, char** argv) {
     const auto work_dir = datadir / "powasm_jobs";
     uint64_t blocks_mined = 0;
     bool stopped_without_block = false;
-    bool assembly_failure = false;
+    bool worker_failure = false;
 
     while (infinite_block_cycles || blocks_mined < block_cycles) {
         const uint64_t target_index = blocks_mined + 1;
@@ -1849,7 +1849,7 @@ int main(int argc, char** argv) {
                 auto worker = future.get();
                 if (!worker.ok) {
                     chunk_failure = true;
-                    assembly_failure = true;
+                    worker_failure = true;
                     std::cerr << "ERROR: " << worker.error << "\n";
                     continue;
                 }
@@ -1890,7 +1890,7 @@ int main(int argc, char** argv) {
                       << " powhash=" << found_hash_value.to_hex_padded(constants::POW_HASH_BYTES)
                       << " after " << total_iter << " iterations in "
                       << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
-                      << " ms using " << thread_count << " assembly workers"
+                      << " ms using " << thread_count << " worker process slots"
                       << " avg_rate=" << format_rate(avg_rate) << "\n";
 
             const uint256_t block_target = compact_target{found_block.header.bits}.expand();
@@ -1902,7 +1902,7 @@ int main(int argc, char** argv) {
             if (!chain.connect_block(found_block) ||
                 chain.tip_hash() != found_block.header.pow_hash() ||
                 chain.best_height() != previous_height + 1) {
-                log_warn("mine", "block was found by the assembly worker but rejected by chain");
+                log_warn("mine", "block was found by the pow worker but rejected by chain");
                 std::cerr << "ERROR: Block was rejected by the chain (stale or invalid)!\n";
             } else {
                 bool approved_tip = true;
@@ -1958,7 +1958,7 @@ int main(int argc, char** argv) {
         ctx.stop();
         if (net_thread && net_thread->joinable()) net_thread->join();
     }
-    return assembly_failure ? 1 : 0;
+    return worker_failure ? 1 : 0;
 }
      
 

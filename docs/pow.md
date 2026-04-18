@@ -94,10 +94,19 @@ Then:
 5. clamp to `pow_limit`
 6. re-encode with canonical compact encoding
 
+## Worker Backends
+
+Every release platform ships an external `cryptex_powminer` worker binary, but the worker backend differs by platform:
+
+- macOS ARM64: dedicated handwritten ARM64 assembly worker in `src/asm/powminer_darwin_arm64.S`
+- Linux ARM64: dedicated handwritten ARM64 assembly worker in `src/asm/powminer_linux_arm64.S`
+- Linux x86_64: external C++ worker in `src/powminer_main.cpp`, using the same file-based worker protocol and the platform OpenSSL SHA3 backend
+- Windows x86_64: external C++ worker in `src/powminer_main.cpp`, packaged with the same file-based worker protocol and a MinGW/OpenSSL toolchain
+
 ## Implementation Notes
 
-- The daemon computes the canonical target from `bits` and passes that target to the external assembly miner.
-- The assembly miner does not define independent consensus rules.
+- The daemon computes the canonical target from `bits` and passes that target to the external PoW worker.
+- The worker does not define independent consensus rules.
 - Any alternate implementation must preserve:
   - exact header byte layout
   - SHA3-512 variant
