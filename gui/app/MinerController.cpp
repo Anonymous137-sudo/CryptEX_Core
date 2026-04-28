@@ -86,7 +86,15 @@ void MinerController::startMining(const LaunchConfig& config) {
     args << "--threads" << QString::number(config.threads);
     args << "--sync-wait-ms" << QString::number(config.syncWaitMs);
     if (!config.dataDir.trimmed().isEmpty()) args << "--datadir" << config.dataDir.trimmed();
-    if (!config.connectEndpoint.trimmed().isEmpty()) args << "--connect" << config.connectEndpoint.trimmed();
+    if (!config.rpcUrl.trimmed().isEmpty()) {
+        args << "--rpc-url" << config.rpcUrl.trimmed();
+        if (!config.rpcUser.trimmed().isEmpty()) args << "--rpcuser" << config.rpcUser.trimmed();
+        if (!config.rpcPassword.isEmpty()) args << "--rpcpassword" << config.rpcPassword;
+        args << "--rpcallowselfsigned" << (config.rpcAllowSelfSigned ? "1" : "0");
+        if (!config.rpcCaCertificatePath.trimmed().isEmpty()) args << "--rpccacert" << config.rpcCaCertificatePath.trimmed();
+    } else if (!config.connectEndpoint.trimmed().isEmpty()) {
+        args << "--connect" << config.connectEndpoint.trimmed();
+    }
     if (config.debug) args << "--debug";
 
     process_.start(config.executablePath, args);

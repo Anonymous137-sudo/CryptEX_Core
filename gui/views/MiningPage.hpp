@@ -26,7 +26,6 @@ public:
 
 private:
     static QString formatHashrate(double hps);
-    static QString defaultPeerForNetwork(const QString& network);
     void setStatus(const QString& text, bool error = false);
     void startMining();
     void stopMining();

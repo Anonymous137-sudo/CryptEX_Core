@@ -1,6 +1,6 @@
 # CryptEX
 
-Current release: `v0.6.2`
+Current release: `v0.6.3`
 
 Public contact: `Anon-Sec-BTCC@proton.me`
 
@@ -15,6 +15,7 @@ CryptEX is a C++ SHA3-512 cryptocurrency with full 512-bit proof-of-work math, a
 - Base64, Base58, `0x` hex, and Bech32 address encodings
 - Encrypted `Wallet.dat` storage with BIP32/BIP39 HD wallet support and recovery tooling
 - Multi-threaded solo mining with sync-before-mining behavior and `--block-cycles`
+- Unified mining flow so the GUI miner and CLI/backend mine against the same live backend chain state instead of separate local chain copies
 - P2P networking with peer exchange, DNS seeds, LAN/WLAN auto-discovery, headers-first sync, and cumulative-work chain selection
 - JSON-RPC for node, wallet, mining, chat, and operator functions
 - Address-first P2P messenger with public forum, private history, voice relay, and media composers
@@ -84,10 +85,10 @@ Start the backend node:
 ./build-release/macOS-ARM64/cryptexd_osx node
 ```
 
-Start mining forever:
+Start mining forever against the local backend RPC:
 
 ```bash
-./build-release/macOS-ARM64/cryptexd_osx mine --address <your_address> --cycles 0
+./build-release/macOS-ARM64/cryptexd_osx mine --rpc-url http://127.0.0.1:9332/ --rpcuser <user> --rpcpassword <pass> --address <your_address> --cycles 0
 ```
 
 Mine multiple blocks in sequence:

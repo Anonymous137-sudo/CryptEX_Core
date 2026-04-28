@@ -9,6 +9,7 @@
 #include <cctype>
 #include <ctime>
 #include <cstdlib>
+#include <sstream>
 
 namespace cryptex {
 
@@ -123,6 +124,88 @@ bool Blockchain::deep_reorgs_allowed() const {
     return allow_deep_reorg();
 }
 
+std::string Blockchain::diagnose_tip_candidate(const Block& blk, bool skip_pow_check) const {
+    std::ostringstream reason;
+    const uint64_t expected_height = best_height_ + 1;
+    const auto prev = get_block(best_height_);
+    const BlockHeader* parent_header = prev ? &prev->header : nullptr;
+    const uint256_t expected_prev_link = parent_header ? parent_header->hash() : uint256_t();
+
+    if (blk.header.prev_block_hash != expected_prev_link) {
+        reason << "stale-prev-link expected=" << expected_prev_link.to_hex()
+               << " have=" << blk.header.prev_block_hash.to_hex();
+        return reason.str();
+    }
+
+    if (!skip_pow_check && blk.header.prev_block_hash != uint256_t()) {
+        compact_target compact{blk.header.bits};
+        if (!compact.is_canonical(constants::POW_HASH_BYTES)) {
+            reason << "bits-encoding";
+            return reason.str();
+        }
+        if (!blk.check_pow()) {
+            reason << "pow";
+            return reason.str();
+        }
+    }
+
+    if (blk.compute_merkle_root() != blk.header.merkle_root) {
+        reason << "merkle";
+        return reason.str();
+    }
+
+    if (blk.transactions.size() > static_cast<size_t>(constants::MAX_TRANSACTIONS_PER_BLOCK)) {
+        reason << "txcount";
+        return reason.str();
+    }
+
+    const size_t block_size = blk.serialize().size();
+    if (block_size > static_cast<size_t>(constants::MAX_BLOCK_SIZE_BYTES)) {
+        reason << "size";
+        return reason.str();
+    }
+
+    if (!block_timestamp_valid(blk.header, parent_header)) {
+        reason << "timestamp candidate_ts=" << blk.header.timestamp
+               << " parent_ts=" << (parent_header ? parent_header->timestamp : 0);
+        return reason.str();
+    }
+
+    const uint32_t exp_bits = expected_bits(expected_height, blk.header.timestamp);
+    if (blk.header.bits != exp_bits) {
+        reason << "bits have=" << blk.header.bits
+               << " expected=" << exp_bits;
+        return reason.str();
+    }
+
+    if (blk.transactions.empty() || !blk.transactions[0].is_coinbase()) {
+        reason << "coinbase-missing";
+        return reason.str();
+    }
+
+    UTXOSet working = utxo_.snapshot();
+    int64_t total_fees = 0;
+    for (size_t tx_index = 0; tx_index < blk.transactions.size(); ++tx_index) {
+        const auto& tx = blk.transactions[tx_index];
+        int64_t fee = 0;
+        if (!working.apply_transaction(tx, static_cast<uint32_t>(expected_height), &fee)) {
+            reason << "tx-apply tx_index=" << tx_index;
+            return reason.str();
+        }
+        if (!tx.is_coinbase()) total_fees += fee;
+    }
+
+    const int64_t expected_reward = Block::get_block_reward(expected_height);
+    const int64_t coinbase_out = blk.transactions[0].total_output_value();
+    if (coinbase_out > expected_reward + total_fees) {
+        reason << "coinbase-overpay coinbase=" << coinbase_out
+               << " allowed=" << (expected_reward + total_fees);
+        return reason.str();
+    }
+
+    return "valid-tip-extension";
+}
+
 void Blockchain::pin_checkpoint_to_tip() {
     local_checkpoint_ = std::make_pair(best_height_, tip_hash_);
     manual_checkpoint_pinned_ = true;
@@ -205,8 +288,25 @@ void Blockchain::ensure_genesis() {
 }
 
 bool Blockchain::connect_block(const Block& blk, bool skip_pow_check) {
-    // Legacy path: only allow direct extension of active tip
-    if (blk.header.prev_block_hash != index_.at(tip_hash_).hash()) return false;
+    // Prefer the canonical active-height map when checking the current tip. If in-memory
+    // tip metadata drifts, self-heal from the persisted active path before rejecting work.
+    uint256_t active_tip = tip_hash_;
+    auto active_it = height_map_.find(best_height_);
+    if (active_it != height_map_.end()) {
+        active_tip = active_it->second;
+        if (active_tip != tip_hash_) {
+            tip_hash_ = active_tip;
+            auto header_it = index_.find(tip_hash_);
+            if (header_it != index_.end()) {
+                tip_bits_ = header_it->second.bits;
+            }
+            log_warn("chain", "corrected tip metadata drift height=" + std::to_string(best_height_) +
+                              " tip=" + tip_hash_.to_hex_padded(constants::POW_HASH_BYTES));
+        }
+    }
+    auto tip_it = index_.find(active_tip);
+    if (tip_it == index_.end()) return false;
+    if (blk.header.prev_block_hash != tip_it->second.hash()) return false;
     return accept_block(blk, skip_pow_check);
 }
 
@@ -442,22 +542,47 @@ void Blockchain::purge_cached_subtree(const uint256_t& root) {
 }
 
 bool Blockchain::activate_path(const std::vector<uint256_t>& path, UTXOSet& new_utxo, uint32_t new_tip_bits) {
-    // Rewrite canonical files according to path
-    height_map_.clear();
-    height_index_.clear();
-    chain_work_.clear();
+    // Resolve the full path before mutating active state so a missing block does not
+    // leave the chain half-rewritten in memory.
+    std::vector<Block> resolved_blocks;
+    resolved_blocks.reserve(path.size());
+    std::map<uint64_t, uint256_t> next_height_map;
+    std::unordered_map<uint256_t, uint64_t> next_height_index;
+    std::unordered_map<uint256_t, uint64_t> next_block_height;
+    std::unordered_map<uint256_t, uint256_t> next_chain_work;
+
     for (size_t i = 0; i < path.size(); ++i) {
         auto blk = get_block_by_hash(path[i]);
-        if (!blk) return false;
-        store_.store(static_cast<uint64_t>(i), *blk);
-        store_.store_by_hash(path[i], *blk);
-        height_map_[static_cast<uint64_t>(i)] = path[i];
-        height_index_[path[i]] = static_cast<uint64_t>(i);
-        block_height_[path[i]] = i; // FIX
+        if (!blk) {
+            log_warn("chain", "activate_path missing block height=" + std::to_string(i) +
+                              " hash=" + path[i].to_hex_padded(constants::POW_HASH_BYTES));
+            return false;
+        }
+        resolved_blocks.push_back(*blk);
+        next_height_map[static_cast<uint64_t>(i)] = path[i];
+        next_height_index[path[i]] = static_cast<uint64_t>(i);
+        next_block_height[path[i]] = static_cast<uint64_t>(i);
         uint256_t work_here = block_work(blk->header.bits);
-        if (i == 0) chain_work_[path[i]] = work_here;
-        else chain_work_[path[i]] = chain_work_[path[i-1]] + work_here;
+        if (i == 0) next_chain_work[path[i]] = work_here;
+        else next_chain_work[path[i]] = next_chain_work[path[i - 1]] + work_here;
     }
+
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (!store_.store(static_cast<uint64_t>(i), resolved_blocks[i])) {
+            log_warn("chain", "activate_path failed to write canonical block height=" + std::to_string(i));
+            return false;
+        }
+        if (!store_.store_by_hash(path[i], resolved_blocks[i])) {
+            log_warn("chain", "activate_path failed to refresh hash block height=" + std::to_string(i) +
+                              " hash=" + path[i].to_hex_padded(constants::POW_HASH_BYTES));
+            return false;
+        }
+    }
+
+    height_map_ = std::move(next_height_map);
+    height_index_ = std::move(next_height_index);
+    block_height_ = std::move(next_block_height);
+    chain_work_ = std::move(next_chain_work);
     best_height_ = path.empty() ? 0 : path.size() - 1;
     tip_hash_ = path.empty() ? tip_hash_ : path.back();
     tip_bits_ = new_tip_bits;
@@ -576,7 +701,12 @@ bool Blockchain::accept_block(const Block& blk, bool skip_pow_check) {
                               " candidate=" + bh.to_hex_padded(constants::POW_HASH_BYTES));
             return false;
         }
-        if (!activate_path(path, new_utxo, new_tip_bits)) return false;
+        if (!activate_path(path, new_utxo, new_tip_bits)) {
+            log_warn("chain", "candidate activation failed hash=" +
+                              bh.to_hex_padded(constants::POW_HASH_BYTES) +
+                              " height=" + std::to_string(height));
+            return false;
+        }
         log_info("chain", "switched to new tip " + bh.to_hex_padded(constants::POW_HASH_BYTES) +
                           " height=" + std::to_string(best_height_));
     } else {

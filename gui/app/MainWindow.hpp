@@ -67,7 +67,6 @@ private:
     void syncWalletPathFromDataDir();
     QString defaultDataDirForNetwork(const QString& network) const;
     QString defaultConfigPathForDataDir(const QString& dataDir) const;
-    QString defaultMinerDataDirForDataDir(const QString& dataDir) const;
     QUrl defaultRpcUrlForNetwork(const QString& network) const;
     void bootstrapBackendAndRefresh(int retries = 8, int generation = -1);
     void setBackendState(const QString& text, bool error = false);
@@ -96,8 +95,6 @@ private:
     void updateStatusIcons();
     void setStartupProgressBusy(bool busy, const QString& text = QString());
     void toggleSyncOverlay();
-    void reconcilePendingMinedBlocks();
-    void submitMinedBlockToBackend(const QString& blockHex);
     void startBackend();
     void launchBackendProcess();
     void handleBackendPortConflict(const QString& detail = QString());
@@ -226,7 +223,6 @@ private:
     QString autoRpcPassword_;
     QString autoDirectPeers_;
     QString autoSeedPeers_;
-    bool reconcileInProgress_{false};
     bool syncOverlayDismissed_{false};
     bool syncOverlayPinned_{false};
     double lastSyncProgress_{-1.0};

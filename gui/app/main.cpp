@@ -45,7 +45,7 @@ public:
         contentLayout->setContentsMargins(18, 20, 18, 16);
         auto* title = new QLabel(QStringLiteral("CryptEX Core"), content);
         title->setStyleSheet(QStringLiteral("color:#4b4b4b; font-size:22px; font-weight:500;"));
-        auto* version = new QLabel(QStringLiteral("Version v0.6.2"), content);
+        auto* version = new QLabel(QStringLiteral("Version v0.6.3"), content);
         version->setStyleSheet(QStringLiteral("color:#666666; font-size:12px;"));
         auto* copyright = new QLabel(QStringLiteral("© 2026 The CryptEX Core developers"), content);
         copyright->setStyleSheet(QStringLiteral("color:#666666; font-size:11px;"));

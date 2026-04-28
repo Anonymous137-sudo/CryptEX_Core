@@ -1139,10 +1139,32 @@ extern "C" int cryptex_powminer_entry(int argc, char** argv) {
             }
 
             const auto previous_height = chain.best_height();
-            if (!chain.connect_block(found_block) ||
+            const auto current_tip = chain.get_block(previous_height);
+            const auto expected_prev_link = current_tip ? current_tip->header.hash() : uint256_t();
+            const uint32_t expected_bits = chain.next_work_bits(found_block.header.timestamp);
+            if (found_block.header.prev_block_hash != expected_prev_link) {
+                log_warn("powminer",
+                         "dropping stale locally mined block reason=stale-prev-link expected=" +
+                             expected_prev_link.to_hex() +
+                             " have=" + found_block.header.prev_block_hash.to_hex() +
+                             " height=" + std::to_string(previous_height + 1));
+                std::cerr << "ERROR: Block was mined on a stale parent and was dropped before submission.\n";
+            } else if (found_block.header.bits != expected_bits) {
+                log_warn("powminer",
+                         "dropping stale locally mined block reason=bits-changed have=" +
+                             std::to_string(found_block.header.bits) +
+                             " expected=" + std::to_string(expected_bits) +
+                             " height=" + std::to_string(previous_height + 1));
+                std::cerr << "ERROR: Block was mined on a stale difficulty target and was dropped before submission.\n";
+            } else if (!chain.connect_block(found_block) ||
                 chain.tip_hash() != found_block.header.pow_hash() ||
                 chain.best_height() != previous_height + 1) {
-                log_warn("powminer", "block was found locally but rejected by chain");
+                log_warn("powminer",
+                         "block was found locally but rejected by chain reason=" +
+                             chain.diagnose_tip_candidate(found_block) +
+                             " previous_height=" + std::to_string(previous_height) +
+                             " current_height=" + std::to_string(chain.best_height()) +
+                             " mempool=" + std::to_string(chain.mempool().size()));
                 std::cerr << "ERROR: Block was rejected by the chain (stale or invalid)!\n";
             } else {
                 bool approved_tip = true;

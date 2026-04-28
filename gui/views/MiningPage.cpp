@@ -70,16 +70,16 @@ MiningPage::MiningPage(QWidget* parent)
     autoTemplateCheck_ = new QCheckBox(QStringLiteral("Refresh template with mining status"), this);
 
     addressEdit_->setPlaceholderText(QStringLiteral("Base64 reward address"));
-    connectEdit_->setPlaceholderText(QStringLiteral("Defaults to the local node, for example 127.0.0.1:9333"));
-    minerDataDirEdit_->setPlaceholderText(QStringLiteral("Defaults to a dedicated miner subdirectory"));
+    connectEdit_->setPlaceholderText(QStringLiteral("Legacy standalone peer target; local backend mining ignores this"));
+    minerDataDirEdit_->setPlaceholderText(QStringLiteral("Optional worker scratch dir; defaults to the backend datadir"));
     cyclesEdit_->setPlaceholderText(QStringLiteral("0 = infinite nonce loop"));
     blockCyclesEdit_->setPlaceholderText(QStringLiteral("0 = mine blocks continuously"));
     syncWaitEdit_->setPlaceholderText(QStringLiteral("0 = wait until synced"));
 
     configLayout->addRow(QStringLiteral("Reward Address"), addressEdit_);
     configLayout->addRow(QString(), usePrimaryButton_);
-    configLayout->addRow(QStringLiteral("Peer / Seed Target"), connectEdit_);
-    configLayout->addRow(QStringLiteral("Miner Data Dir"), minerDataDirEdit_);
+    configLayout->addRow(QStringLiteral("Standalone Peer Target"), connectEdit_);
+    configLayout->addRow(QStringLiteral("Worker Scratch Dir"), minerDataDirEdit_);
     configLayout->addRow(QStringLiteral("Nonce Cycles"), cyclesEdit_);
     configLayout->addRow(QStringLiteral("Block Cycles"), blockCyclesEdit_);
     configLayout->addRow(QStringLiteral("Threads"), threadSpin_);
@@ -131,7 +131,7 @@ MiningPage::MiningPage(QWidget* parent)
     templateLayout->addWidget(templateTabs_);
     root->addWidget(templateBox);
 
-    auto* note = new QLabel(QStringLiteral("The GUI miner now launches the daemon mining command, which orchestrates the external SHA3-512 PoW worker. If you leave the peer target blank it will mine against the local node, and found blocks are submitted back into the backend so your wallet and dashboard stay in sync. Live miner logs appear in the separate Miner Output tab, while this template panel is meant for template inspection and copy/export workflows."));
+    auto* note = new QLabel(QStringLiteral("The GUI miner now uses the same backend RPC session as the wallet and dashboard. The miner process only fetches block templates, runs the external SHA3-512 PoW worker, and submits completed blocks back to the already-running backend. That keeps the CLI and GUI on one chain state instead of creating a separate gui-miner blockchain view."));
     note->setWordWrap(true);
     root->addWidget(note);
     root->addStretch(1);
@@ -236,12 +236,6 @@ QString MiningPage::formatHashrate(double hps) {
     return QString::number(hps, 'f', 2) + QStringLiteral(" H/s");
 }
 
-QString MiningPage::defaultPeerForNetwork(const QString& network) {
-    if (network == QStringLiteral("testnet")) return QStringLiteral("127.0.0.1:19333");
-    if (network == QStringLiteral("regtest")) return QStringLiteral("127.0.0.1:19444");
-    return QStringLiteral("127.0.0.1:9333");
-}
-
 void MiningPage::setStatus(const QString& text, bool error) {
     statusValue_->setText(text);
     statusValue_->setStyleSheet(error ? QStringLiteral("color:#a61b1b;") : QString());
@@ -342,10 +336,9 @@ void MiningPage::startMining() {
         setStatus(QStringLiteral("Reward address is required."), true);
         return;
     }
-
-    if (config.connectEndpoint.isEmpty()) {
-        config.connectEndpoint = defaultPeerForNetwork(config.network);
-        connectEdit_->setPlaceholderText(config.connectEndpoint);
+    if (config.rpcUrl.trimmed().isEmpty()) {
+        setStatus(QStringLiteral("RPC URL is required so the miner can use the active backend session."), true);
+        return;
     }
 
     if (minerDataDirEdit_->text().trimmed().isEmpty()) {
@@ -354,7 +347,7 @@ void MiningPage::startMining() {
             setStatus(QStringLiteral("Set a backend datadir before starting the GUI miner."), true);
             return;
         }
-        config.dataDir = QDir(baseDir).filePath(QStringLiteral("gui-miner"));
+        config.dataDir = baseDir;
     } else {
         config.dataDir = minerDataDirEdit_->text().trimmed();
     }

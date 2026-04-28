@@ -130,6 +130,9 @@ if(TARGET cryptex_powminer)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET cryptexd AND TARGET cryptex_powminer)
+    set_property(TARGET cryptexqt APPEND PROPERTY LINK_DEPENDS
+        $<TARGET_FILE:cryptexd>
+        $<TARGET_FILE:cryptex_powminer>)
     add_custom_command(
         TARGET cryptexqt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory

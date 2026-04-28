@@ -39,10 +39,23 @@
 extern char** environ;
 #endif
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 using namespace cryptex;
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace ssl = boost::asio::ssl;
+namespace pt = boost::property_tree;
+using tcp = boost::asio::ip::tcp;
 
 static std::string format_rate(double hps) {
     std::ostringstream ss;
@@ -384,6 +397,403 @@ static std::filesystem::path locate_external_powminer_binary(const char* argv0) 
         }
     }
     return {};
+}
+
+struct RpcMiningSettings {
+    std::string url;
+    std::string username;
+    std::string password;
+    bool allow_self_signed{false};
+    std::string ca_cert_path;
+};
+
+struct RpcUrlParts {
+    bool tls{false};
+    std::string host;
+    std::string port;
+    std::string target{"/"};
+};
+
+struct RpcSyncSnapshot {
+    uint64_t local_height{0};
+    uint64_t best_peer_height{0};
+    uint64_t blocks_left{0};
+    uint64_t queued_blocks{0};
+    uint64_t inflight_blocks{0};
+    uint64_t connections{0};
+    uint64_t validated_peers{0};
+    bool syncing{false};
+    bool chain_approved{false};
+    std::string best_block_hash;
+};
+
+struct RpcBlockTemplate {
+    Block block;
+    uint64_t height{0};
+    std::string bits_hex;
+    std::string target_hex;
+    std::string previous_block_hash;
+    std::string previous_link_hash;
+};
+
+static std::string json_escape(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (unsigned char ch : input) {
+        switch (ch) {
+        case '\\':
+            out += "\\\\";
+            break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                std::ostringstream ss;
+                ss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                   << static_cast<unsigned int>(ch);
+                out += ss.str();
+            } else {
+                out.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+static int hex_digit_value(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+    return -1;
+}
+
+static std::vector<uint8_t> parse_hex_bytes(const std::string& input) {
+    if (input.size() % 2 != 0) {
+        throw std::runtime_error("hex string must have even length");
+    }
+    std::vector<uint8_t> out;
+    out.reserve(input.size() / 2);
+    for (size_t i = 0; i < input.size(); i += 2) {
+        const int hi = hex_digit_value(input[i]);
+        const int lo = hex_digit_value(input[i + 1]);
+        if (hi < 0 || lo < 0) {
+            throw std::runtime_error("invalid hex string");
+        }
+        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return out;
+}
+
+static bool is_loopback_host(const std::string& host) {
+    if (host == "localhost" || host == "127.0.0.1" || host == "::1") {
+        return true;
+    }
+    boost::system::error_code ec;
+    auto address = boost::asio::ip::make_address(host, ec);
+    return !ec && address.is_loopback();
+}
+
+static RpcUrlParts parse_rpc_url(const std::string& url) {
+    const auto scheme_pos = url.find("://");
+    if (scheme_pos == std::string::npos) {
+        throw std::runtime_error("rpc url must include http:// or https://");
+    }
+
+    RpcUrlParts parts;
+    std::string scheme = url.substr(0, scheme_pos);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (scheme == "https") {
+        parts.tls = true;
+        parts.port = "443";
+    } else if (scheme == "http") {
+        parts.tls = false;
+        parts.port = "80";
+    } else {
+        throw std::runtime_error("unsupported rpc url scheme: " + scheme);
+    }
+
+    std::string remainder = url.substr(scheme_pos + 3);
+    const auto slash_pos = remainder.find('/');
+    std::string authority = slash_pos == std::string::npos ? remainder : remainder.substr(0, slash_pos);
+    parts.target = slash_pos == std::string::npos ? "/" : remainder.substr(slash_pos);
+    if (parts.target.empty()) {
+        parts.target = "/";
+    }
+
+    const auto at_pos = authority.rfind('@');
+    if (at_pos != std::string::npos) {
+        authority = authority.substr(at_pos + 1);
+    }
+
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close == std::string::npos) {
+            throw std::runtime_error("invalid rpc url host");
+        }
+        parts.host = authority.substr(1, close - 1);
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':') {
+                throw std::runtime_error("invalid rpc url port");
+            }
+            parts.port = authority.substr(close + 2);
+        }
+    } else {
+        const auto colon = authority.rfind(':');
+        if (colon != std::string::npos && authority.find(':') == colon) {
+            parts.host = authority.substr(0, colon);
+            parts.port = authority.substr(colon + 1);
+        } else {
+            parts.host = authority;
+        }
+    }
+
+    if (parts.host.empty()) {
+        throw std::runtime_error("rpc url is missing a host");
+    }
+    if (parts.port.empty()) {
+        parts.port = parts.tls ? "443" : "80";
+    }
+    return parts;
+}
+
+static pt::ptree parse_json_tree(const std::string& body) {
+    std::istringstream in(body);
+    pt::ptree tree;
+    pt::read_json(in, tree);
+    return tree;
+}
+
+static std::string rpc_http_post_json(const RpcMiningSettings& settings,
+                                      const std::string& body) {
+    const auto endpoint = parse_rpc_url(settings.url);
+    boost::asio::io_context ioc;
+
+    http::request<http::string_body> req{http::verb::post, endpoint.target, 11};
+    req.set(http::field::host, endpoint.host);
+    req.set(http::field::user_agent, "cryptex-client-mine");
+    req.set(http::field::content_type, "application/json");
+    if (!settings.username.empty()) {
+        req.set(http::field::authorization,
+                "Basic " + crypto::base64_encode(settings.username + ":" + settings.password));
+    }
+    req.body() = body;
+    req.prepare_payload();
+
+    beast::flat_buffer buffer;
+
+    if (endpoint.tls) {
+        ssl::context ctx(ssl::context::tls_client);
+        ctx.set_default_verify_paths();
+        if (!settings.ca_cert_path.empty()) {
+            ctx.load_verify_file(settings.ca_cert_path);
+        }
+        if (settings.allow_self_signed && is_loopback_host(endpoint.host)) {
+            ctx.set_verify_mode(ssl::verify_none);
+        } else {
+            ctx.set_verify_mode(ssl::verify_peer);
+        }
+
+        tcp::resolver resolver(ioc);
+        beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint.host.c_str())) {
+            throw std::runtime_error("failed to set tls host name");
+        }
+        auto results = resolver.resolve(endpoint.host, endpoint.port);
+        beast::get_lowest_layer(stream).connect(results);
+        stream.handshake(ssl::stream_base::client);
+
+        http::write(stream, req);
+        http::response<http::string_body> res;
+        http::read(stream, buffer, res);
+        beast::error_code ec;
+        stream.shutdown(ec);
+
+        const auto response = res.body();
+        if (res.result() != http::status::ok) {
+            throw std::runtime_error("rpc http " + std::to_string(res.result_int()) + ": " + response);
+        }
+        return response;
+    }
+
+    tcp::resolver resolver(ioc);
+    beast::tcp_stream stream(ioc);
+    auto results = resolver.resolve(endpoint.host, endpoint.port);
+    stream.connect(results);
+    http::write(stream, req);
+
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    beast::error_code ec;
+    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+    const auto response = res.body();
+    if (res.result() != http::status::ok) {
+        throw std::runtime_error("rpc http " + std::to_string(res.result_int()) + ": " + response);
+    }
+    return response;
+}
+
+static pt::ptree rpc_call_tree(const RpcMiningSettings& settings,
+                               const std::string& method,
+                               const std::string& params_json = "[]") {
+    const std::string body =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"mine\",\"method\":\"" + json_escape(method) +
+        "\",\"params\":" + params_json + "}";
+    auto root = parse_json_tree(rpc_http_post_json(settings, body));
+    if (auto error = root.get_child_optional("error")) {
+        const auto message = error->get<std::string>("message", "");
+        const auto scalar = error->data();
+        if (!message.empty()) {
+            throw std::runtime_error("rpc " + method + " failed: " + message);
+        }
+        if (!scalar.empty() && scalar != "null") {
+            throw std::runtime_error("rpc " + method + " failed: " + scalar);
+        }
+    }
+    return root;
+}
+
+static RpcSyncSnapshot rpc_sync_snapshot(const RpcMiningSettings& settings) {
+    RpcSyncSnapshot snapshot;
+    const auto chain_info = rpc_call_tree(settings, "getblockchaininfo");
+    const auto network_info = rpc_call_tree(settings, "getnetworkinfo");
+
+    snapshot.local_height = chain_info.get<uint64_t>("result.blocks", 0);
+    snapshot.best_peer_height = chain_info.get<uint64_t>("result.bestpeerheight", 0);
+    snapshot.blocks_left = chain_info.get<uint64_t>("result.blocksleft", 0);
+    snapshot.queued_blocks = chain_info.get<uint64_t>("result.queuedblocks", 0);
+    snapshot.inflight_blocks = chain_info.get<uint64_t>("result.inflightblocks", 0);
+    snapshot.syncing = chain_info.get<bool>("result.initialblockdownload", false);
+    snapshot.chain_approved = chain_info.get<bool>("result.chain_approved", false);
+    snapshot.best_block_hash = chain_info.get<std::string>("result.bestblockhash", "");
+    snapshot.connections = network_info.get<uint64_t>("result.connections", 0);
+    snapshot.validated_peers = network_info.get<uint64_t>("result.validatedpeers", 0);
+    return snapshot;
+}
+
+static RpcBlockTemplate rpc_block_template(const RpcMiningSettings& settings,
+                                           const std::string& coinbase_addr) {
+    const std::string params_json = coinbase_addr.empty()
+        ? "[]"
+        : "[\"" + json_escape(coinbase_addr) + "\"]";
+    const auto root = rpc_call_tree(settings, "getblocktemplate", params_json);
+
+    RpcBlockTemplate out;
+    out.height = root.get<uint64_t>("result.height", 0);
+    out.bits_hex = root.get<std::string>("result.bits", "");
+    out.target_hex = root.get<std::string>("result.target", "");
+    out.previous_block_hash = root.get<std::string>("result.previousblockhash", "");
+    out.previous_link_hash = root.get<std::string>("result.previouslinkhash", "");
+
+    const auto block_hex = root.get<std::string>("result.blockhex");
+    auto raw = parse_hex_bytes(block_hex);
+    const uint8_t* ptr = raw.data();
+    size_t remaining = raw.size();
+    out.block = Block::deserialize(ptr, remaining);
+    if (remaining != 0) {
+        throw std::runtime_error("block template payload had trailing bytes");
+    }
+    return out;
+}
+
+static std::string rpc_submit_block(const RpcMiningSettings& settings,
+                                    const std::string& block_hex) {
+    const auto root = rpc_call_tree(settings,
+                                    "submitblock",
+                                    "[\"" + json_escape(block_hex) + "\"]");
+    return root.get<std::string>("result", "");
+}
+
+static bool wait_for_rpc_mining_sync(const RpcMiningSettings& settings,
+                                     uint64_t max_wait_ms,
+                                     bool verbose) {
+    using namespace std::chrono_literals;
+
+    const auto start = std::chrono::steady_clock::now();
+    auto last_report = start - 1s;
+    bool saw_peer = false;
+
+    while (true) {
+        const auto snapshot = rpc_sync_snapshot(settings);
+        net::NetworkNode::SyncStatus status{};
+        status.local_height = static_cast<uint32_t>(snapshot.local_height);
+        status.best_peer_height = static_cast<uint32_t>(snapshot.best_peer_height);
+        status.queued_blocks = static_cast<uint32_t>(snapshot.queued_blocks);
+        status.inflight_blocks = static_cast<uint32_t>(snapshot.inflight_blocks);
+        status.connected_peers = static_cast<uint32_t>(snapshot.connections);
+        status.validated_peers = static_cast<uint32_t>(snapshot.validated_peers);
+        status.syncing = snapshot.syncing;
+
+        saw_peer = saw_peer || snapshot.validated_peers > 0 || snapshot.best_peer_height > 0;
+        const bool caught_up =
+            snapshot.validated_peers > 0 &&
+            snapshot.local_height >= snapshot.best_peer_height &&
+            snapshot.blocks_left == 0 &&
+            snapshot.queued_blocks == 0 &&
+            snapshot.inflight_blocks == 0 &&
+            !snapshot.syncing;
+
+        if (caught_up) {
+            if (verbose) {
+                std::cout << "[sync] caught up: " << format_sync_status(status) << "\n";
+            }
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!saw_peer && now - start >= 5s) {
+            if (verbose) {
+                std::cout << "[sync] no peer state received, proceeding with local chain\n";
+            }
+            return false;
+        }
+
+        if (saw_peer &&
+            snapshot.validated_peers > 0 &&
+            !snapshot.syncing &&
+            snapshot.local_height >= snapshot.best_peer_height &&
+            snapshot.blocks_left == 0) {
+            if (verbose) {
+                std::cout << "[sync] peer chain already aligned: " << format_sync_status(status) << "\n";
+            }
+            return true;
+        }
+
+        if (max_wait_ms > 0 &&
+            now - start >= std::chrono::milliseconds(max_wait_ms)) {
+            if (verbose) {
+                std::cout << "[sync] timed out waiting for peer sync: "
+                          << format_sync_status(status) << "\n";
+            }
+            return false;
+        }
+
+        if (verbose && now - last_report >= 1s) {
+            std::cout << "[sync] waiting: " << format_sync_status(status) << "\n";
+            last_report = now;
+        }
+
+        std::this_thread::sleep_for(250ms);
+    }
 }
 
 static int run_external_process_wait(const std::filesystem::path& executable,
@@ -859,7 +1269,7 @@ static void usage() {
               << "  chat-private [host:port] <recipient-address> <message> --recipient-pubkey base64 [--peer host:port] [--seed host[:port]] [--wallet path] [--walletpass p] [--from address] [--datadir path] [--wait-ms n]\n"
               << "  chat-inbox [--datadir path] [--limit N] [--channel name] [--address addr] [--direction in|out] [--private|--public]\n"
               << "  chat-history [--datadir path] [--limit N] [--channel name] [--address addr] [--direction in|out] [--private|--public]\n"
-              << "  mine [--cycles N] [--block-cycles N] [--datadir path] [--connect host:port] [--address addr] [--threads N] [--sync-wait-ms N] [--debug]\n"
+              << "  mine [--cycles N] [--block-cycles N] [--datadir path] [--connect host:port] [--rpc-url url] [--rpcuser u] [--rpcpassword p] [--rpcallowselfsigned 0|1] [--rpccacert pem] [--address addr] [--threads N] [--sync-wait-ms N] [--debug]\n"
               << "     (set --cycles 0 for infinite mining)\n"
               << "  genesis-mine [--threads N] [--start nonce] [--limit N]\n"
               << "default datadir: " << g_default_data_dir.string() << "\n";
@@ -1711,6 +2121,7 @@ int main(int argc, char** argv) {
     std::filesystem::path datadir = runtime.datadir;
     std::string hostport = runtime.config.get_all("connect").empty() ? std::string() : runtime.config.get_all("connect").front();
     std::string coinbase_addr = runtime.config.get_string("mine_address").value_or("genesis");
+    RpcMiningSettings rpc_mining;
     bool debug = debug_enabled();
     bool infinite = false;
     bool infinite_block_cycles = false;
@@ -1718,12 +2129,30 @@ int main(int argc, char** argv) {
     uint64_t sync_wait_ms = runtime.config.get_u64("mine_sync_wait_ms").value_or(0);
     if (auto configured_cycles = runtime.config.get_u64("mine_cycles")) cycles = *configured_cycles;
     if (auto configured_block_cycles = runtime.config.get_u64("mine_block_cycles")) block_cycles = *configured_block_cycles;
+    if (auto configured_rpc_url = runtime.config.get_string("mine_rpc_url")) rpc_mining.url = *configured_rpc_url;
+    if (auto configured_rpc_user = runtime.config.get_string("mine_rpc_user")) rpc_mining.username = *configured_rpc_user;
+    else if (auto configured_rpc_user = runtime.config.get_string("rpcuser")) rpc_mining.username = *configured_rpc_user;
+    if (auto configured_rpc_password = runtime.config.get_string("mine_rpc_password")) rpc_mining.password = *configured_rpc_password;
+    else if (auto configured_rpc_password = runtime.config.get_string("rpcpassword")) rpc_mining.password = *configured_rpc_password;
+    if (auto configured_rpc_allow_self_signed = runtime.config.get_bool("mine_rpc_allow_self_signed")) {
+        rpc_mining.allow_self_signed = *configured_rpc_allow_self_signed;
+    }
+    if (auto configured_rpc_ca = runtime.config.get_string("mine_rpc_ca_cert")) rpc_mining.ca_cert_path = *configured_rpc_ca;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--cycles" && i + 1 < argc) cycles = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--block-cycles" && i + 1 < argc) block_cycles = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--datadir" && i + 1 < argc) datadir = argv[++i];
         else if (arg == "--connect" && i + 1 < argc) hostport = argv[++i];
+        else if (arg == "--rpc-url" && i + 1 < argc) rpc_mining.url = argv[++i];
+        else if (arg == "--rpcuser" && i + 1 < argc) rpc_mining.username = argv[++i];
+        else if (arg == "--rpcpassword" && i + 1 < argc) rpc_mining.password = argv[++i];
+        else if (arg == "--rpcallowselfsigned" && i + 1 < argc) {
+            auto parsed = parse_bool_text(argv[++i]);
+            if (!parsed) throw std::runtime_error("invalid --rpcallowselfsigned value");
+            rpc_mining.allow_self_signed = *parsed;
+        }
+        else if (arg == "--rpccacert" && i + 1 < argc) rpc_mining.ca_cert_path = argv[++i];
         else if (arg == "--address" && i + 1 < argc) coinbase_addr = argv[++i];
         else if (arg == "--debug") debug = true;
         else if (arg == "--threads" && i + 1 < argc) thread_count = static_cast<unsigned int>(std::stoul(argv[++i]));
@@ -1744,6 +2173,190 @@ int main(int argc, char** argv) {
                      " worker=" + miner_path.string() +
                      (infinite ? " cycles=infinite" : " cycles=" + std::to_string(cycles)) +
                      (infinite_block_cycles ? " block_cycles=infinite" : " block_cycles=" + std::to_string(block_cycles)));
+    const auto work_dir = datadir / "powasm_jobs";
+
+    if (!rpc_mining.url.empty()) {
+        std::cout << "[mine] worker=" << miner_path.string()
+                  << " threads=" << thread_count
+                  << " datadir=" << datadir.string()
+                  << " address=" << coinbase_addr
+                  << " rpc=" << rpc_mining.url << "\n";
+
+        uint64_t blocks_mined = 0;
+        bool stopped_without_block = false;
+        bool worker_failure = false;
+
+        wait_for_rpc_mining_sync(rpc_mining, sync_wait_ms, true);
+
+        while (infinite_block_cycles || blocks_mined < block_cycles) {
+            const uint64_t target_index = blocks_mined + 1;
+            auto sync_snapshot = rpc_sync_snapshot(rpc_mining);
+            if (sync_wait_ms > 0 || debug || target_index == 1) {
+                wait_for_rpc_mining_sync(rpc_mining, sync_wait_ms, debug || target_index == 1);
+                sync_snapshot = rpc_sync_snapshot(rpc_mining);
+            }
+
+            if (debug || infinite_block_cycles || block_cycles > 1) {
+                std::cout << "[mine] starting block cycle "
+                          << (infinite_block_cycles ? std::to_string(target_index) + "/infinite"
+                                                    : std::to_string(target_index) + "/" + std::to_string(block_cycles))
+                          << " at height " << sync_snapshot.local_height + 1 << "\n";
+            }
+
+            const auto start = std::chrono::steady_clock::now();
+            uint64_t total_iter = 0;
+            uint32_t next_nonce_seed = 0;
+            bool found = false;
+            uint32_t found_nonce = 0;
+            Block found_block;
+            std::array<uint8_t, constants::POW_HASH_BYTES> found_hash{};
+            constexpr uint64_t kChunkIterationsPerWorker = 250000;
+
+            while (!found && (infinite || total_iter < cycles)) {
+                auto current_job = rpc_block_template(rpc_mining, coinbase_addr);
+                auto header_bytes = serialize_header_fast(current_job.block.header);
+                auto target_vec = compact_target{current_job.block.header.bits}.expand().to_padded_bytes(constants::POW_HASH_BYTES);
+                std::array<uint8_t, constants::POW_HASH_BYTES> target_bytes{};
+                std::memcpy(target_bytes.data(), target_vec.data(), target_bytes.size());
+
+                const uint64_t remaining = infinite ? 0 : (cycles - total_iter);
+                const uint64_t worker_limit = infinite
+                    ? kChunkIterationsPerWorker
+                    : std::max<uint64_t>(1, std::min<uint64_t>(
+                        kChunkIterationsPerWorker,
+                        (remaining + static_cast<uint64_t>(thread_count) - 1) / static_cast<uint64_t>(thread_count)));
+
+                std::vector<std::future<PowAsmWorkerResult>> workers;
+                workers.reserve(thread_count);
+                for (unsigned int tid = 0; tid < thread_count; ++tid) {
+                    PowAsmWorkerJob job;
+                    job.header = header_bytes;
+                    job.target = target_bytes;
+                    job.start_nonce = static_cast<uint32_t>(next_nonce_seed + tid);
+                    job.nonce_step = thread_count;
+                    job.max_iterations = worker_limit;
+                    workers.push_back(std::async(std::launch::async,
+                                                 run_pow_asm_worker,
+                                                 miner_path,
+                                                 work_dir,
+                                                 target_index,
+                                                 tid,
+                                                 job));
+                }
+
+                uint64_t chunk_iter = 0;
+                bool chunk_failure = false;
+                for (auto& future : workers) {
+                    auto worker = future.get();
+                    if (!worker.ok) {
+                        chunk_failure = true;
+                        worker_failure = true;
+                        std::cerr << "ERROR: " << worker.error << "\n";
+                        continue;
+                    }
+                    chunk_iter += worker.iterations;
+                    if (worker.found && !found) {
+                        found = true;
+                        found_nonce = worker.nonce;
+                        found_hash = worker.hash;
+                        found_block = current_job.block;
+                        found_block.header.nonce = found_nonce;
+                    }
+                }
+
+                if (chunk_iter == 0 && chunk_failure) {
+                    break;
+                }
+
+                total_iter += chunk_iter;
+                next_nonce_seed = static_cast<uint32_t>(
+                    next_nonce_seed + static_cast<uint32_t>(thread_count * worker_limit));
+
+                if (debug && chunk_iter > 0 && !found) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+                    const double rate = secs > 0.0 ? static_cast<double>(total_iter) / secs : 0.0;
+                    std::cout << "[mine] iter=" << total_iter
+                              << " next_nonce=" << next_nonce_seed
+                              << " rate=" << format_rate(rate) << "\n";
+                }
+            }
+
+            const auto end = std::chrono::steady_clock::now();
+            if (found) {
+                const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+                const double avg_rate = secs > 0.0 ? static_cast<double>(total_iter) / secs : 0.0;
+                const auto found_hash_value = uint256_t::from_bytes(found_hash.data(), found_hash.size());
+                std::cout << "Found block nonce=" << found_nonce
+                          << " powhash=" << found_hash_value.to_hex_padded(constants::POW_HASH_BYTES)
+                          << " after " << total_iter << " iterations in "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
+                          << " ms using " << thread_count << " worker process slots"
+                          << " avg_rate=" << format_rate(avg_rate) << "\n";
+
+                const uint256_t block_target = compact_target{found_block.header.bits}.expand();
+                std::cout << "Target:  " << block_target.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+                std::cout << "PoWHash: " << found_hash_value.to_hex_padded(constants::POW_HASH_BYTES) << "\n";
+                std::cout << "LinkHash: " << found_block.header.hash().to_hex() << "\n";
+
+                const auto latest_template = rpc_block_template(rpc_mining, coinbase_addr);
+                if (found_block.header.prev_block_hash != latest_template.block.header.prev_block_hash) {
+                    log_warn("mine",
+                             "dropping stale pow worker result reason=stale-prev-link expected=" +
+                                 latest_template.block.header.prev_block_hash.to_hex() +
+                                 " have=" + found_block.header.prev_block_hash.to_hex() +
+                                 " height=" + std::to_string(latest_template.height));
+                    std::cerr << "ERROR: Block was mined on a stale parent and was dropped before submission.\n";
+                } else if (found_block.header.bits != latest_template.block.header.bits) {
+                    log_warn("mine",
+                             "dropping stale pow worker result reason=bits-changed have=" +
+                                 std::to_string(found_block.header.bits) +
+                                 " expected=" + std::to_string(latest_template.block.header.bits) +
+                                 " height=" + std::to_string(latest_template.height));
+                    std::cerr << "ERROR: Block was mined on a stale difficulty target and was dropped before submission.\n";
+                } else {
+                    const auto block_bytes = found_block.serialize();
+                    const auto block_hex = lower_hex(block_bytes.data(), block_bytes.size());
+                    const auto status = rpc_submit_block(rpc_mining, block_hex);
+                    const auto post_submit = rpc_sync_snapshot(rpc_mining);
+                    const auto found_pow_hex = found_block.header.pow_hash().to_hex_padded(constants::POW_HASH_BYTES);
+                    const bool tip_matches = !post_submit.best_block_hash.empty() &&
+                                             post_submit.best_block_hash == found_pow_hex;
+                    if (status == "accepted" || (status == "duplicate" && tip_matches)) {
+                        ++blocks_mined;
+                        log_info("mine", "block accepted at height " + std::to_string(post_submit.local_height));
+                        std::cout << "Block successfully added to chain.\n";
+                        if (!post_submit.chain_approved) {
+                            std::cout << "[policy] block accepted locally, but funds remain locked until the chain is synced/approved.\n";
+                        }
+                        std::cout << "MinedBlockHex: " << block_hex << "\n";
+                    } else {
+                        log_warn("mine",
+                                 "block was found by the pow worker but rejected by chain status=" + status +
+                                     " current_height=" + std::to_string(post_submit.local_height) +
+                                     " tip=" + post_submit.best_block_hash);
+                        std::cerr << "ERROR: Block was rejected by the chain (stale or invalid)!\n";
+                    }
+                }
+            } else {
+                stopped_without_block = true;
+                std::cout << "No block found in " << total_iter << " iterations\n";
+                break;
+            }
+        }
+
+        if (!infinite_block_cycles) {
+            if (stopped_without_block && blocks_mined < block_cycles) {
+                std::cout << "Mining session ended early after " << blocks_mined
+                          << " successful block(s) out of requested " << block_cycles << "\n";
+            } else if (block_cycles > 1) {
+                std::cout << "Mining session complete: mined " << blocks_mined
+                          << " block(s)\n";
+            }
+        }
+        return worker_failure ? 1 : 0;
+    }
+
     std::cout << "[mine] worker=" << miner_path.string()
               << " threads=" << thread_count
               << " datadir=" << datadir.string()
@@ -1783,7 +2396,6 @@ int main(int argc, char** argv) {
         wait_for_mining_sync(*node, sync_wait_ms, true);
     }
 
-    const auto work_dir = datadir / "powasm_jobs";
     uint64_t blocks_mined = 0;
     bool stopped_without_block = false;
     bool worker_failure = false;
@@ -1899,10 +2511,32 @@ int main(int argc, char** argv) {
             std::cout << "LinkHash: " << found_block.header.hash().to_hex() << "\n";
 
             const auto previous_height = chain.best_height();
-            if (!chain.connect_block(found_block) ||
+            const auto current_tip = chain.get_block(previous_height);
+            const auto expected_prev_link = current_tip ? current_tip->header.hash() : uint256_t();
+            const uint32_t expected_bits = chain.next_work_bits(found_block.header.timestamp);
+            if (found_block.header.prev_block_hash != expected_prev_link) {
+                log_warn("mine",
+                         "dropping stale pow worker result reason=stale-prev-link expected=" +
+                             expected_prev_link.to_hex() +
+                             " have=" + found_block.header.prev_block_hash.to_hex() +
+                             " height=" + std::to_string(previous_height + 1));
+                std::cerr << "ERROR: Block was mined on a stale parent and was dropped before submission.\n";
+            } else if (found_block.header.bits != expected_bits) {
+                log_warn("mine",
+                         "dropping stale pow worker result reason=bits-changed have=" +
+                             std::to_string(found_block.header.bits) +
+                             " expected=" + std::to_string(expected_bits) +
+                             " height=" + std::to_string(previous_height + 1));
+                std::cerr << "ERROR: Block was mined on a stale difficulty target and was dropped before submission.\n";
+            } else if (!chain.connect_block(found_block) ||
                 chain.tip_hash() != found_block.header.pow_hash() ||
                 chain.best_height() != previous_height + 1) {
-                log_warn("mine", "block was found by the pow worker but rejected by chain");
+                log_warn("mine",
+                         "block was found by the pow worker but rejected by chain reason=" +
+                             chain.diagnose_tip_candidate(found_block) +
+                             " previous_height=" + std::to_string(previous_height) +
+                             " current_height=" + std::to_string(chain.best_height()) +
+                             " mempool=" + std::to_string(chain.mempool().size()));
                 std::cerr << "ERROR: Block was rejected by the chain (stale or invalid)!\n";
             } else {
                 bool approved_tip = true;

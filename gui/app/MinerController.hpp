@@ -12,6 +12,11 @@ public:
         QString dataDir;
         QString rewardAddress;
         QString connectEndpoint;
+        QString rpcUrl;
+        QString rpcUser;
+        QString rpcPassword;
+        QString rpcCaCertificatePath;
+        bool rpcAllowSelfSigned{false};
         quint64 cycles{0};
         quint64 blockCycles{1};
         quint32 threads{1};

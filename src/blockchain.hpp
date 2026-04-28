@@ -58,6 +58,7 @@ public:
     CheckpointInfo checkpoint_info() const;
     uint64_t max_reorg_depth_limit() const;
     bool deep_reorgs_allowed() const;
+    std::string diagnose_tip_candidate(const Block& blk, bool skip_pow_check = false) const;
     void pin_checkpoint_to_tip();
     void clear_checkpoint_pin();
     void refresh_checkpoint_now();

@@ -56,7 +56,6 @@
 #include <QFileInfo>
 #include <QRandomGenerator>
 #include <QTextStream>
-#include <QtEndian>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -132,22 +131,6 @@ QString loopbackRpcHostForBind(QString bind) {
         return QStringLiteral("127.0.0.1");
     }
     return bind;
-}
-
-quint64 parseStoredBlockLength(const QByteArray& raw) {
-    if (raw.size() < static_cast<int>(sizeof(quint32) + sizeof(quint64))) {
-        return 0;
-    }
-    return qFromLittleEndian<quint64>(reinterpret_cast<const uchar*>(raw.constData() + sizeof(quint32)));
-}
-
-quint64 parseBlockHeightFromFileName(const QString& name) {
-    if (!name.startsWith(QStringLiteral("blk")) || !name.endsWith(QStringLiteral(".dat"))) {
-        return 0;
-    }
-    bool ok = false;
-    const auto value = name.mid(3, name.size() - 7).toULongLong(&ok);
-    return ok ? value : 0;
 }
 
 QString formatCoinAmount(qint64 sats) {
@@ -306,10 +289,6 @@ MainWindow::MainWindow(QWidget* parent)
     });
     connect(&miner_, &MinerController::outputLine, this, [this](const QString& line) {
         minerOutputView_->appendPlainText(QStringLiteral("[miner] ") + line);
-        if (line.startsWith(QStringLiteral("MinedBlockHex:"), Qt::CaseInsensitive)) {
-            submitMinedBlockToBackend(line.section(':', 1).trimmed());
-            return;
-        }
         if (line.contains(QStringLiteral("Block successfully added to chain."), Qt::CaseInsensitive) ||
             line.contains(QStringLiteral("Mining session complete"), Qt::CaseInsensitive) ||
             line.contains(QStringLiteral("block accepted"), Qt::CaseInsensitive)) {
@@ -483,9 +462,18 @@ void MainWindow::buildUi() {
 
     miningPage_->setBaseLaunchConfigProvider([this]() {
         MinerController::LaunchConfig config;
-        config.executablePath = guessedDaemonPath();
+        config.executablePath = daemonPathEdit_->text().trimmed().isEmpty()
+            ? guessedDaemonPath()
+            : daemonPathEdit_->text().trimmed();
         config.network = networkCombo_->currentText();
-        config.dataDir = dataDirEdit_->text().trimmed();
+        config.dataDir = dataDirEdit_->text().trimmed().isEmpty()
+            ? defaultDataDirForNetwork(config.network)
+            : dataDirEdit_->text().trimmed();
+        config.rpcUrl = rpcUrlEdit_->text().trimmed();
+        config.rpcUser = rpcUserEdit_->text().trimmed();
+        config.rpcPassword = rpcPasswordEdit_->text();
+        config.rpcAllowSelfSigned = rpcTlsAllowSelfSignedCheck_ && rpcTlsAllowSelfSignedCheck_->isChecked();
+        config.rpcCaCertificatePath = rpcTlsCaPathEdit_ ? rpcTlsCaPathEdit_->text().trimmed() : QString();
         return config;
     });
 
@@ -1595,11 +1583,6 @@ QString MainWindow::defaultConfigPathForDataDir(const QString& dataDir) const {
     return QDir(dataDir).filePath(QStringLiteral("cryptex.conf"));
 }
 
-QString MainWindow::defaultMinerDataDirForDataDir(const QString& dataDir) const {
-    if (dataDir.trimmed().isEmpty()) return QStringLiteral("gui-miner");
-    return QDir(dataDir).filePath(QStringLiteral("gui-miner"));
-}
-
 QUrl MainWindow::defaultRpcUrlForNetwork(const QString& network) const {
     QUrl url(QStringLiteral("http://127.0.0.1/"));
     if (network == QStringLiteral("testnet")) url.setPort(19332);
@@ -2427,7 +2410,6 @@ void MainWindow::refreshAll() {
     refreshSyncState();
     if (backendBootstrapInProgress_) return;
     refreshWalletSessionState();
-    reconcilePendingMinedBlocks();
     refreshCurrentMainTab();
     refreshVisibleNodeSection();
     refreshVisibleWalletManager();
@@ -2539,121 +2521,6 @@ void MainWindow::refreshCheckpointManager() {
         },
         [this](const QString&) {
             portMappingValue_->setText(QStringLiteral("Unavailable"));
-        });
-}
-
-void MainWindow::reconcilePendingMinedBlocks() {
-    if (reconcileInProgress_) {
-        return;
-    }
-
-    const auto minerDataDir = defaultMinerDataDirForDataDir(dataDirEdit_->text().trimmed());
-    QDir blocksDir(QDir(minerDataDir).filePath(QStringLiteral("blocks")));
-    if (!blocksDir.exists()) {
-        return;
-    }
-
-    reconcileInProgress_ = true;
-    rpc_.call(QStringLiteral("getblockcount"), {}, this,
-        [this, blocksDir](const QJsonValue& result) mutable {
-            const auto backendHeight = static_cast<quint64>(result.toInteger());
-            QList<QPair<quint64, QString>> pending;
-            const auto names = blocksDir.entryList(QStringList{QStringLiteral("blk*.dat")}, QDir::Files, QDir::Name);
-            for (const auto& name : names) {
-                const auto height = parseBlockHeightFromFileName(name);
-                if (height == 0 || height <= backendHeight) {
-                    continue;
-                }
-                pending.push_back({height, blocksDir.filePath(name)});
-            }
-
-            if (pending.isEmpty()) {
-                reconcileInProgress_ = false;
-                return;
-            }
-
-            std::sort(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
-                return a.first < b.first;
-            });
-
-            auto pendingShared = std::make_shared<QList<QPair<quint64, QString>>>(std::move(pending));
-            auto submitNext = std::make_shared<std::function<void()>>();
-            *submitNext = [this, pendingShared, submitNext]() {
-                if (pendingShared->isEmpty()) {
-                    reconcileInProgress_ = false;
-                    QTimer::singleShot(250, this, [this]() {
-                        dashboardPage_->refresh();
-                        walletPage_->refresh();
-                        miningPage_->refresh();
-                    });
-                    return;
-                }
-
-                const auto nextEntry = pendingShared->takeFirst();
-                const auto height = nextEntry.first;
-                const auto path = nextEntry.second;
-                QFile file(path);
-                if (!file.open(QIODevice::ReadOnly)) {
-                    systemLogView_->appendPlainText(QStringLiteral("[gui] failed to open pending mined block: ") + path);
-                    (*submitNext)();
-                    return;
-                }
-
-                const auto raw = file.readAll();
-                const auto payloadLength = parseStoredBlockLength(raw);
-                const int headerBytes = static_cast<int>(sizeof(quint32) + sizeof(quint64));
-                if (payloadLength == 0 || raw.size() < headerBytes || raw.size() < headerBytes + static_cast<int>(payloadLength)) {
-                    systemLogView_->appendPlainText(QStringLiteral("[gui] invalid mined block file: ") + path);
-                    (*submitNext)();
-                    return;
-                }
-
-                const auto blockHex = QString::fromLatin1(raw.mid(headerBytes, static_cast<int>(payloadLength)).toHex());
-                rpc_.call(QStringLiteral("submitblock"), QJsonArray{blockHex}, this,
-                    [this, height, submitNext, path](const QJsonValue& response) {
-                        const auto status = response.toString();
-                        systemLogView_->appendPlainText(QStringLiteral("[gui] reconciled mined block height %1 -> %2").arg(height).arg(status));
-                        // Remove replay entries once the backend has conclusively classified them.
-                        if (status == QStringLiteral("accepted") ||
-                            status == QStringLiteral("duplicate") ||
-                            status == QStringLiteral("rejected")) {
-                            QFile::remove(path);
-                        }
-                        (*submitNext)();
-                    },
-                    [this, height, submitNext](const QString& error) {
-                        systemLogView_->appendPlainText(QStringLiteral("[gui] failed to reconcile mined block height %1: %2").arg(height).arg(error));
-                        (*submitNext)();
-                    });
-            };
-            (*submitNext)();
-        },
-        [this](const QString&) {
-            reconcileInProgress_ = false;
-        });
-}
-
-void MainWindow::submitMinedBlockToBackend(const QString& blockHex) {
-    const auto trimmed = blockHex.trimmed();
-    if (trimmed.isEmpty()) {
-        return;
-    }
-
-    rpc_.call(QStringLiteral("submitblock"), QJsonArray{trimmed}, this,
-        [this](const QJsonValue& result) {
-            const auto status = result.toString().trimmed();
-            if (status == QStringLiteral("accepted") || status == QStringLiteral("duplicate")) {
-                setBackendState(QStringLiteral("Connected"));
-                setConnectionStatus(QStringLiteral("Backend accepted mined block (%1).").arg(status));
-                QTimer::singleShot(250, this, [this]() { refreshAll(); });
-            } else {
-                setConnectionStatus(QStringLiteral("Backend returned submitblock status: %1").arg(status), true);
-                QTimer::singleShot(500, this, [this]() { refreshAll(); });
-            }
-        },
-        [this](const QString& error) {
-            setConnectionStatus(QStringLiteral("Failed to submit mined block to backend: %1").arg(error), true);
-            QTimer::singleShot(1000, this, [this]() { refreshAll(); });
         });
 }
 
